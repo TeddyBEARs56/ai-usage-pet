@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Claude Code 상태 표시줄용 콘솔 프로그램. 창 프로그램(AIUsage.exe)이 안에 품고 있다가 설치할 때 꺼내 둔다. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>AIUsage</RootNamespace>
+    <AssemblyName>AIUsageStatus</AssemblyName>
+    <Product>AI 사용량</Product>
+    <Version>1.0.0</Version>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <SatelliteResourceLanguages>ko</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <!-- 윈도우용으로 낼 때만: 설치 없이 도는 단일 파일, 상태 표시줄마다 뜨므로 작고 빠르게 -->
+  <PropertyGroup Condition="'$(RuntimeIdentifier)' == 'win-x64'">
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <PublishTrimmed>true</PublishTrimmed>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="../Shared/Usage.cs" />
+  </ItemGroup>
+
+</Project>

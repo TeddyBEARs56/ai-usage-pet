@@ -1,3 +1,7 @@
 .DS_Store
 *.iconset/
 *.png
+windows/dist/
+windows/**/bin/
+windows/**/obj/
+windows/AIUsageStatus/publish/

@@ -1,6 +1,6 @@
 # AI 사용량
 
-Claude 와 ChatGPT(Codex) 사용 한도를 화면 위에 계속 띄워 두는 맥 앱. Codex 펫처럼 다른 창 위·모든 데스크톱·전체 화면 앱 위에 떠 있고, 눌러도 지금 쓰는 앱의 초점을 뺏지 않는다.
+Claude 와 ChatGPT(Codex) 사용 한도를 화면 위에 계속 띄워 두는 맥 앱. **Windows 판은 [`windows/`](windows/README.md)**. Codex 펫처럼 다른 창 위·모든 데스크톱·전체 화면 앱 위에 떠 있고, 눌러도 지금 쓰는 앱의 초점을 뺏지 않는다.
 
 ## 켜고 끄기
 
@@ -33,6 +33,7 @@ ChatGPT 대화(웹·앱) 자체의 한도는 밖에서 읽을 방법이 없어 C
 | `Info.plist` | 앱 정보 |
 | `AppIcon.icns` | 앱 아이콘(바깥 고리 Claude 주황, 안쪽 고리 ChatGPT 초록) |
 | `make-icon.swift` | 아이콘 원본 그림(1024px PNG)을 그리는 스크립트 |
+| `windows/` | Windows 판(같은 규칙, 맥에서 빌드) |
 | `build.sh` | 소스를 고쳤을 때만: 다시 빌드해 `~/Applications/AI 사용량.app` 에 두고 다시 띄운다 |
 
 ## 고친 뒤 다시 만들기
