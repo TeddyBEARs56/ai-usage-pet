@@ -1,6 +1,6 @@
 #!/bin/zsh
 # 소스를 고쳤을 때만 쓴다: AI 사용량 앱을 다시 만들어 ~/Applications 에 두고 (다시) 띄운다.
-#   zsh build.sh
+#   zsh mac/build.sh
 # 평소에는 Dock 이나 ~/Applications 의 「AI 사용량」으로 열고, Dock 아이콘 오른쪽 클릭 → 종료로 끈다.
 set -euo pipefail
 

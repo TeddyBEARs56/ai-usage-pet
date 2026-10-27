@@ -8,7 +8,7 @@ export PATH=/opt/homebrew/bin:$PATH DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=
 dist="$here/dist"
 rm -rf "$dist"
 
-[[ -f $here/AIUsage/AIUsage.ico ]] || swift "$here/../make-icon.swift" --windows "$here/AIUsage/AIUsage.ico"
+[[ -f $here/AIUsage/AIUsage.ico ]] || swift "$here/../icon/make-icon.swift" --windows "$here/AIUsage/AIUsage.ico"
 
 # 1) 상태 표시줄 프로그램 → 2) 그것을 품은 창 프로그램
 dotnet publish "$here/AIUsageStatus/AIUsageStatus.csproj" -c Release -r win-x64 -o "$here/AIUsageStatus/publish" -nologo -v q

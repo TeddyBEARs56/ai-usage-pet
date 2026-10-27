@@ -1,6 +1,7 @@
 // 앱 아이콘 그리기 — 바깥 고리 Claude 주황, 안쪽 고리 ChatGPT 초록
-//   swift make-icon.swift icon.png               맥용 1024px PNG (build.sh 가 AppIcon.icns 로 바꾼다)
+//   swift make-icon.swift icon.png               맥용 1024px PNG (make-icons.sh 가 mac/AppIcon.icns 로 바꾼다)
 //   swift make-icon.swift --windows AIUsage.ico  윈도우용 ICO (여백 없이 꽉 차게, 크기마다 따로 그림)
+// 두 가지를 한 번에 다시 만들 때: zsh icon/make-icons.sh
 
 import AppKit
 

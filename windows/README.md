@@ -1,6 +1,6 @@
 # AI 사용량 (Windows)
 
-맥판과 같은 창을 Windows 에서 띄운다. 다른 창 위에 늘 떠 있고, 눌러도 쓰던 프로그램의 초점을 뺏지 않는다. 작업 표시줄 단추로 켜고 끈다.
+맥판과 같은 창을 Windows 에서 띄운다. 다른 창 위에 늘 떠 있고, 눌러도 쓰던 프로그램의 초점을 뺏지 않는다. 작업 표시줄 단추로 켜고 끈다. 무엇을 보여 주고 값을 어디서 가져오는지는 [맨 위 README](../README.md).
 
 ## 처음 쓰기
 
@@ -43,6 +43,7 @@ Windows 에는 jq 가 없어서 상태 표시줄은 같이 들어 있는 작은 
 | `AIUsage/` | 창 프로그램(WinForms). `MainForm.cs` 화면, `Setup.cs` 설치·자동 실행·연결 |
 | `AIUsageStatus/` | 상태 표시줄 콘솔 프로그램. 창 프로그램 안에 들어가 있다가 설치할 때 꺼내진다 |
 | `build.sh` | 맥에서 빌드 → `dist/AIUsage.exe` |
+| `AIUsage/AIUsage.ico` | 아이콘(`icon/make-icons.sh` 로 만든다) |
 
 ## 다시 만들기(맥)
 
