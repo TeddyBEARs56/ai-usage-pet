@@ -1,0 +1,33 @@
+#!/bin/zsh
+# 다른 맥에 줄 설치 묶음을 만든다 — 애플 칩·인텔 공용, macOS 14 이상.
+#   zsh mac/package.sh [zip 경로]      (기본: ~/Downloads/AI사용량-mac.zip)
+# 묶음: 「AI 사용량 설치」 폴더 = AI 사용량.app + 설치.sh + 지우기.sh + 읽어 주세요.txt
+# 받는 쪽은 읽어 주세요.txt 대로 터미널에서 zsh 설치.sh 만 하면 된다(앱은 개발자 인증 없이 임시 서명).
+set -euo pipefail
+
+here=${0:A:h}
+out=${1:-$HOME/Downloads/AI사용량-mac.zip}
+stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT
+pkg="$stage/AI 사용량 설치"
+app="$pkg/AI 사용량.app"
+
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp "$here/Info.plist" "$app/Contents/Info.plist"
+cp "$here/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
+cp "$here/share/claude-settings.js" "$app/Contents/Resources/claude-settings.js"
+for arch in arm64 x86_64; do
+  swiftc -O -swift-version 5 -parse-as-library -target "$arch-apple-macos14.0" \
+    "$here/AIUsagePet.swift" -o "$stage/AIUsagePet-$arch"
+done
+lipo -create "$stage/AIUsagePet-arm64" "$stage/AIUsagePet-x86_64" -output "$app/Contents/MacOS/AIUsagePet"
+codesign --force --sign - "$app"
+
+cp "$here/share/install.sh" "$pkg/설치.sh"
+cp "$here/share/uninstall.sh" "$pkg/지우기.sh"
+cp "$here/share/README.txt" "$pkg/읽어 주세요.txt"
+chmod +x "$pkg/설치.sh" "$pkg/지우기.sh"
+
+rm -f "$out"
+ditto -c -k --sequesterRsrc --keepParent "$pkg" "$out"
+print "완료: $out ($(lipo -archs "$app/Contents/MacOS/AIUsagePet"), $(du -h "$out" | cut -f1))"

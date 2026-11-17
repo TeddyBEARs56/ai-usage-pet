@@ -15,6 +15,7 @@ Claude 와 ChatGPT(Codex) 사용 한도를 화면 위에 계속 띄워 두는 �
 | Claude 5시간·주간 | 남은 비율과 초기화 시각(↺). 초록 50% 이상, 노랑 20% 이상, 빨강 20% 미만 — Claude Code 상태 표시줄과 같은 기준 |
 | ChatGPT 주간 | ChatGPT 플랜의 Codex 한도. 플랜에 5시간 한도가 있으면(Plus 등) 5시간 줄이 생긴다 |
 | 오른쪽 위 「방금·n분 전」 | 그 값을 마지막으로 받은 때 |
+| 세션(맥 판만) | 이 맥에서 연 Claude Code·Codex 세션이 진행 중인지, 답을 마쳤는지, 내 확인을 기다리는지. 자세한 것은 [mac/README.md](mac/README.md#세션-목록) |
 
 ChatGPT 대화(웹·앱) 자체의 한도는 밖에서 읽을 방법이 없어 Codex 한도만 보여 준다.
 
