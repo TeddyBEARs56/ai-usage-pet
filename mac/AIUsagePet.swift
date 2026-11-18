@@ -537,6 +537,13 @@ func tailLines(_ path: String, maxBytes: UInt64) -> [Data] {
     return lines.map { Data($0) }
 }
 
+/// 대화 기록 끝에서 읽은 것
+struct TranscriptTail {
+    var turnEndedAt: Date?  // 마지막 차례가 끝난 시각(turn_duration)
+    var promptAt: Date?     // 차례가 아직 안 끝났으면 그 차례를 연 내 말의 시각
+    var title: String?      // /rename 으로 붙인 이름(custom-title), 없으면 Claude 가 붙인 제목(ai-title)
+}
+
 /// Claude Code 는 실행 중인 세션마다 ~/.claude/sessions/<pid>.json 에 상태를 남긴다
 /// (status: busy·shell=진행 중, idle=답 나옴, waiting=권한 묻기 등에서 내 답을 기다림).
 /// 공식 문서에 없는 형식이라 모르는 값이 오면 「알 수 없음」으로 둔다.
@@ -544,7 +551,9 @@ final class ClaudeSessionReader {
     private var lastState: [String: SessionState] = [:]
     private var workingSince: [String: Date] = [:]
     private var transcriptPaths: [String: String] = [:]
-    private var tailCache: [String: (size: UInt64, turnEndedAt: Date?, promptAt: Date?)] = [:]
+    private var tailCache: [String: (size: UInt64, tail: TranscriptTail)] = [:]
+    /// 세션마다 기록에서 마지막으로 찾은 제목. 긴 차례 도중에는 기록 끝 512KB 에 제목 줄이 없을 수 있어 앞의 것을 그대로 쓴다
+    private var titles: [String: String] = [:]
 
     func read(now: Date) -> [AgentSession] {
         let dir = homeDir + "/.claude/sessions"
@@ -556,21 +565,24 @@ final class ClaudeSessionReader {
                   let exe = executablePath(pid), exe.lowercased().contains("claude") else { continue }  // 꺼진 세션이 남긴 파일은 건너뛴다
             let sessionId = obj["sessionId"] as? String ?? file
             let cwd = obj["cwd"] as? String ?? ""
-            let given = (obj["name"] as? String)?.trimmingCharacters(in: .whitespaces) ?? ""
-            let name = given.isEmpty ? (cwd as NSString).lastPathComponent : given
             let changedAt = number(obj["statusUpdatedAt"]).map { Date(timeIntervalSince1970: $0 / 1000) } ?? now
             let key = "\(pid):\(sessionId)"
             seen.insert(key)
+
+            // 차례 도중(진행 중·확인 기다림)인 세션을 처음 보면 더 깊이(8MB) 읽는다 — 그 차례를 연 내 말과
+            // 지난 차례 끝에 적힌 제목이 화면 캡처 등에 밀려 멀리 있을 수 있다. 답을 마친 세션은 제목이 기록 맨 끝에 있다
+            let status = obj["status"] as? String
+            let tail = transcriptTail(sessionId: sessionId, deep: lastState[key] == nil && status != "idle")
+            if let title = tail.title { titles[sessionId] = title }
+            let name = Self.sessionName(obj, title: titles[sessionId], cwd: cwd)
 
             var state: SessionState
             var since = changedAt
             var promptAt: Date?
             var background = false
-            switch obj["status"] as? String {
+            switch status {
             case "busy", "shell":
                 // 뒤에서 도는 작업(백그라운드 명령 등)이 남아 있으면 답을 마친 뒤에도 busy 로 남는다 → 대화 기록 끝으로 가린다
-                // 처음 보는 세션이면 그 차례를 연 내 말을 찾으러 더 깊이(8MB) 읽는다 — 화면 캡처 등으로 기록이 금방 커진다
-                let tail = transcriptTail(sessionId: sessionId, deep: lastState[key] == nil)
                 if let ended = tail.turnEndedAt {
                     state = .answered
                     since = ended
@@ -602,22 +614,54 @@ final class ClaudeSessionReader {
         }
         lastState = lastState.filter { seen.contains($0.key) }
         workingSince = workingSince.filter { seen.contains($0.key) }
+        let liveIds = Set(seen.map { String($0.split(separator: ":", maxSplits: 1).last ?? "") })
+        titles = titles.filter { liveIds.contains($0.key) }
         return result
     }
 
-    /// 대화 기록(~/.claude/projects/<폴더>/<세션>.jsonl) 끝에서: 마지막 차례가 끝났는지(turn_duration), 아니면 그 차례를 연 내 말의 시각
-    private func transcriptTail(sessionId: String, deep: Bool) -> (turnEndedAt: Date?, promptAt: Date?) {
-        guard let path = transcriptPath(sessionId) else { return (nil, nil) }
+    /// 보일 이름: /rename 으로 붙인 이름 → 대화 기록의 제목(Claude 가 붙인 것) → 지금 폴더 이름.
+    /// sessions/<pid>.json 의 name 은 직접 붙이지 않았으면(nameSource: derived) 켤 때 시작 폴더로 한 번 만든
+    /// 「폴더-16진수 2자리」라서, 다른 폴더로 옮기거나 일이 바뀌어도 그대로다 — 그래서 쓰지 않는다.
+    static func sessionName(_ obj: [String: Any], title: String?, cwd: String) -> String {
+        let given = (obj["name"] as? String)?.trimmingCharacters(in: .whitespaces) ?? ""
+        if obj["nameSource"] as? String == "user", !given.isEmpty { return given }
+        if let title = title?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty { return title }
+        let folder = (cwd as NSString).lastPathComponent
+        return folder.isEmpty ? "Claude" : folder
+    }
+
+    /// 대화 기록(~/.claude/projects/<폴더>/<세션>.jsonl) 끝에서: 마지막 차례가 끝났는지(turn_duration), 아니면 그 차례를 연 내 말의 시각,
+    /// 그리고 세션 제목
+    private func transcriptTail(sessionId: String, deep: Bool) -> TranscriptTail {
+        guard let path = transcriptPath(sessionId) else { return TranscriptTail() }
         // 기록이 그대로면 지난번 결과를 쓴다(3초마다 512KB 를 다시 읽지 않게)
         let size = ((try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? NSNumber)?.uint64Value ?? 0
-        if let cached = tailCache[path], cached.size == size { return (cached.turnEndedAt, cached.promptAt) }
-        let result = scanTail(path, maxBytes: deep ? 8 << 20 : 512 << 10)
-        tailCache[path] = (size, result.turnEndedAt, result.promptAt)
+        if let cached = tailCache[path], cached.size == size { return cached.tail }
+        let result = Self.scanTail(path, maxBytes: deep ? 8 << 20 : 512 << 10)
+        tailCache[path] = (size, result)
         return result
     }
 
-    private func scanTail(_ path: String, maxBytes: UInt64) -> (turnEndedAt: Date?, promptAt: Date?) {
+    static func scanTail(_ path: String, maxBytes: UInt64) -> TranscriptTail {
+        var result = TranscriptTail()
+        var turnFound = false
+        var customTitle: String?
+        var aiTitle: String?
+        let customMark = Data("\"type\":\"custom-title\"".utf8)
+        let aiMark = Data("\"type\":\"ai-title\"".utf8)
         for line in tailLines(path, maxBytes: maxBytes).reversed() {
+            if turnFound && customTitle != nil && aiTitle != nil { break }
+            // 제목 줄: Claude Code 가 차례마다 기록 끝에 다시 적는다. /resume 목록과 같이 custom-title 이 먼저다
+            if line.range(of: customMark) != nil || line.range(of: aiMark) != nil {
+                guard let entry = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else { continue }
+                switch entry["type"] as? String {
+                case "custom-title" where customTitle == nil: customTitle = entry["customTitle"] as? String
+                case "ai-title" where aiTitle == nil: aiTitle = entry["aiTitle"] as? String
+                default: break
+                }
+                continue
+            }
+            if turnFound { continue }
             guard line.range(of: Data("\"type\":\"user\"".utf8)) != nil
                     || line.range(of: Data("\"type\":\"assistant\"".utf8)) != nil
                     || line.range(of: Data("\"turn_duration\"".utf8)) != nil,
@@ -625,21 +669,23 @@ final class ClaudeSessionReader {
             let at = (entry["timestamp"] as? String).flatMap(parseDate)
             switch entry["type"] as? String {
             case "system" where entry["subtype"] as? String == "turn_duration":
-                return (at, nil)
-            case "assistant":
-                continue
+                result.turnEndedAt = at
+                turnFound = true
             case "user":
                 if entry["isMeta"] as? Bool == true { continue }
                 let message = entry["message"] as? [String: Any]
-                if message?["content"] is String { return (nil, at) }
                 let parts = message?["content"] as? [[String: Any]] ?? []
                 let types = Set(parts.compactMap { $0["type"] as? String })
-                if !types.contains("tool_result") && !types.isEmpty { return (nil, at) }
+                if message?["content"] is String || (!types.contains("tool_result") && !types.isEmpty) {
+                    result.promptAt = at
+                    turnFound = true
+                }
             default:
                 continue
             }
         }
-        return (nil, nil)
+        result.title = customTitle ?? aiTitle
+        return result
     }
 
     private func transcriptPath(_ sessionId: String) -> String? {
