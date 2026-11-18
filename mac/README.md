@@ -68,8 +68,10 @@ zsh ~/Documents/GitHub/ai-usage-pet/mac/build.sh
 ## 다른 맥에 설치
 
 ```bash
-zsh ~/Documents/GitHub/ai-usage-pet/mac/package.sh   # → ~/Downloads/AI사용량-mac.zip
+zsh ~/Documents/GitHub/ai-usage-pet/mac/package.sh   # → ~/Downloads/AI사용량-mac-<버전>.zip
 ```
+
+zip 이름의 버전은 `Info.plist` 의 `CFBundleShortVersionString`. 새로 건넬 묶음을 만들 때마다 먼저 그것(예: 1.3 → 1.4)과 `CFBundleVersion`(4 → 5)을 올린다. 같은 버전 zip 이 이미 있으면 덮어쓰지 않고 멈춘다.
 
 zip 을 건네면 받는 쪽은 `읽어 주세요.txt` 대로 터미널에 `zsh ` + `설치.sh` 끌어다 놓기 → Enter. 설치가 하는 일:
 
