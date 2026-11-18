@@ -16,15 +16,16 @@
 - **켜기**: 시작 메뉴나 작업 표시줄의 「AI 사용량」
 - **끄기**: 작업 표시줄 단추 오른쪽 클릭 → 창 닫기, 또는 창 오른쪽 클릭 → 종료
 - **Windows 를 켤 때 자동으로**: 창 오른쪽 클릭 → 「Windows 시작할 때 자동으로 열기」
+- **칸 순서**: 창 오른쪽 클릭 → 「칸 순서」 → 「Claude → ChatGPT」 또는 「ChatGPT → Claude」. 고른 순서는 기억한다(레지스트리 `HKCU\Software\AIUsage` 의 `Order`).
 
-창은 끌어서 옮기고(위치 기억), 두 번 클릭하면 새로고침. 오른쪽 클릭 메뉴에 마지막 값·초기화 날짜, 위치 초기화, 상태 표시줄 연결, 종료가 있다.
+창은 끌어서 옮기고(위치 기억), 두 번 클릭하면 새로고침. 오른쪽 클릭 메뉴에 마지막 값·초기화 날짜, 위치 초기화, 칸 순서, 상태 표시줄 연결, 종료가 있다.
 
 ## 값이 뜨려면
 
 | 값 | 필요한 것 |
 |---|---|
 | ChatGPT | Codex CLI 로그인. `codex` 를 PATH, npm(`%APPDATA%\npm`), `~\.codex\packages\standalone` 에서 찾는다 |
-| Claude | Claude Code + 상태 표시줄 연결(메뉴). `~\.claude\settings.json` 의 `statusLine` 을 `AIUsageStatus.exe --statusline` 으로 바꾼다(원래 파일은 `settings.json.bak-날짜`) |
+| Claude | Claude Code + 상태 표시줄 연결(메뉴). `~\.claude\settings.json` 의 `statusLine` 을 `AIUsageStatus.exe --statusline` 으로 바꾼다(원래 파일은 `settings.json.bak-날짜`). 연결이 가리키는 `AIUsageStatus.exe` 가 없으면 켤 때 묻지 않고 다시 건다. 또는 Claude 데스크톱 앱(`%APPDATA%\Claude\plan-usage-history.json`, Microsoft Store 판은 `Packages\…Claude…\LocalCache\Roaming\Claude\`) — 앱을 쓰는 동안 받은 값만, 초기화 시각 없이 |
 
 Windows 에는 jq 가 없어서 상태 표시줄은 같이 들어 있는 작은 콘솔 프로그램 `AIUsageStatus.exe` 가 맡는다(창 프로그램으로 하면 실행될 때마다 마우스 커서가 「로딩 중」으로 깜빡인다). 상태 표시줄 모양은 맥과 같은 3줄(저장소·모델·한도)이고 브랜치 표시는 없다.
 

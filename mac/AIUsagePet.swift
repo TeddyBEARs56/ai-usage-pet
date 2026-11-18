@@ -3,16 +3,24 @@
 // 값의 출처
 //   Claude  : Claude Code 상태 표시줄이 세션마다 남기는 ~/.cache/ai-usage/claude/<세션>.json
 //             (이 앱을 `AIUsagePet --statusline` 으로 상태 표시줄에 걸거나, 직접 만든 statusline.sh 에서 같은 파일을 남긴다)
+//             + Claude 데스크톱 앱이 남기는 plan-usage-history.json(초기화 시각 없음). 둘 중 나중 값을 쓴다
+//             (Claude Code 로그인 토큰은 읽지 않는다)
 //   ChatGPT : `codex app-server` 의 account/rateLimits/read(5분마다) + ~/.codex/sessions 기록에 찍히는 최신 한도
 //   세션    : Claude Code 가 실행 중인 세션마다 남기는 ~/.claude/sessions/<pid>.json(+ 대화 기록 끝),
 //             Codex 의 ~/.codex/sessions rollout 기록 마지막 표시(+ 그 파일을 연 codex 프로세스가 있는지), 3초마다
 //
-// 실행 옵션: --print (값만 출력), --snapshot <png> (창 모양을 그림으로 저장),
+// 실행 옵션: --print (값만 출력), --snapshot <png> (창 모양을 그림으로 저장), --connect (Claude Code 상태 표시줄에 연결),
 //           --statusline (Claude Code 상태 표시줄: 한도를 남기고 상태 표시줄 글자를 낸다)
 
 import AppKit
 import ServiceManagement
 import SwiftUI
+
+/// 홈 폴더. 시험할 때는 AIUSAGE_HOME 으로 바꾼다(윈도우 판과 같다)
+let homeDir: String = {
+    if let home = ProcessInfo.processInfo.environment["AIUSAGE_HOME"], !home.isEmpty { return home }
+    return NSHomeDirectory()
+}()
 
 // MARK: - 값
 
@@ -35,6 +43,7 @@ struct ProviderSnapshot {
     var observedAt: Date?
     var plan: String?
     var message: String?
+    var source: String?  // 오른쪽 클릭 메뉴에 보일 값의 출처
 }
 
 private let isoWithFraction: ISO8601DateFormatter = {
@@ -78,7 +87,7 @@ func planName(_ raw: String?) -> String? {
 /// 세션마다 마지막으로 받은 한도를 모아, 가장 최근 창(초기화 시각이 가장 늦은 것)에서 가장 많이 쓴 값을 쓴다.
 /// 같은 창 안에서 사용률은 줄지 않으므로, 오래 쉬던 세션이 옛 값을 다시 써도 표시가 뒤로 가지 않는다.
 final class ClaudeReader {
-    private let dir = NSHomeDirectory() + "/.cache/ai-usage/claude"
+    private let dir = homeDir + "/.cache/ai-usage/claude"
     private var cache: [String: (mtime: Date, limits: [String: Any])] = [:]
 
     func read(now: Date) -> ProviderSnapshot {
@@ -104,20 +113,190 @@ final class ClaudeReader {
         }
         cache = cache.filter { alive.contains($0.key) }
 
+        // Claude Code 를 안 쓰는 동안에는 데스크톱 앱 기록이 더 새것일 수 있다(같은 계정일 때만)
+        let statusAt = entries.map { $0.mtime }.max()
+        let desktop = ClaudeDesktopUsage.latest(org: ClaudeCodeAccount.organization(), now: now)
         var snap = ProviderSnapshot()
-        snap.observedAt = entries.map { $0.mtime }.max()
+        var usedStatus = false, usedDesktop = false
         for (key, label, minutes) in [("five_hour", "5시간", 300), ("seven_day", "주간", 10_080)] {
             let found = entries.compactMap { entry -> (used: Double, reset: Double)? in
                 guard let w = entry.limits[key] as? [String: Any], let used = number(w["used_percentage"]) else { return nil }
                 return (used, number(w["resets_at"]) ?? 0)
             }
-            guard let latest = found.map({ $0.reset }).max() else { continue }
-            let used = found.filter { $0.reset >= latest - 600 }.map { $0.used }.max() ?? 0
+            var used: Double?
+            var reset: Double = 0
+            if let latest = found.map({ $0.reset }).max() {
+                used = found.filter { $0.reset >= latest - 600 }.map { $0.used }.max() ?? 0
+                reset = latest
+            }
+            var fromDesktop = false
+            if let desktop, let value = desktop.used[key], used == nil || desktop.at > statusAt ?? .distantPast {
+                if let current = used, reset > desktop.at.timeIntervalSince1970 {
+                    used = max(current, value)  // 상태 표시줄이 본 창이 그때도 열려 있었다: 같은 창이라 초기화 시각을 이어 쓴다
+                } else {
+                    // 데스크톱 앱 기록에는 초기화 시각이 없다. 창 길이보다 오래된 기록이면 그 창은 이미 끝났다.
+                    used = now.timeIntervalSince(desktop.at) >= Double(minutes * 60) ? 0 : value
+                    reset = 0
+                }
+                fromDesktop = true
+            }
+            guard let used else { continue }
+            if fromDesktop { usedDesktop = true } else { usedStatus = true }
             snap.windows.append(LimitWindow(id: key, label: label, minutes: minutes, usedPercent: used,
-                                            resetsAt: latest > 0 ? Date(timeIntervalSince1970: latest) : nil))
+                                            resetsAt: reset > 0 ? Date(timeIntervalSince1970: reset) : nil))
         }
-        if snap.windows.isEmpty { snap.message = "Claude Code 에서 한 번 대화하면 표시됩니다" }
+        snap.observedAt = [usedStatus ? statusAt : nil, usedDesktop ? desktop?.at : nil].compactMap { $0 }.max()
+        snap.source = usedStatus && usedDesktop ? "Claude Code·데스크톱 앱" : usedDesktop ? "Claude 데스크톱 앱 기록" : "Claude Code 상태 표시줄"
+        if snap.windows.isEmpty { snap.message = ClaudeCodeLink.emptyMessage() }
         return snap
+    }
+}
+
+/// Claude 데스크톱 앱이 사용량을 서버에서 받을 때마다 남기는 기록(로그인 정보 없이 읽는다).
+/// 앱을 쓰는 동안(창을 열고 대화할 때 등)에만 쌓이고, 4.5분에 한 번까지만 남으며, 초기화 시각은 없다.
+/// 공식 문서에 없는 파일이라 앱 업데이트로 바뀔 수 있다 — 못 읽으면 상태 표시줄 값만 쓴다.
+enum ClaudeDesktopUsage {
+    static let path = homeDir + "/Library/Application Support/Claude/plan-usage-history.json"
+
+    struct Sample {
+        let at: Date
+        let used: [String: Double]  // five_hour·seven_day 사용률
+    }
+
+    /// 가장 최근 기록. Claude Code 계정(조직)을 알면 그 조직 것만, 8일보다 오래된 것은 뺀다.
+    static func latest(org: String?, now: Date) -> Sample? {
+        guard let data = FileManager.default.contents(atPath: path),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let samples = root["samples"] as? [[String: Any]] else { return nil }
+        var best: Sample?
+        for sample in samples {
+            guard let t = number(sample["t"]) else { continue }
+            let at = Date(timeIntervalSince1970: t / 1000)
+            guard now.timeIntervalSince(at) < 8 * 86_400, at > best?.at ?? .distantPast else { continue }
+            if let org, let sampleOrg = sample["org"] as? String, sampleOrg != org { continue }
+            let u = sample["u"] as? [String: Any] ?? sample  // 1판은 fh·sd 가 바로 밑에 있다
+            var used: [String: Double] = [:]
+            if let v = number(u["fh"]) { used["five_hour"] = v }
+            if let v = number(u["sd"]) { used["seven_day"] = v }
+            if !used.isEmpty { best = Sample(at: at, used: used) }
+        }
+        return best
+    }
+}
+
+/// Claude Code 가 로그인한 조직(~/.claude.json 의 oauthAccount.organizationUuid, 비밀값 아님).
+/// 데스크톱 앱이 다른 계정이면 그 기록은 쓰지 않으려고 본다. 파일이 바뀔 때만 다시 읽는다.
+enum ClaudeCodeAccount {
+    private static var cached: (mtime: Date, org: String?)?
+
+    static func organization() -> String? {
+        let path = homeDir + "/.claude.json"
+        guard let mtime = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date else { return nil }
+        if let cached, cached.mtime == mtime { return cached.org }
+        var org: String?
+        if let data = FileManager.default.contents(atPath: path),
+           let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            org = (root["oauthAccount"] as? [String: Any])?["organizationUuid"] as? String
+        }
+        cached = (mtime, org)
+        return org
+    }
+}
+
+/// Claude Code 상태 표시줄이 이 앱에 걸려 있는지 보고, 안 걸렸거나 끊겼으면 건다(설치.sh 와 같은 claude-settings.js 로).
+enum ClaudeCodeLink {
+    enum State { case noClaudeCode, notConnected, broken, connected }
+
+    static let claudeDir = homeDir + "/.claude"
+    static let settingsPath = claudeDir + "/settings.json"
+    static let wrapperPath = claudeDir + "/ai-usage-statusline.sh"
+    static let originalPath = claudeDir + "/ai-usage-statusline.original.json"
+    /// 상태 표시줄이 마지막으로 돈 때와 한도 값(rate_limits)이 왔는지 — 값이 안 나올 때 이유를 말하려고 남긴다
+    static let seenPath = homeDir + "/.cache/ai-usage/claude-statusline.json"
+
+    static func command() -> String? {
+        guard let data = FileManager.default.contents(atPath: settingsPath),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        return (root["statusLine"] as? [String: Any])?["command"] as? String
+    }
+
+    static func state() -> State {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: claudeDir, isDirectory: &isDir), isDir.boolValue else { return .noClaudeCode }
+        guard let command = command(), !command.isEmpty else { return .notConnected }
+        let fm = FileManager.default
+        if command.contains("ai-usage-statusline.sh") {  // 쓰던 상태 표시줄을 감싼 경우
+            guard fm.isExecutableFile(atPath: wrapperPath),
+                  let script = try? String(contentsOfFile: wrapperPath, encoding: .utf8),
+                  let bin = appPath(in: script) else { return .broken }
+            return fm.isExecutableFile(atPath: bin) ? .connected : .broken
+        }
+        if command.contains("AIUsagePet") {
+            guard let bin = appPath(in: command) else { return .broken }
+            return fm.isExecutableFile(atPath: bin) ? .connected : .broken
+        }
+        // 직접 만든 상태 표시줄 스크립트가 같은 곳(~/.cache/ai-usage)에 남기면 연결된 것으로 본다
+        if let script = scriptPath(command), let text = try? String(contentsOfFile: script, encoding: .utf8),
+           text.contains("ai-usage") {
+            return .connected
+        }
+        return .notConnected
+    }
+
+    /// `"…/AIUsagePet" --statusline` 의 따옴표 안 경로
+    static func appPath(in text: String) -> String? {
+        guard let range = text.range(of: #""[^"\n]+"[ \t]+--statusline"#, options: .regularExpression) else { return nil }
+        return text[range].split(separator: "\"").first.map(String.init)
+    }
+
+    /// `~/.claude/statusline.sh`, `bash ~/x.sh` 같은 명령에서 스크립트 파일
+    static func scriptPath(_ command: String) -> String? {
+        let words = command.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        guard var word = words.first(where: { !["bash", "sh", "zsh", "/bin/bash", "/bin/sh", "/bin/zsh"].contains($0) }) else { return nil }
+        word = word.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+        if word.hasPrefix("~/") { word = homeDir + word.dropFirst(1) }
+        if word.hasPrefix("$HOME/") { word = homeDir + word.dropFirst(5) }
+        return word.hasPrefix("/") ? word : nil
+    }
+
+    /// Claude 칸에 값이 하나도 없을 때 보일 이유
+    static func emptyMessage() -> String {
+        switch state() {
+        case .noClaudeCode:
+            return "Claude Code 나 Claude 데스크톱 앱을 쓰면 표시됩니다"
+        case .notConnected:
+            return "Claude Code 에 연결되지 않았습니다 — 오른쪽 클릭 → 「Claude Code 에 연결」"
+        case .broken:
+            return "Claude Code 연결이 끊겼습니다 — 오른쪽 클릭 → 「Claude Code 에 연결」"
+        case .connected:
+            if let data = FileManager.default.contents(atPath: seenPath),
+               let seen = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               seen["limits"] as? Bool == false {
+                return "Claude Code 가 한도 값을 보내지 않습니다 — Claude 구독(Pro·Max·Team)으로 로그인했는지, Claude Code 가 최신인지 확인"
+            }
+            return "Claude Code 에서 한 번 대화하면 표시됩니다"
+        }
+    }
+
+    /// claude-settings.js install 을 돌린다. 결과 한 단어(new·wrapped·repaired·already·error:…)를 돌려준다.
+    @discardableResult
+    static func connect() -> String {
+        guard let script = Bundle.main.path(forResource: "claude-settings", ofType: "js"),
+              let bin = Bundle.main.executablePath else { return "error:앱 안에 claude-settings.js 가 없습니다" }
+        try? FileManager.default.createDirectory(atPath: claudeDir, withIntermediateDirectories: true)
+        let stamp = makeFormatter("yyyyMMdd-HHmmss").string(from: Date())
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-l", "JavaScript", script, "install", settingsPath, bin, wrapperPath, originalPath,
+                             "\(settingsPath).bak-\(stamp)"]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        do { try process.run() } catch { return "error:osascript 를 실행하지 못했습니다" }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        if FileManager.default.fileExists(atPath: wrapperPath) { chmod(wrapperPath, 0o755) }  // 새로 쓴 감싸는 스크립트는 실행 권한이 없다
+        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -195,7 +374,7 @@ final class CodexReader {
         for back in 0...1 {
             guard let day = cal.date(byAdding: .day, value: -back, to: now) else { continue }
             let c = cal.dateComponents([.year, .month, .day], from: day)
-            let dir = NSHomeDirectory() + String(format: "/.codex/sessions/%04ld/%02ld/%02ld", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+            let dir = homeDir + String(format: "/.codex/sessions/%04ld/%02ld/%02ld", c.year ?? 0, c.month ?? 0, c.day ?? 0)
             for name in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] where name.hasPrefix("rollout-") && name.hasSuffix(".jsonl") {
                 let path = dir + "/" + name
                 if let mtime = (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date {
@@ -229,7 +408,7 @@ final class CodexReader {
 
     /// codex 를 까는 방법마다 놓이는 곳(독립 설치·Homebrew·npm·nvm·ChatGPT 앱에 들어 있는 것) 가운데 먼저 있는 것
     static func codexExecutable() -> String? {
-        let home = NSHomeDirectory()
+        let home = homeDir
         var candidates = [home + "/.local/bin/codex", "/opt/homebrew/bin/codex", "/usr/local/bin/codex",
                           home + "/.codex/packages/standalone/current/bin/codex",
                           home + "/.npm-global/bin/codex", home + "/.volta/bin/codex", home + "/.bun/bin/codex"]
@@ -247,7 +426,7 @@ final class CodexReader {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: exe)
         process.arguments = ["app-server"]
-        process.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory())
+        process.currentDirectoryURL = URL(fileURLWithPath: homeDir)
         // Dock 에서 연 앱은 PATH 가 짧다. npm 으로 깐 codex 는 node 스크립트라 같은 폴더의 node 를 찾을 수 있게 앞에 붙인다.
         var env = ProcessInfo.processInfo.environment
         let exeDir = (exe as NSString).deletingLastPathComponent
@@ -368,7 +547,7 @@ final class ClaudeSessionReader {
     private var tailCache: [String: (size: UInt64, turnEndedAt: Date?, promptAt: Date?)] = [:]
 
     func read(now: Date) -> [AgentSession] {
-        let dir = NSHomeDirectory() + "/.claude/sessions"
+        let dir = homeDir + "/.claude/sessions"
         var result: [AgentSession] = []
         var seen = Set<String>()
         for file in (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [] where file.hasSuffix(".json") {
@@ -465,7 +644,7 @@ final class ClaudeSessionReader {
 
     private func transcriptPath(_ sessionId: String) -> String? {
         if let cached = transcriptPaths[sessionId], FileManager.default.fileExists(atPath: cached) { return cached }
-        let root = NSHomeDirectory() + "/.claude/projects"
+        let root = homeDir + "/.claude/projects"
         for folder in (try? FileManager.default.contentsOfDirectory(atPath: root)) ?? [] {
             let path = "\(root)/\(folder)/\(sessionId).jsonl"
             if FileManager.default.fileExists(atPath: path) {
@@ -641,7 +820,7 @@ func sessionStatusText(_ s: AgentSession, now: Date) -> String {
 }
 
 func describeSession(_ s: AgentSession, now: Date) -> String {
-    let home = NSHomeDirectory()
+    let home = homeDir
     let place = s.cwd.hasPrefix(home) ? "~" + s.cwd.dropFirst(home.count) : s.cwd
     let note = s.background ? " (뒤에서 명령이 아직 도는 중)" : ""
     return "\(s.tool == .claude ? "Claude" : "Codex") · \(s.name) — \(sessionStatusText(s, now: now))\(note)\(place.isEmpty ? "" : " · \(place)")"
@@ -673,7 +852,39 @@ enum Shown {
     static func get(_ key: String) -> Bool { UserDefaults.standard.object(forKey: key) as? Bool ?? true }
 }
 
+/// 창 안 칸. 순서는 「칸 순서」 메뉴에서 고르고 기억한다(처음엔 세션 → Claude → ChatGPT)
+enum Pane: String {
+    case sessions, claude, codex
+
+    static let orderKey = "paneOrder"
+    static let standard: [Pane] = [.sessions, .claude, .codex]
+    /// 메뉴에 나오는 순서 전부(3칸이면 6가지). 맨 앞이 기본.
+    static let orders: [[Pane]] = [
+        [.sessions, .claude, .codex], [.sessions, .codex, .claude],
+        [.claude, .codex, .sessions], [.codex, .claude, .sessions],
+        [.claude, .sessions, .codex], [.codex, .sessions, .claude],
+    ]
+
+    var title: String {
+        switch self {
+        case .sessions: return "세션"
+        case .claude: return "Claude"
+        case .codex: return "ChatGPT"
+        }
+    }
+
+    /// 저장된 순서. 빠졌거나 모르는 칸은 기본 순서대로 뒤에 채운다(칸이 늘거나 줄어도 깨지지 않게)
+    static func loadOrder() -> [Pane] {
+        var result: [Pane] = []
+        for pane in (UserDefaults.standard.stringArray(forKey: orderKey) ?? []).compactMap(Pane.init(rawValue:))
+        where !result.contains(pane) { result.append(pane) }
+        for pane in standard where !result.contains(pane) { result.append(pane) }
+        return result
+    }
+}
+
 final class UsageModel: ObservableObject {
+    @Published var order = Pane.loadOrder()
     @Published var claude = ProviderSnapshot()
     @Published var codex = ProviderSnapshot()
     @Published var sessions: [AgentSession] = []
@@ -690,25 +901,39 @@ struct PetView: View {
     @ObservedObject var model: UsageModel
 
     var body: some View {
+        // 고른 순서대로, 켜 둔 칸만. 칸 사이에만 구분선을 넣는다.
+        let panes = model.order.filter(isShown)
         VStack(alignment: .leading, spacing: 9) {
-            if model.showSessions {
-                SessionSection(sessions: model.sessions, now: model.now)
-                Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
-            }
-            if model.showClaude {
-                ProviderSection(name: "Claude", detail: nil, color: claudeTint, snap: model.claude, now: model.now)
-            }
-            if model.showClaude && model.showCodex {
-                Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
-            }
-            if model.showCodex {
-                ProviderSection(name: "ChatGPT", detail: ["Codex", model.codex.plan].compactMap { $0 }.joined(separator: " · "),
-                                color: codexTint, snap: model.codex, now: model.now)
+            ForEach(Array(panes.enumerated()), id: \.element) { index, pane in
+                if index > 0 {
+                    Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
+                }
+                paneView(pane)
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .frame(width: 290)
+    }
+
+    private func isShown(_ pane: Pane) -> Bool {
+        switch pane {
+        case .sessions: return model.showSessions
+        case .claude: return model.showClaude
+        case .codex: return model.showCodex
+        }
+    }
+
+    @ViewBuilder private func paneView(_ pane: Pane) -> some View {
+        switch pane {
+        case .sessions:
+            SessionSection(sessions: model.sessions, now: model.now)
+        case .claude:
+            ProviderSection(name: "Claude", detail: nil, color: claudeTint, snap: model.claude, now: model.now)
+        case .codex:
+            ProviderSection(name: "ChatGPT", detail: ["Codex", model.codex.plan].compactMap { $0 }.joined(separator: " · "),
+                            color: codexTint, snap: model.codex, now: model.now)
+        }
     }
 }
 
@@ -958,6 +1183,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var hosting: NSHostingView<PetView>!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 앱을 옮기거나 다시 깔아 상태 표시줄이 없는 경로를 가리키면, 이 앱이 걸었던 것이니 묻지 않고 새 경로로 고친다
+        if ClaudeCodeLink.state() == .broken { ClaudeCodeLink.connect() }
         buildMainMenu()
         buildPanel()
         refreshAll()
@@ -1124,13 +1351,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 lines.append("    \(w.label) \(w.leftPercent(now: now))% 남음 · 초기화 \(w.resetsAt.map(fullTime) ?? "-")")
             }
         }
-        if model.showClaude { add("Claude (Claude Code 상태 표시줄)", model.claude) }
-        if model.showCodex {
-            add("ChatGPT (Codex 한도)", model.codex)
-            lines.append("Codex 서버 확인 \(codex.serverCheckedAt.map(clock) ?? "전")\(codex.serverError.map { " — \($0)" } ?? "")")
-        }
-        if model.showSessions {
-            for s in model.sessions { lines.append("세션 · " + describeSession(s, now: now)) }
+        for pane in model.order {  // 창과 같은 순서로
+            switch pane {
+            case .claude where model.showClaude:
+                add("Claude (\(model.claude.source ?? "Claude Code 상태 표시줄"))", model.claude)
+            case .codex where model.showCodex:
+                add("ChatGPT (Codex 한도)", model.codex)
+                lines.append("Codex 서버 확인 \(codex.serverCheckedAt.map(clock) ?? "전")\(codex.serverError.map { " — \($0)" } ?? "")")
+            case .sessions where model.showSessions:
+                for s in model.sessions { lines.append("세션 · " + describeSession(s, now: now)) }
+            default:
+                break
+            }
         }
         return lines
     }
@@ -1147,9 +1379,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         menu.addItem(menuItem("위치 초기화", #selector(resetPosition)))
         addShownItems(to: menu)
         menu.addItem(menuItem("로그인할 때 자동으로 열기", #selector(toggleLoginItem)))
+        addConnectItem(to: menu)
         menu.addItem(.separator())
         menu.addItem(menuItem("종료", #selector(quit)))
         NSMenu.popUpContextMenu(menu, with: event, for: container)
+    }
+
+    /// Claude Code 가 있는데 상태 표시줄이 안 걸렸거나 끊겼을 때만 「Claude Code 에 연결」
+    private func addConnectItem(to menu: NSMenu) {
+        let state = ClaudeCodeLink.state()
+        guard state == .notConnected || state == .broken else { return }
+        menu.addItem(menuItem("Claude Code 에 연결…", #selector(connectClaudeCode)))
+    }
+
+    @objc private func connectClaudeCode() {
+        let alert = NSAlert()
+        alert.messageText = "Claude Code 에 연결할까요?"
+        alert.informativeText = "Claude 값을 받으려고 Claude Code 상태 표시줄(~/.claude/settings.json)에 이 앱을 겁니다.\n"
+            + "쓰시던 상태 표시줄이 있으면 그대로 보입니다. 고치기 전 파일은 settings.json.bak-날짜 로 남깁니다."
+        alert.addButton(withTitle: "연결")
+        alert.addButton(withTitle: "취소")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let result = ClaudeCodeLink.connect()
+        let done = NSAlert()
+        if result.hasPrefix("error:") || ClaudeCodeLink.state() != .connected {
+            done.messageText = "연결하지 못했습니다"
+            done.informativeText = result.hasPrefix("error:") ? String(result.dropFirst(6)) : "결과: \(result)"
+        } else {
+            done.messageText = "연결했습니다"
+            done.informativeText = "Claude Code 에서 한 번 대화하면 Claude 값이 나타납니다."
+        }
+        done.runModal()
+        refreshLocal()
     }
 
     private func menuItem(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
@@ -1158,13 +1420,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         return item
     }
 
-    /// 「Claude 보이기」「ChatGPT 보이기」「세션 보이기」 — 앞뒤를 구분선으로 묶는다
+    /// 「Claude 보이기」「ChatGPT 보이기」「세션 보이기」「칸 순서」 — 앞뒤를 구분선으로 묶는다
     private func addShownItems(to menu: NSMenu) {
         menu.addItem(.separator())
         menu.addItem(menuItem("Claude 보이기", #selector(toggleClaude)))
         menu.addItem(menuItem("ChatGPT 보이기", #selector(toggleCodex)))
         menu.addItem(menuItem("세션 보이기", #selector(toggleSessions)))
+        menu.addItem(orderMenuItem())
         menu.addItem(.separator())
+    }
+
+    /// 「칸 순서」 — 고를 수 있는 순서를 다 늘어놓고 지금 것에 체크(체크는 validateMenuItem 이 붙인다)
+    private func orderMenuItem() -> NSMenuItem {
+        let submenu = NSMenu()
+        for order in Pane.orders {
+            let item = menuItem(order.map(\.title).joined(separator: " → "), #selector(chooseOrder(_:)))
+            item.representedObject = order.map(\.rawValue)
+            submenu.addItem(item)
+        }
+        let item = NSMenuItem(title: "칸 순서", action: nil, keyEquivalent: "")
+        item.submenu = submenu
+        return item
+    }
+
+    @objc private func chooseOrder(_ sender: NSMenuItem) {
+        guard let names = sender.representedObject as? [String] else { return }
+        let order = names.compactMap(Pane.init(rawValue:))
+        guard order.count == Pane.standard.count, order != model.order else { return }
+        model.order = order
+        UserDefaults.standard.set(names, forKey: Pane.orderKey)
+        afterUpdate()  // 칸 높이가 달라도 아래 모서리를 그대로 두고 맞춘다
     }
 
     @objc private func toggleClaude() { setShown(claude: !model.showClaude, codex: model.showCodex) }
@@ -1219,6 +1504,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         menu.addItem(menuItem("위치 초기화", #selector(resetPosition)))
         addShownItems(to: menu)
         menu.addItem(menuItem("로그인할 때 자동으로 열기", #selector(toggleLoginItem)))
+        addConnectItem(to: menu)
         return menu
     }
 
@@ -1256,6 +1542,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return model.showClaude
         case #selector(toggleSessions):
             menuItem.state = model.showSessions ? .on : .off
+        case #selector(chooseOrder(_:)):
+            menuItem.state = (menuItem.representedObject as? [String]) == model.order.map(\.rawValue) ? .on : .off
         default:
             break
         }
@@ -1271,14 +1559,24 @@ enum StatusLine {
     static func handle(_ input: Data) -> String {
         guard let root = (try? JSONSerialization.jsonObject(with: input)) as? [String: Any] else { return "" }
         saveLimits(root)
+        saveSeen(root)
         return render(root)
+    }
+
+    /// 상태 표시줄이 돌았다는 표시와 한도 값이 왔는지(구독 로그인이 아니면 rate_limits 가 없다)
+    static func saveSeen(_ root: [String: Any]) {
+        let seen: [String: Any] = ["at": Date().timeIntervalSince1970, "limits": root["rate_limits"] is [String: Any],
+                                   "version": root["version"] as? String ?? ""]
+        guard let data = try? JSONSerialization.data(withJSONObject: seen) else { return }
+        try? FileManager.default.createDirectory(atPath: homeDir + "/.cache/ai-usage", withIntermediateDirectories: true)
+        try? data.write(to: URL(fileURLWithPath: ClaudeCodeLink.seenPath), options: .atomic)
     }
 
     static func saveLimits(_ root: [String: Any]) {
         guard let id = root["session_id"] as? String, id.range(of: "^[A-Za-z0-9_-]{1,128}$", options: .regularExpression) != nil,
               let limits = root["rate_limits"] as? [String: Any],
               let data = try? JSONSerialization.data(withJSONObject: limits) else { return }
-        let dir = NSHomeDirectory() + "/.cache/ai-usage/claude"
+        let dir = homeDir + "/.cache/ai-usage/claude"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let temp = "\(dir)/.\(id).tmp"
         guard FileManager.default.createFile(atPath: temp, contents: data) else { return }
@@ -1344,7 +1642,7 @@ enum StatusLine {
 /// 이미 떠 있으면 false (로그인 자동 실행과 직접 실행이 겹쳐도 하나만 뜨게).
 /// 다시 띄울 때는 앞의 것이 꺼지는 중일 수 있어 3초까지 기다린다.
 func takeSingleInstanceLock() -> Bool {
-    let dir = NSHomeDirectory() + "/.cache/ai-usage"
+    let dir = homeDir + "/.cache/ai-usage"
     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
     let fd = open(dir + "/pet.lock", O_CREAT | O_RDWR, 0o644)
     if fd < 0 { return true }
@@ -1362,7 +1660,20 @@ func takeSingleInstanceLock() -> Bool {
     codex.readLog()
     let fromLog = codex.fromLog
     codex.applyServer(CodexReader.fetchServerSync())
-    print(describe("Claude", ClaudeReader().read(now: now), now: now))
+    let claude = ClaudeReader().read(now: now)
+    print(describe("Claude", claude, now: now))
+    let link: String
+    switch ClaudeCodeLink.state() {
+    case .noClaudeCode: link = "Claude Code 없음(~/.claude 폴더 없음)"
+    case .notConnected: link = "안 됨 — 지금 명령: \(ClaudeCodeLink.command() ?? "없음")"
+    case .broken: link = "끊김(가리키는 앱 경로가 없음) — 지금 명령: \(ClaudeCodeLink.command() ?? "없음")"
+    case .connected: link = "됨"
+    }
+    print("  출처: \(claude.windows.isEmpty ? "-" : claude.source ?? "-") · Claude Code 연결: \(link)")
+    if let data = FileManager.default.contents(atPath: ClaudeCodeLink.seenPath),
+       let seen = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any], let at = number(seen["at"]) {
+        print("  상태 표시줄 마지막 실행 \(fullTime(Date(timeIntervalSince1970: at))) · 한도 값 \(seen["limits"] as? Bool == true ? "옴" : "안 옴") · Claude Code \(seen["version"] as? String ?? "?")")
+    }
     print(describe("ChatGPT · 기록", fromLog ?? ProviderSnapshot(message: "최근 기록 없음"), now: now))
     print(describe("ChatGPT · 서버", codex.fromServer ?? ProviderSnapshot(message: codex.serverError ?? "실패"), now: now))
     print(describe("ChatGPT · 표시", codex.current, now: now))
@@ -1413,6 +1724,10 @@ enum Main {
         }
         if args.contains("--print") {
             printOnce()
+            return
+        }
+        if args.contains("--connect") {  // 메뉴의 「Claude Code 에 연결」과 같은 일(터미널에서)
+            print(ClaudeCodeLink.connect())
             return
         }
         if let i = args.firstIndex(of: "--snapshot"), args.indices.contains(i + 1) {

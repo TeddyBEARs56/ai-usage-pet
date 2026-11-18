@@ -2,7 +2,8 @@
 // 설치.sh·지우기.sh 가 osascript -l JavaScript 로 부른다(맥 기본 기능만 써서 jq·node 가 없어도 된다).
 //   install   <settings> <앱 실행 파일> <연결 스크립트> <원래 설정 보관 파일> <백업 파일>
 //   uninstall <settings> <앱 실행 파일> <연결 스크립트> <원래 설정 보관 파일> <백업 파일>
-// 결과 한 단어를 돌려준다: new · wrapped · already · restored · removed · untouched · error:<이유>
+// 앱도 「Claude Code 에 연결」 메뉴와, 앱을 옮겨 경로가 끊겼을 때 같은 install 을 부른다.
+// 결과 한 단어를 돌려준다: new · wrapped · repaired · already · restored · removed · untouched · error:<이유>
 ObjC.import('Foundation');
 
 function read(path) {
@@ -49,7 +50,26 @@ function run(argv) {
   };
 
   if (mode === 'install') {
-    if (isOurs(command)) return 'already';
+    if (isOurs(command)) {
+      // 앱을 옮기거나 다시 깔아 경로가 바뀌었으면 새 경로로 고쳐 건다
+      // 「사용량」 같은 한글 경로는 설치.sh(합친 꼴)와 앱이 아는 경로(풀어 쓴 꼴)가 달라 맞춰서 비교한다
+      const same = (a, b) => a.normalize('NFC') === b.normalize('NFC');
+      const want = `"${bin}" --statusline`;
+      if (command.includes('ai-usage-statusline.sh')) {
+        const script = read(wrapperPath);
+        if (script !== null && script.normalize('NFC').includes(want.normalize('NFC'))) return 'already';
+        const saved = read(savedPath);
+        let original;
+        try { original = saved === null ? undefined : JSON.parse(saved).command; } catch (e) { original = undefined; }
+        if (typeof original !== 'string' || original.trim() === '') return 'error:원래 상태 표시줄 설정(' + savedPath + ')을 읽지 못했습니다';
+        write(wrapperPath, wrapperScript(bin, original), true);
+        return 'repaired';
+      }
+      if (same(command, want)) return 'already';
+      root.statusLine = Object.assign({}, current, { type: 'command', command: want });
+      save();
+      return 'repaired';
+    }
     if (typeof command === 'string' && command.trim() !== '') {
       // 쓰던 상태 표시줄이 있으면 그대로 보이게 감싸고, 원래 설정을 따로 남겨 둔다
       write(savedPath, JSON.stringify(current, null, 2) + '\n', true);

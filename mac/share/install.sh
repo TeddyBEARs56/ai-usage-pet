@@ -33,7 +33,8 @@ xattr -dr com.apple.quarantine "$app" 2>/dev/null  # 인터넷·메신저로 받
 print "✓ 앱을 넣었습니다 — ~/Applications/AI 사용량.app"
 
 # 2. Claude Code 상태 표시줄 연결
-if [[ -d "$claude_dir" ]] || command -v claude >/dev/null 2>&1; then
+# 터미널 설정(.zshrc)을 읽지 않고 도는 스크립트라 PATH 에 ~/.local/bin 이 없을 수 있어 따로 본다
+if [[ -d "$claude_dir" ]] || command -v claude >/dev/null 2>&1 || [[ -x "$HOME/.local/bin/claude" ]]; then
   mkdir -p "$claude_dir"
   result=$(osascript -l JavaScript "$app/Contents/Resources/claude-settings.js" install \
     "$claude_dir/settings.json" "$bin" "$claude_dir/ai-usage-statusline.sh" \
@@ -46,6 +47,9 @@ if [[ -d "$claude_dir" ]] || command -v claude >/dev/null 2>&1; then
       chmod +x "$claude_dir/ai-usage-statusline.sh"
       print "✓ Claude Code 에 연결했습니다 — 쓰시던 상태 표시줄은 그대로 보입니다."
       print "  (원래 설정은 ~/.claude/settings.json.bak-$stamp)" ;;
+    repaired)
+      [[ -f "$claude_dir/ai-usage-statusline.sh" ]] && chmod +x "$claude_dir/ai-usage-statusline.sh"
+      print "✓ Claude Code 연결을 새로 넣은 앱으로 고쳤습니다." ;;
     already)
       print "✓ Claude Code 는 이미 연결돼 있습니다." ;;
     *)
@@ -67,4 +71,5 @@ fi
 print
 print "끝났습니다. 화면 오른쪽 위에 창이 뜹니다."
 print -- "- 안 쓰는 칸 숨기기: 창 오른쪽 클릭 → 「Claude 보이기」 또는 「ChatGPT 보이기」"
-print -- "- Claude 값은 Claude Code 에서 한 번 대화하면 나옵니다."
+print -- "- Claude 값은 Claude Code 에서 한 번 대화하면 나옵니다. Claude 데스크톱 앱을 쓰는 동안 받은 값도 씁니다."
+print -- "- Claude Code 를 나중에 깔았다면: 창 오른쪽 클릭 → 「Claude Code 에 연결」"

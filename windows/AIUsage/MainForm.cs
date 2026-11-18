@@ -22,6 +22,7 @@ sealed class MainForm : Form
     readonly System.Windows.Forms.Timer serverTimer = new() { Interval = 300_000 };
     readonly ContextMenuStrip menu = new();
     ProviderSnapshot claudeSnap = new(), codexSnap = new();
+    Pane[] order = Settings.Order;
     DateTimeOffset now = DateTimeOffset.Now;
     bool fetching, useRegion;
     Font? fontName, fontSmall, fontRow, fontPercent;
@@ -67,6 +68,7 @@ sealed class MainForm : Form
     {
         base.OnLoad(e);
         MakeFonts();
+        ClaudeLink.RepairIfBroken();
         RefreshLocal();
         PlaceWindow(reset: false);
         ApplyCorners();
@@ -129,7 +131,10 @@ sealed class MainForm : Form
 
     int S(double value) => (int)Math.Round(value * DeviceDpi / 96.0);
 
-    int SectionHeight(ProviderSnapshot snap) => S(HeaderH) + Math.Max(1, snap.Windows.Count) * (S(Gap) + S(RowH));
+    /// 값이 없을 때 이유 글은 두 줄까지 접는다
+    static int Rows(ProviderSnapshot snap) => snap.Windows.Count == 0 ? 2 : snap.Windows.Count;
+
+    int SectionHeight(ProviderSnapshot snap) => S(HeaderH) + Rows(snap) * (S(Gap) + S(RowH));
 
     /// 내용 줄 수가 바뀌면 왼쪽 위 모서리를 그대로 두고 높이를 맞춘다
     void FitSize()
@@ -209,12 +214,25 @@ sealed class MainForm : Form
         if (fontName is null) return;
         var g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
-        var y = DrawSection(g, "Claude", null, Palette.Claude, claudeSnap, S(PadY));
-        y += S(SectionGap);
-        using (var pen = new Pen(Palette.Divider)) g.DrawLine(pen, S(PadX), y, Width - S(PadX), y);
-        y += 1 + S(SectionGap);
-        var detail = string.Join(" · ", new[] { "Codex", codexSnap.Plan }.Where(s => !string.IsNullOrEmpty(s)));
-        DrawSection(g, "ChatGPT", detail, Palette.ChatGPT, codexSnap, y);
+        var y = S(PadY);
+        for (var i = 0; i < order.Length; i++)  // 고른 순서대로(「칸 순서」 메뉴), 칸 사이에 구분선
+        {
+            if (i > 0)
+            {
+                y += S(SectionGap);
+                using (var pen = new Pen(Palette.Divider)) g.DrawLine(pen, S(PadX), y, Width - S(PadX), y);
+                y += 1 + S(SectionGap);
+            }
+            if (order[i] == Pane.Codex)
+            {
+                var detail = string.Join(" · ", new[] { "Codex", codexSnap.Plan }.Where(s => !string.IsNullOrEmpty(s)));
+                y = DrawSection(g, "ChatGPT", detail, Palette.ChatGPT, codexSnap, y);
+            }
+            else
+            {
+                y = DrawSection(g, "Claude", null, Palette.Claude, claudeSnap, y);
+            }
+        }
     }
 
     int DrawSection(Graphics g, string name, string? detail, Color dot, ProviderSnapshot snap, int top)
@@ -238,9 +256,11 @@ sealed class MainForm : Form
         if (snap.Windows.Count == 0)
         {
             y += S(Gap);
-            TextRenderer.DrawText(g, snap.Message ?? "값이 없습니다", fontRow, new Rectangle(left, y, right - left, S(RowH)),
-                                  Palette.Secondary, TextFlags | TextFormatFlags.EndEllipsis);
-            return y + S(RowH);
+            var height = S(RowH) * 2 + S(Gap);
+            TextRenderer.DrawText(g, snap.Message ?? "값이 없습니다", fontRow, new Rectangle(left, y, right - left, height),
+                                  Palette.Secondary, TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.WordBreak
+                                  | TextFormatFlags.EndEllipsis);
+            return y + height;
         }
         foreach (var window in snap.Windows)
         {
@@ -292,10 +312,17 @@ sealed class MainForm : Form
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("지금 새로고침", null, (_, _) => RefreshAll());
         menu.Items.Add("위치 초기화", null, (_, _) => PlaceWindow(reset: true));
+        var orderMenu = new ToolStripMenuItem("칸 순서");
+        foreach (var choice in Settings.Orders)
+            orderMenu.DropDownItems.Add(new ToolStripMenuItem(string.Join(" → ", choice.Select(Settings.Title)), null, (_, _) => ChooseOrder(choice))
+            {
+                Checked = choice.SequenceEqual(order),
+            });
+        menu.Items.Add(orderMenu);
         menu.Items.Add(new ToolStripMenuItem("Windows 시작할 때 자동으로 열기", null, (_, _) => AutoStart.Set(!AutoStart.IsOn)) { Checked = AutoStart.IsOn });
-        menu.Items.Add(new ToolStripMenuItem("Claude Code 상태 표시줄 연결", null, (_, _) => ClaudeLink.Ask(fromMenu: true))
+        menu.Items.Add(new ToolStripMenuItem("Claude Code 상태 표시줄 연결", null, (_, _) => { ClaudeLink.Ask(fromMenu: true); RefreshLocal(); })
         {
-            Checked = ClaudeSettings.IsConnected(ClaudeSettings.CurrentCommand()),
+            Checked = ClaudeSettings.State() == ClaudeSettings.LinkState.Connected,
         });
         if (!Installer.IsInstalled)
             menu.Items.Add("설치(시작 메뉴에 등록)", null, (_, _) => { if (Installer.InstallAndRelaunch(mutex)) Close(); });
@@ -304,9 +331,18 @@ sealed class MainForm : Form
         e.Cancel = false;  // 항목을 여기서 채우므로 열리게 둔다
     }
 
+    void ChooseOrder(Pane[] choice)
+    {
+        order = choice;
+        Settings.Order = choice;
+        Invalidate();
+    }
+
     IEnumerable<string> DetailLines()
     {
-        foreach (var (title, snap) in new[] { ("Claude (Claude Code 상태 표시줄)", claudeSnap), ("ChatGPT (Codex 한도)", codexSnap) })
+        foreach (var (title, snap) in order.Select(p => p == Pane.Codex
+                     ? ("ChatGPT (Codex 한도)", codexSnap)
+                     : ($"Claude ({claudeSnap.Source ?? "Claude Code 상태 표시줄"})", claudeSnap)))
         {
             yield return $"{title} · 마지막 값 {(snap.ObservedAt is { } at ? Fmt.FullTime(at) : "없음")}";
             foreach (var w in snap.Windows)

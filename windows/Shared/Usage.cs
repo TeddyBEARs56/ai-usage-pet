@@ -3,6 +3,8 @@
 //
 // 값의 출처
 //   Claude  : Claude Code 상태 표시줄(AIUsageStatus --statusline)이 세션마다 남기는 ~/.cache/ai-usage/claude/<세션>.json
+//             + Claude 데스크톱 앱이 남기는 plan-usage-history.json(초기화 시각 없음). 둘 중 나중 값을 쓴다
+//             (Claude Code 로그인 토큰은 읽지 않는다)
 //   ChatGPT : `codex app-server` 의 account/rateLimits/read(5분마다) + ~/.codex/sessions 기록에 찍히는 최신 한도
 
 using System.Diagnostics;
@@ -28,6 +30,7 @@ public sealed class ProviderSnapshot
     public DateTimeOffset? ObservedAt { get; set; }
     public string? Plan { get; set; }
     public string? Message { get; set; }
+    public string? Source { get; set; }  // 오른쪽 클릭 메뉴에 보일 값의 출처
 }
 
 public static class Paths
@@ -41,6 +44,33 @@ public static class Paths
     public static string ClaudeCache => Path.Combine(Home, ".cache", "ai-usage", "claude");
     public static string CodexSessions => Path.Combine(Home, ".codex", "sessions");
     public static string ClaudeSettings => Path.Combine(Home, ".claude", "settings.json");
+    public static string ClaudeDir => Path.Combine(Home, ".claude");
+    public static string ClaudeAccount => Path.Combine(Home, ".claude.json");
+    /// 상태 표시줄이 마지막으로 돈 때와 한도 값이 왔는지(값이 안 나올 때 이유를 말하려고)
+    public static string StatusSeen => Path.Combine(Home, ".cache", "ai-usage", "claude-statusline.json");
+
+    /// Claude 데스크톱 앱의 사용량 기록 후보. 설치판은 %APPDATA%\Claude, Microsoft Store 판은 Packages\…Claude…\LocalCache\Roaming\Claude.
+    /// 맥에서 돌려 볼 때는 ~/Library/Application Support/Claude.
+    public static List<string> ClaudeDesktopHistory()
+    {
+        const string name = "plan-usage-history.json";
+        if (Environment.GetEnvironmentVariable("AIUSAGE_HOME") is { Length: > 0 } || OperatingSystem.IsMacOS())
+            return new()
+            {
+                Path.Combine(Home, "AppData", "Roaming", "Claude", name),
+                Path.Combine(Home, "Library", "Application Support", "Claude", name),
+            };
+        var result = new List<string> { Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Claude", name) };
+        try
+        {
+            var packages = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Packages");
+            if (Directory.Exists(packages))
+                result.AddRange(Directory.EnumerateDirectories(packages, "*Claude_*")
+                                         .Select(dir => Path.Combine(dir, "LocalCache", "Roaming", "Claude", name)));
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        return result;
+    }
 }
 
 static class J
@@ -177,19 +207,45 @@ public sealed class ClaudeReader
         }
         foreach (var stale in cache.Keys.Where(k => !alive.Contains(k)).ToList()) cache.Remove(stale);
 
-        var snap = new ProviderSnapshot
-        {
-            ObservedAt = entries.Count > 0 ? new DateTimeOffset(entries.Max(e => e.Mtime), TimeSpan.Zero) : null,
-        };
+        // Claude Code 를 안 쓰는 동안에는 데스크톱 앱 기록이 더 새것일 수 있다(같은 계정일 때만)
+        DateTimeOffset? statusAt = entries.Count > 0 ? new DateTimeOffset(entries.Max(e => e.Mtime), TimeSpan.Zero) : null;
+        var desktop = ClaudeDesktopUsage.Latest(ClaudeCodeAccount.Organization(), now);
+        var snap = new ProviderSnapshot();
+        bool usedStatus = false, usedDesktop = false;
         foreach (var (key, label, minutes) in new[] { ("five_hour", "5시간", 300), ("seven_day", "주간", 10_080) })
         {
             var found = entries.Where(e => e.Limits.ContainsKey(key)).Select(e => e.Limits[key]).ToList();
-            if (found.Count == 0) continue;
-            var latest = found.Max(f => f.Reset);
-            var used = found.Where(f => f.Reset >= latest - 600).Max(f => f.Used);
-            snap.Windows.Add(new LimitWindow(key, label, minutes, used, J.Epoch(latest)));
+            double? used = null;
+            double reset = 0;
+            if (found.Count > 0)
+            {
+                reset = found.Max(f => f.Reset);
+                var latest = reset;
+                used = found.Where(f => f.Reset >= latest - 600).Max(f => f.Used);
+            }
+            var fromDesktop = false;
+            if (desktop is { } d && d.Used.TryGetValue(key, out var value) && (used is null || d.At > (statusAt ?? DateTimeOffset.MinValue)))
+            {
+                if (used is { } current && reset > d.At.ToUnixTimeMilliseconds() / 1000.0)
+                    used = Math.Max(current, value);  // 상태 표시줄이 본 창이 그때도 열려 있었다: 같은 창이라 초기화 시각을 이어 쓴다
+                else
+                {
+                    // 데스크톱 앱 기록에는 초기화 시각이 없다. 창 길이보다 오래된 기록이면 그 창은 이미 끝났다.
+                    used = (now - d.At).TotalMinutes >= minutes ? 0 : value;
+                    reset = 0;
+                }
+                fromDesktop = true;
+            }
+            if (used is not { } u) continue;
+            if (fromDesktop) usedDesktop = true; else usedStatus = true;
+            snap.Windows.Add(new LimitWindow(key, label, minutes, u, J.Epoch(reset)));
         }
-        if (snap.Windows.Count == 0) snap.Message = "Claude Code 에서 한 번 대화하면 표시됩니다";
+        var seen = new List<DateTimeOffset>();
+        if (usedStatus && statusAt is { } s) seen.Add(s);
+        if (usedDesktop && desktop is { } dd) seen.Add(dd.At);
+        snap.ObservedAt = seen.Count > 0 ? seen.Max() : null;
+        snap.Source = usedStatus && usedDesktop ? "Claude Code·데스크톱 앱" : usedDesktop ? "Claude 데스크톱 앱 기록" : "Claude Code 상태 표시줄";
+        if (snap.Windows.Count == 0) snap.Message = ClaudeSettings.EmptyMessage();
         return snap;
     }
 
@@ -200,6 +256,66 @@ public sealed class ClaudeReader
             if (J.Obj(limits, key) is { } w && J.Number(w, "used_percentage") is { } used)
                 result[key] = (used, J.Number(w, "resets_at") ?? 0);
         return result;
+    }
+}
+
+public sealed record DesktopUsageSample(DateTimeOffset At, Dictionary<string, double> Used);
+
+/// Claude 데스크톱 앱이 사용량을 서버에서 받을 때마다 남기는 기록(로그인 정보 없이 읽는다).
+/// 앱을 쓰는 동안에만 쌓이고, 4.5분에 한 번까지만 남으며, 초기화 시각은 없다. 공식 문서에 없는 파일이라 바뀔 수 있다.
+public static class ClaudeDesktopUsage
+{
+    /// 가장 최근 기록. Claude Code 계정(조직)을 알면 그 조직 것만, 8일보다 오래된 것은 뺀다.
+    public static DesktopUsageSample? Latest(string? org, DateTimeOffset now)
+    {
+        foreach (var path in Paths.ClaudeDesktopHistory())
+        {
+            if (!File.Exists(path)) continue;
+            try
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllBytes(path));
+                if (doc.RootElement.ValueKind != JsonValueKind.Object
+                    || !doc.RootElement.TryGetProperty("samples", out var samples) || samples.ValueKind != JsonValueKind.Array) continue;
+                DesktopUsageSample? best = null;
+                foreach (var sample in samples.EnumerateArray())
+                {
+                    if (J.Number(sample, "t") is not { } t) continue;
+                    var at = DateTimeOffset.FromUnixTimeMilliseconds((long)t);
+                    if (now - at >= TimeSpan.FromDays(8) || (best is not null && at <= best.At)) continue;
+                    if (org is not null && J.Str(sample, "org") is { } sampleOrg && sampleOrg != org) continue;
+                    var u = J.Obj(sample, "u") ?? sample;  // 1판은 fh·sd 가 바로 밑에 있다
+                    var used = new Dictionary<string, double>();
+                    if (J.Number(u, "fh") is { } fh) used["five_hour"] = fh;
+                    if (J.Number(u, "sd") is { } sd) used["seven_day"] = sd;
+                    if (used.Count > 0) best = new DesktopUsageSample(at, used);
+                }
+                if (best is not null) return best;
+            }
+            catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException) { }
+        }
+        return null;
+    }
+}
+
+/// Claude Code 가 로그인한 조직(~/.claude.json 의 oauthAccount.organizationUuid, 비밀값 아님).
+/// 데스크톱 앱이 다른 계정이면 그 기록은 쓰지 않으려고 본다. 파일이 바뀔 때만 다시 읽는다.
+public static class ClaudeCodeAccount
+{
+    static (DateTime Mtime, string? Org)? cached;
+
+    public static string? Organization()
+    {
+        try
+        {
+            if (!File.Exists(Paths.ClaudeAccount)) return null;
+            var mtime = File.GetLastWriteTimeUtc(Paths.ClaudeAccount);
+            if (cached is { } hit && hit.Mtime == mtime) return hit.Org;
+            using var doc = JsonDocument.Parse(File.ReadAllBytes(Paths.ClaudeAccount));
+            var org = J.Obj(doc.RootElement, "oauthAccount") is { } account ? J.Str(account, "organizationUuid") : null;
+            cached = (mtime, org);
+            return org;
+        }
+        catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException) { return null; }
     }
 }
 
@@ -464,7 +580,28 @@ public static class StatusLine
     {
         using var doc = JsonDocument.Parse(input);
         SaveLimits(doc.RootElement);
+        SaveSeen(doc.RootElement);
         return Render(doc.RootElement);
+    }
+
+    /// 상태 표시줄이 돌았다는 표시와 한도 값이 왔는지(구독 로그인이 아니면 rate_limits 가 없다)
+    static void SaveSeen(JsonElement root)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(Paths.StatusSeen)!);
+            var seen = new JsonObject
+            {
+                ["at"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0,
+                ["limits"] = J.Obj(root, "rate_limits") is not null,
+                ["version"] = J.Str(root, "version") ?? "",
+            };
+            var temp = Paths.StatusSeen + ".tmp";
+            File.WriteAllText(temp, seen.ToJsonString());
+            File.Move(temp, Paths.StatusSeen, overwrite: true);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 
     static void SaveLimits(JsonElement root)
@@ -576,6 +713,43 @@ public static class ClaudeSettings
     public static bool IsConnected(string? command) =>
         command is not null && command.Contains("AIUsageStatus", StringComparison.OrdinalIgnoreCase);
 
+    public enum LinkState { NoClaudeCode, NotConnected, Broken, Connected }
+
+    /// 걸려 있어도 가리키는 AIUsageStatus.exe 가 없으면 끊긴 것(Broken)
+    public static LinkState State()
+    {
+        if (!Directory.Exists(Paths.ClaudeDir)) return LinkState.NoClaudeCode;
+        var command = CurrentCommand();
+        if (!IsConnected(command)) return LinkState.NotConnected;
+        var exe = command!.Replace("--statusline", "").Trim().Trim('"');
+        return File.Exists(exe) ? LinkState.Connected : LinkState.Broken;
+    }
+
+    /// Claude 칸에 값이 하나도 없을 때 보일 이유
+    public static string EmptyMessage() => State() switch
+    {
+        LinkState.NoClaudeCode => "Claude Code 나 Claude 데스크톱 앱을 쓰면 표시됩니다",
+        LinkState.NotConnected => "Claude Code 에 연결되지 않았습니다 — 오른쪽 클릭 → 「Claude Code 상태 표시줄 연결」",
+        LinkState.Broken => "Claude Code 연결이 끊겼습니다 — 오른쪽 클릭 → 「Claude Code 상태 표시줄 연결」",
+        _ => LastSeen() is { Limits: false }
+            ? "Claude Code 가 한도 값을 보내지 않습니다 — Claude 구독(Pro·Max·Team)으로 로그인했는지, Claude Code 가 최신인지 확인"
+            : "Claude Code 에서 한 번 대화하면 표시됩니다",
+    };
+
+    public static (DateTimeOffset At, bool Limits, string Version)? LastSeen()
+    {
+        try
+        {
+            if (!File.Exists(Paths.StatusSeen)) return null;
+            using var doc = JsonDocument.Parse(File.ReadAllBytes(Paths.StatusSeen));
+            var root = doc.RootElement;
+            if (J.Epoch(J.Number(root, "at")) is not { } at) return null;
+            var limits = root.TryGetProperty("limits", out var l) && l.ValueKind == JsonValueKind.True;
+            return (at, limits, J.Str(root, "version") ?? "");
+        }
+        catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException) { return null; }
+    }
+
     /// statusLine 만 바꾸고 나머지 설정은 그대로 둔다. 원래 파일은 settings.json.bak-날짜 로 남긴다.
     public static void Connect(string statusExe)
     {
@@ -607,12 +781,26 @@ public static class Report
         codex.ReadLog();
         var fromLog = codex.FromLog;
         codex.ApplyServer(await CodexReader.FetchServerAsync());
-        return string.Join("\n", new[]
+        var claude = new ClaudeReader().Read(now);
+        var link = ClaudeSettings.State() switch
         {
-            Fmt.Describe("Claude", new ClaudeReader().Read(now), now),
+            ClaudeSettings.LinkState.NoClaudeCode => "Claude Code 없음(~\\.claude 폴더 없음)",
+            ClaudeSettings.LinkState.NotConnected => $"안 됨 — 지금 명령: {ClaudeSettings.CurrentCommand() ?? "없음"}",
+            ClaudeSettings.LinkState.Broken => $"끊김(가리키는 AIUsageStatus.exe 가 없음) — 지금 명령: {ClaudeSettings.CurrentCommand()}",
+            _ => "됨",
+        };
+        var lines = new List<string>
+        {
+            Fmt.Describe("Claude", claude, now),
+            $"  출처: {(claude.Windows.Count == 0 ? "-" : claude.Source)} · Claude Code 연결: {link}",
+        };
+        if (ClaudeSettings.LastSeen() is { } seen)
+            lines.Add($"  상태 표시줄 마지막 실행 {Fmt.FullTime(seen.At)} · 한도 값 {(seen.Limits ? "옴" : "안 옴")} · Claude Code {seen.Version}");
+        return string.Join("\n", lines.Concat(new[]
+        {
             Fmt.Describe("ChatGPT · 기록", fromLog ?? new ProviderSnapshot { Message = "최근 기록 없음" }, now),
             Fmt.Describe("ChatGPT · 서버", codex.FromServer ?? new ProviderSnapshot { Message = codex.ServerError ?? "실패" }, now),
             Fmt.Describe("ChatGPT · 표시", codex.Current, now),
-        });
+        }));
     }
 }

@@ -10,6 +10,7 @@ app="$HOME/Applications/AI 사용량.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$here/Info.plist" "$app/Contents/Info.plist"
 cp "$here/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
+cp "$here/share/claude-settings.js" "$app/Contents/Resources/claude-settings.js"
 swiftc -O -swift-version 5 -parse-as-library "$here/AIUsagePet.swift" -o "$app/Contents/MacOS/AIUsagePet"
 codesign --force --sign - "$app"
 # Finder·Dock 이 바뀐 아이콘을 다시 읽게 한다

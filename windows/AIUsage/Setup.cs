@@ -158,15 +158,48 @@ static class Settings
             key.SetValue("InstallDeclined", value ? 1 : 0, RegistryValueKind.DWord);
         }
     }
+
+    /// 「칸 순서」 메뉴에 나오는 순서 전부. 맨 앞이 기본(맥판의 세션 칸은 Windows 에 없다).
+    public static readonly Pane[][] Orders = { new[] { Pane.Claude, Pane.Codex }, new[] { Pane.Codex, Pane.Claude } };
+
+    public static string Title(Pane pane) => pane == Pane.Codex ? "ChatGPT" : "Claude";
+
+    /// 창 안 칸 순서(값 Order = "claude,codex"). 모르는 값이면 기본 순서.
+    public static Pane[] Order
+    {
+        get
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(Key);
+            var saved = key?.GetValue("Order") as string;
+            return Orders.FirstOrDefault(o => string.Join(",", o.Select(Name)) == saved) ?? Orders[0];
+        }
+        set
+        {
+            using var key = Registry.CurrentUser.CreateSubKey(Key);
+            key.SetValue("Order", string.Join(",", value.Select(Name)), RegistryValueKind.String);
+        }
+    }
+
+    static string Name(Pane pane) => pane == Pane.Codex ? "codex" : "claude";  // 맥판 paneOrder 와 같은 이름
 }
+
+enum Pane { Claude, Codex }
 
 /// Claude 값을 받으려면 Claude Code 상태 표시줄을 AIUsageStatus 로 걸어야 한다
 static class ClaudeLink
 {
+    /// 상태 표시줄이 이 프로그램을 가리키는데 그 파일이 없으면(지웠거나 다른 곳에서 켰거나) 묻지 않고 다시 건다
+    public static void RepairIfBroken()
+    {
+        if (ClaudeSettings.State() != ClaudeSettings.LinkState.Broken) return;
+        try { ClaudeSettings.Connect(Installer.EnsureStatusExe()); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or InvalidDataException or System.Text.Json.JsonException) { }
+    }
+
     public static void Ask(bool fromMenu)
     {
         var current = ClaudeSettings.CurrentCommand();
-        if (ClaudeSettings.IsConnected(current))
+        if (ClaudeSettings.State() == ClaudeSettings.LinkState.Connected)
         {
             if (fromMenu) MessageBox.Show($"이미 연결돼 있습니다.\n\n{current}", "AI 사용량", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
@@ -175,7 +208,7 @@ static class ClaudeLink
         if (!fromMenu && !Directory.Exists(Path.GetDirectoryName(Paths.ClaudeSettings))) return;
 
         var question = "Claude 값을 받으려면 Claude Code 상태 표시줄을 이 프로그램과 연결해야 합니다.\n\n"
-            + (current is null ? "" : $"지금 쓰는 상태 표시줄({current})은 AI 사용량의 상태 표시줄로 바뀝니다. 원래 설정은 settings.json.bak-날짜 파일로 남깁니다.\n\n")
+            + (current is null || ClaudeSettings.IsConnected(current) ? "" : $"지금 쓰는 상태 표시줄({current})은 AI 사용량의 상태 표시줄로 바뀝니다. 원래 설정은 settings.json.bak-날짜 파일로 남깁니다.\n\n")
             + "연결할까요?";
         if (MessageBox.Show(question, "AI 사용량", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
         try
