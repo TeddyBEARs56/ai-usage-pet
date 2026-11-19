@@ -4,6 +4,7 @@
 #   zsh release.sh windows ["바뀐 점"]    windows/*/*.csproj 의 <Version> → 태그 windows-v<버전>, 파일 AIUsage.exe
 # 먼저 버전을 올려 커밋·push 한다(맥: CFBundleShortVersionString·CFBundleVersion, Windows: 두 csproj 의 <Version>).
 # 앱은 태그의 버전이 지금보다 높을 때만 바꾸므로, 버전을 안 올리면 올려도 아무도 안 바뀐다.
+# 올린 뒤 README.md 「받기」 표의 버전·링크를 새 판으로 고쳐 커밋·push 한다.
 set -euo pipefail
 
 root=${0:A:h}
@@ -65,3 +66,16 @@ body="${notes:+$notes
 }$install_note"
 gh release create "$tag" "$asset" -R $repo --target "$(git rev-parse HEAD)" --title "$title" --notes "$body"
 print "올림: $tag — $(gh release view "$tag" -R $repo --json assets -q '.assets[] | "\(.name) \(.size)바이트 \(.digest // "digest 없음")"')"
+
+# README 「받기」 표: 그 판 줄(링크에 releases/download/<target>-v 가 든 줄)의 버전 칸과 링크를 새 판으로
+url="https://github.com/$repo/releases/download/$tag/${asset:t}"
+VERSION=$version URL=$url NAME=${asset:t} TARGET=$target perl -pi -e '
+  if (m{releases/download/$ENV{TARGET}-v}) {
+    s{^(\|[^|]*\|) [0-9.]+ \|}{$1 $ENV{VERSION} |};
+    s{\[[^\]]+\]\(https://github\.com/[^)]*/releases/download/$ENV{TARGET}-v[^)]*\)}{[$ENV{NAME}]($ENV{URL})};
+  }' README.md
+if ! git diff --quiet README.md; then
+  git commit -q -m "README 받기 링크: $tag" README.md
+  git push -q origin main
+  print "README 받기 링크를 $tag 로 고쳐 push 함"
+fi
