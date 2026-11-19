@@ -289,13 +289,14 @@ public static class Fmt
 
 /// 세션마다 마지막으로 받은 한도를 모아, 가장 최근 창(초기화 시각이 가장 늦은 것)에서 가장 많이 쓴 값을 쓴다.
 /// 같은 창 안에서 사용률은 줄지 않으므로, 오래 쉬던 세션이 옛 값을 다시 써도 표시가 뒤로 가지 않는다.
+/// 지금 로그인한 계정 값만 쓴다: 기록에 적힌 계정(account)이 다르면 빼고, 계정이 안 적힌 옛 기록은 계정을 바꾼 뒤 쓰인 것만(맥 판과 같다).
 public sealed class ClaudeReader
 {
-    readonly Dictionary<string, (DateTime Mtime, Dictionary<string, (double Used, double Reset)> Limits)> cache = new();
+    readonly Dictionary<string, (DateTime Mtime, Dictionary<string, (double Used, double Reset)> Limits, string? Account)> cache = new();
 
     public ProviderSnapshot Read(DateTimeOffset now)
     {
-        var entries = new List<(DateTime Mtime, Dictionary<string, (double Used, double Reset)> Limits)>();
+        var entries = new List<(DateTime Mtime, Dictionary<string, (double Used, double Reset)> Limits, string? Account)>();
         var alive = new HashSet<string>();
         if (Directory.Exists(Paths.ClaudeCache))
         {
@@ -316,17 +317,27 @@ public sealed class ClaudeReader
                     continue;
                 }
                 Dictionary<string, (double Used, double Reset)> limits;
+                string? owner;
                 try
                 {
                     using var doc = JsonDocument.Parse(File.ReadAllBytes(path));
                     limits = FromRateLimits(doc.RootElement);
+                    owner = J.Str(doc.RootElement, "account");
                 }
                 catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException) { continue; }
-                cache[path] = (mtime, limits);
-                entries.Add((mtime, limits));
+                cache[path] = (mtime, limits, owner);
+                entries.Add((mtime, limits, owner));
             }
         }
         foreach (var stale in cache.Keys.Where(k => !alive.Contains(k)).ToList()) cache.Remove(stale);
+
+        var me = ClaudeCodeAccount.Identity();
+        var since = AccountSwitch.Since("claude", me, now);
+        // 지금 계정이 적힌 기록이 있으면 계정이 안 적힌 옛 기록(이 판 전에 쓰인 것)은 쓰지 않는다
+        var tagged = me is not null && entries.Any(e => e.Account == me);
+        entries = entries.Where(e => e.Account is { } account
+            ? account == me  // 로그아웃이면 어느 계정 것도 아니다
+            : !tagged && new DateTimeOffset(e.Mtime, TimeSpan.Zero) >= since).ToList();
 
         // Claude Code 를 안 쓰는 동안에는 데스크톱 앱 기록이 더 새것일 수 있다(같은 계정일 때만)
         DateTimeOffset? statusAt = entries.Count > 0 ? new DateTimeOffset(entries.Max(e => e.Mtime), TimeSpan.Zero) : null;
@@ -422,21 +433,65 @@ public static class ClaudeDesktopUsage
 /// 데스크톱 앱이 다른 계정이면 그 기록은 쓰지 않으려고 본다. 파일이 바뀔 때만 다시 읽는다.
 public static class ClaudeCodeAccount
 {
-    static (DateTime Mtime, string? Org)? cached;
+    static (DateTime Mtime, string? Org, string? Identity)? cached;
 
-    public static string? Organization()
+    public static string? Organization() => Read()?.Org;
+
+    /// Claude Code 에 로그인한 계정 — 「사용자 id|조직 id」. 한도는 계정마다 따로라 이것으로 값을 가른다(로그인 정보가 없으면 null)
+    public static string? Identity() => Read()?.Identity;
+
+    static (string? Org, string? Identity)? Read()
     {
         try
         {
             if (!File.Exists(Paths.ClaudeAccount)) return null;
             var mtime = File.GetLastWriteTimeUtc(Paths.ClaudeAccount);
-            if (cached is { } hit && hit.Mtime == mtime) return hit.Org;
+            if (cached is { } hit && hit.Mtime == mtime) return (hit.Org, hit.Identity);
             using var doc = JsonDocument.Parse(File.ReadAllBytes(Paths.ClaudeAccount));
-            var org = J.Obj(doc.RootElement, "oauthAccount") is { } account ? J.Str(account, "organizationUuid") : null;
-            cached = (mtime, org);
-            return org;
+            string? org = null, identity = null;
+            if (J.Obj(doc.RootElement, "oauthAccount") is { } account)
+            {
+                org = J.Str(account, "organizationUuid");
+                var user = J.Str(account, "accountUuid");
+                if (user is not null || org is not null) identity = $"{user}|{org}";
+            }
+            cached = (mtime, org, identity);
+            return (org, identity);
         }
         catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException) { return null; }
+    }
+}
+
+/// 계정을 바꾼 때를 기억한다(~/.cache/ai-usage/accounts.json, 맥 판과 같은 파일 모양). 어느 계정 값인지 적혀 있지 않은 기록은
+/// 마지막으로 계정이 바뀐 뒤에 쓰인 것만 지금 계정 값으로 본다. 처음 보는 계정이면 바뀐 때를 모르니 다 쓴다.
+public static class AccountSwitch
+{
+    static readonly object Gate = new();
+    static string FilePath => Path.Combine(Paths.Home, ".cache", "ai-usage", "accounts.json");
+
+    public static DateTimeOffset Since(string kind, string? id, DateTimeOffset now)
+    {
+        if (id is null) return DateTimeOffset.MinValue;
+        lock (Gate)
+        {
+            JsonObject root;
+            try { root = JsonNode.Parse(File.ReadAllText(FilePath)) as JsonObject ?? new JsonObject(); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException) { root = new JsonObject(); }
+            var saved = root[kind] as JsonObject;
+            if (saved is not null && saved["id"]?.GetValueKind() == JsonValueKind.String && (string?)saved["id"] == id)
+            {
+                var at = saved["since"]?.GetValueKind() == JsonValueKind.Number ? (double)saved["since"]! : 0;
+                return at > 0 ? DateTimeOffset.FromUnixTimeMilliseconds((long)(at * 1000)) : DateTimeOffset.MinValue;
+            }
+            root[kind] = new JsonObject { ["id"] = id, ["since"] = saved is null ? 0 : now.ToUnixTimeMilliseconds() / 1000.0 };
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
+                File.WriteAllText(FilePath, root.ToJsonString());
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+            return saved is null ? DateTimeOffset.MinValue : now;  // 처음이면 바뀐 때를 모른다
+        }
     }
 }
 
@@ -445,6 +500,9 @@ public static class ClaudeCodeAccount
 public sealed class CodexReader
 {
     string lastLogKey = "";
+    string? account;
+    bool accountKnown;
+    readonly Dictionary<string, string?> logAccounts = new();  // 기록 파일 → 만든 계정(파일마다 한 번만 읽는다)
 
     public ProviderSnapshot? FromLog { get; private set; }
     public ProviderSnapshot? FromServer { get; private set; }
@@ -456,22 +514,81 @@ public sealed class CodexReader
         new[] { FromLog, FromServer }.OfType<ProviderSnapshot>().OrderByDescending(s => s.ObservedAt ?? DateTimeOffset.MinValue).FirstOrDefault()
         ?? new ProviderSnapshot { Message = ServerError ?? T("Codex 한도를 읽는 중…") };
 
-    /// Codex 를 쓰는 동안 기록 파일에 찍히는 최신 한도(파일이 바뀌었을 때만 다시 읽는다)
-    public void ReadLog()
+    /// Codex 를 쓰는 동안 기록 파일에 찍히는 최신 한도(파일이 바뀌었을 때만 다시 읽는다).
+    /// 지금 로그인한 계정(~/.codex/auth.json 의 account_id)이 만든 기록만 쓴다. 계정이 바뀌었으면 true —
+    /// 앞 계정 값은 버렸으니 부른 쪽이 서버에 바로 다시 묻는다(맥 판과 같다).
+    public bool ReadLog()
     {
-        var files = RecentRolloutFiles(DateTimeOffset.Now);
-        if (files.Count == 0) return;
-        var key = $"{files[0].Path}|{files[0].Mtime.Ticks}";
-        if (key == lastLogKey) return;
-        lastLogKey = key;
-        foreach (var file in files.Take(5))
+        var me = CurrentAccount();
+        var switched = false;
+        if (!accountKnown || me != account)
         {
+            switched = accountKnown && account is not null;  // 다른 계정으로 바꿨거나 로그아웃
+            if (switched)
+            {
+                FromLog = null;
+                FromServer = null;
+                ServerError = null;
+            }
+            account = me;
+            accountKnown = true;
+        }
+        var since = AccountSwitch.Since("codex", me, DateTimeOffset.Now);
+        var files = RecentRolloutFiles(DateTimeOffset.Now);
+        if (files.Count == 0) return switched;
+        var key = $"{files[0].Path}|{files[0].Mtime.Ticks}|{me}";
+        if (key == lastLogKey) return switched;
+        lastLogKey = key;
+        foreach (var gone in logAccounts.Keys.Where(k => files.All(f => f.Path != k)).ToList()) logAccounts.Remove(gone);
+        foreach (var file in files.Take(10))
+        {
+            if (!logAccounts.TryGetValue(file.Path, out var owner)) logAccounts[file.Path] = owner = CreatorAccount(file.Path);
+            if (owner is not null)
+            {
+                if (owner != me) continue;  // 다른 계정으로 쓴 기록(로그아웃·API 키면 어느 계정 것도 아니다)
+            }
+            else if (new DateTimeOffset(file.Mtime, TimeSpan.Zero) < since)
+            {
+                continue;  // 계정이 안 적힌 기록은 계정을 바꾼 뒤 것만
+            }
             if (LastLimits(file.Path, file.Mtime) is { } snap)
             {
                 FromLog = snap;
-                return;
+                return switched;
             }
         }
+        FromLog = null;
+        return switched;
+    }
+
+    /// 지금 Codex 에 로그인한 ChatGPT 계정(auth.json 의 tokens.account_id 만 읽는다). API 키 로그인이면 null
+    static string? CurrentAccount()
+    {
+        try
+        {
+            var path = Path.Combine(Paths.Home, ".codex", "auth.json");
+            if (!File.Exists(path)) return null;
+            using var doc = JsonDocument.Parse(File.ReadAllBytes(path));
+            return J.Obj(doc.RootElement, "tokens") is { } tokens ? J.Str(tokens, "account_id") : null;
+        }
+        catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException) { return null; }
+    }
+
+    static readonly Regex CreatorPattern = new("\"creator_account_id\"\\s*:\\s*\"([^\"]+)\"", RegexOptions.CultureInvariant);
+
+    /// 기록 첫 줄(session_meta)의 creator_account_id — 그 기록을 만든 계정. 첫 줄은 길 수 있어 앞 1MB 에서 찾는다
+    static string? CreatorAccount(string path)
+    {
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var head = new byte[(int)Math.Min(stream.Length, 1_000_000)];
+            stream.ReadExactly(head);
+            var newline = Array.IndexOf(head, (byte)'\n');
+            var first = Encoding.UTF8.GetString(head, 0, newline >= 0 ? newline : head.Length);
+            return CreatorPattern.Match(first) is { Success: true } match ? match.Groups[1].Value : null;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return null; }
     }
 
     public void ApplyServer((ProviderSnapshot? Snap, string? Error) result)
@@ -732,7 +849,9 @@ public static class StatusLine
         {
             Directory.CreateDirectory(Paths.ClaudeCache);
             var temp = Path.Combine(Paths.ClaudeCache, $".{id}.tmp");
-            File.WriteAllText(temp, limits.GetRawText());
+            var saved = JsonNode.Parse(limits.GetRawText()) as JsonObject ?? new JsonObject();
+            if (ClaudeCodeAccount.Identity() is { } account) saved["account"] = account;  // 어느 계정 값인지(계정을 바꿔도 섞이지 않게)
+            File.WriteAllText(temp, saved.ToJsonString());
             File.Move(temp, Path.Combine(Paths.ClaudeCache, $"{id}.json"), overwrite: true);
         }
         catch (IOException) { }

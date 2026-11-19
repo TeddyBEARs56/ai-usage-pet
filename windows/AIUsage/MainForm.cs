@@ -149,10 +149,11 @@ sealed class MainForm : Form
     {
         now = DateTimeOffset.Now;
         claudeSnap = claude.Read(now);
-        codex.ReadLog();
+        var codexSwitched = codex.ReadLog();
         codexSnap = codex.Current;
         FitSize();
         Invalidate();
+        if (codexSwitched) RefreshServer();  // ChatGPT 계정이 바뀌었다: 5분 기다리지 않고 새 계정 값을 묻는다
     }
 
     async void RefreshServer()

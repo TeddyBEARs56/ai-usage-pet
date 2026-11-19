@@ -38,6 +38,10 @@ ChatGPT 대화(웹·앱) 자체의 한도는 밖에서 읽을 방법이 없어 C
   - 그래서 Claude Code 도 데스크톱 앱도 한동안 안 쓰면 값이 멈춰 있다(「n분 전」 확인). claude.ai 웹에서 쓴 양도 같은 한도에서 깎이고, 다음에 둘 중 하나가 값을 받을 때 반영된다.
   - 값이 하나도 없으면 Claude 칸에 이유를 쓴다: Claude Code 없음 / 상태 표시줄 연결 안 됨 / 연결이 끊김(앱을 옮김 등) / 상태 표시줄은 도는데 한도 값이 안 옴(구독 로그인이 아님 등) / 아직 대화 전. 상태 표시줄은 돌 때마다 `~/.cache/ai-usage/claude-statusline.json` 에 그 시각과 한도 값이 왔는지 남긴다.
   - 두 파일 모두 공식 문서에 없는 형식이라 Claude Code·데스크톱 앱 업데이트로 바뀔 수 있다.
+- **계정을 바꿨을 때**: 한도는 계정마다 따로라 지금 로그인한 계정 값만 쓴다.
+  - Claude: 상태 표시줄이 한도를 남길 때 그때 Claude Code 에 로그인한 계정(`~/.claude.json` 의 `oauthAccount` 사용자 id|조직 id)을 `account` 로 함께 적고, 창은 지금 계정과 같은 것만 쓴다. 계정이 안 적힌 옛 기록(1.5 이전, 또는 직접 만든 `statusline.sh` 의 jq 줄)은 지금 계정이 적힌 기록이 하나도 없을 때만, 그것도 계정을 바꾼 뒤 쓰인 것만 쓴다. 바뀐 때는 `~/.cache/ai-usage/accounts.json` 에 남는다.
+  - ChatGPT: Codex 기록 첫 줄의 `creator_account_id` 가 지금 로그인(`~/.codex/auth.json` 의 `tokens.account_id` 만 읽는다)과 같은 기록만 쓴다. 15초마다 보다가 계정이 바뀌면 앞 계정 값을 버리고 5분을 기다리지 않고 바로 서버에 다시 묻는다.
+  - 그래서 계정을 바꾼 직후 Claude 칸은 새 계정으로 Claude Code 에서 한 번 대화할 때까지 비어 있을 수 있다(앞 계정 값을 보여 주지 않는다). 로그아웃 상태면 어느 계정 값도 쓰지 않는다.
 - **ChatGPT**: 5분마다 `codex app-server` 를 잠깐 띄워 `account/rateLimits/read` 로 묻는다(1초 정도, 인증은 codex 가 처리). Codex 를 쓰는 동안은 `~/.codex/sessions` 기록에 찍히는 값을 15초마다 읽는다. 둘 중 나중에 확인한 값을 쓴다.
 
 규칙을 바꿀 때는 두 판을 같이 고친다: 맥 `mac/AIUsagePet.swift`, Windows `windows/Shared/Usage.cs`.

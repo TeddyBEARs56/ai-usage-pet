@@ -158,6 +158,7 @@ func planName(_ raw: String?) -> String? {
 
 /// 세션마다 마지막으로 받은 한도를 모아, 가장 최근 창(초기화 시각이 가장 늦은 것)에서 가장 많이 쓴 값을 쓴다.
 /// 같은 창 안에서 사용률은 줄지 않으므로, 오래 쉬던 세션이 옛 값을 다시 써도 표시가 뒤로 가지 않는다.
+/// 지금 로그인한 계정 값만 쓴다: 기록에 적힌 계정(account)이 다르면 빼고, 계정이 안 적힌 옛 기록은 계정을 바꾼 뒤 쓰인 것만.
 final class ClaudeReader {
     private let dir = homeDir + "/.cache/ai-usage/claude"
     private var cache: [String: (mtime: Date, limits: [String: Any])] = [:]
@@ -184,6 +185,14 @@ final class ClaudeReader {
             entries.append((mtime, limits))
         }
         cache = cache.filter { alive.contains($0.key) }
+        let me = ClaudeCodeAccount.identity()
+        let since = AccountSwitch.since("claude", id: me, now: now)
+        // 지금 계정이 적힌 기록이 있으면 계정이 안 적힌 옛 기록(이 판 전에 쓰인 것)은 쓰지 않는다
+        let tagged = me != nil && entries.contains { $0.limits["account"] as? String == me }
+        entries = entries.filter { entry in
+            if let account = entry.limits["account"] as? String { return account == me }  // 로그아웃이면 어느 계정 것도 아니다
+            return !tagged && entry.mtime >= since
+        }
 
         // Claude Code 를 안 쓰는 동안에는 데스크톱 앱 기록이 더 새것일 수 있다(같은 계정일 때만)
         let statusAt = entries.map { $0.mtime }.max()
@@ -259,19 +268,53 @@ enum ClaudeDesktopUsage {
 /// Claude Code 가 로그인한 조직(~/.claude.json 의 oauthAccount.organizationUuid, 비밀값 아님).
 /// 데스크톱 앱이 다른 계정이면 그 기록은 쓰지 않으려고 본다. 파일이 바뀔 때만 다시 읽는다.
 enum ClaudeCodeAccount {
-    private static var cached: (mtime: Date, org: String?)?
+    private static var cached: (mtime: Date, org: String?, identity: String?)?
 
-    static func organization() -> String? {
+    /// Claude Code 에 로그인한 조직(데스크톱 앱 기록을 고를 때)
+    static func organization() -> String? { read()?.org }
+
+    /// Claude Code 에 로그인한 계정 — 「사용자 id|조직 id」. 한도는 계정마다 따로라 이것으로 값을 가른다(로그인 정보가 없으면 nil)
+    static func identity() -> String? { read()?.identity }
+
+    private static func read() -> (org: String?, identity: String?)? {
         let path = homeDir + "/.claude.json"
         guard let mtime = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date else { return nil }
-        if let cached, cached.mtime == mtime { return cached.org }
-        var org: String?
+        if let cached, cached.mtime == mtime { return (cached.org, cached.identity) }
+        var org: String?, identity: String?
         if let data = FileManager.default.contents(atPath: path),
-           let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
-            org = (root["oauthAccount"] as? [String: Any])?["organizationUuid"] as? String
+           let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           let account = root["oauthAccount"] as? [String: Any] {
+            org = account["organizationUuid"] as? String
+            let user = account["accountUuid"] as? String
+            if user != nil || org != nil { identity = "\(user ?? "")|\(org ?? "")" }
         }
-        cached = (mtime, org)
-        return org
+        cached = (mtime, org, identity)
+        return (org, identity)
+    }
+}
+
+/// 계정을 바꾼 때를 기억한다(~/.cache/ai-usage/accounts.json). 어느 계정 값인지 적혀 있지 않은 기록은
+/// 마지막으로 계정이 바뀐 뒤에 쓰인 것만 지금 계정 값으로 본다. 처음 보는 계정이면 바뀐 때를 모르니 다 쓴다.
+enum AccountSwitch {
+    static let path = homeDir + "/.cache/ai-usage/accounts.json"
+    private static let lock = NSLock()
+
+    /// kind(claude·codex)의 지금 계정이 id 일 때, 그 계정으로 바뀐 시각
+    static func since(_ kind: String, id: String?, now: Date = Date()) -> Date {
+        guard let id else { return .distantPast }
+        lock.lock()
+        defer { lock.unlock() }
+        var root = (FileManager.default.contents(atPath: path)
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]) ?? [:]
+        let saved = root[kind] as? [String: Any]
+        if let saved, saved["id"] as? String == id { return Date(timeIntervalSince1970: number(saved["since"]) ?? 0) }
+        let since = saved == nil ? Date.distantPast : now  // 처음이면 바뀐 때를 모른다
+        root[kind] = ["id": id, "since": saved == nil ? 0 : now.timeIntervalSince1970]
+        if let data = try? JSONSerialization.data(withJSONObject: root) {
+            try? FileManager.default.createDirectory(atPath: homeDir + "/.cache/ai-usage", withIntermediateDirectories: true)
+            try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        }
+        return since
     }
 }
 
@@ -377,6 +420,8 @@ enum ClaudeCodeLink {
 final class CodexReader {
     private var lastLogKey = ""
     private var fetching = false
+    private var account: String?
+    private var logAccounts: [String: String?] = [:]  // 기록 파일 → 만든 계정(파일마다 한 번만 읽는다)
     private(set) var fromLog: ProviderSnapshot?
     private(set) var fromServer: ProviderSnapshot?
     private(set) var serverError: String?
@@ -389,19 +434,59 @@ final class CodexReader {
         return ProviderSnapshot(message: serverError ?? T("Codex 한도를 읽는 중…"))
     }
 
-    /// Codex 를 쓰는 동안 기록 파일에 찍히는 최신 한도(파일이 바뀌었을 때만 다시 읽는다)
-    func readLog() {
+    /// Codex 를 쓰는 동안 기록 파일에 찍히는 최신 한도(파일이 바뀌었을 때만 다시 읽는다).
+    /// 지금 로그인한 계정(~/.codex/auth.json 의 account_id)이 만든 기록만 쓴다. 계정이 바뀌었으면 true —
+    /// 앞 계정 값은 버렸으니 부른 쪽이 서버에 바로 다시 묻는다.
+    @discardableResult
+    func readLog() -> Bool {
+        let me = Self.currentAccount()
+        var switched = false
+        if me != account {
+            switched = account != nil  // 다른 계정으로 바꿨거나 로그아웃: 앞 계정 값을 버린다
+            if switched { fromLog = nil; fromServer = nil; serverError = nil }
+            account = me
+        }
+        let since = AccountSwitch.since("codex", id: me)
         let files = Self.recentRolloutFiles()
-        guard let newest = files.first else { return }
-        let key = "\(newest.path)|\(newest.mtime.timeIntervalSince1970)"
-        guard key != lastLogKey else { return }
+        guard let newest = files.first else { return switched }
+        let key = "\(newest.path)|\(newest.mtime.timeIntervalSince1970)|\(me ?? "")"
+        guard key != lastLogKey else { return switched }
         lastLogKey = key
-        for file in files.prefix(5) {
+        logAccounts = logAccounts.filter { path, _ in files.contains { $0.path == path } }
+        for file in files.prefix(10) {
+            if logAccounts[file.path] == nil { logAccounts[file.path] = .some(Self.creatorAccount(inLog: file.path)) }
+            if let owner = logAccounts[file.path] ?? nil {
+                if owner != me { continue }  // 다른 계정으로 쓴 기록(로그아웃·API 키면 어느 계정 것도 아니다)
+            } else if file.mtime < since {
+                continue  // 계정이 안 적힌 기록은 계정을 바꾼 뒤 것만
+            }
             if let snap = Self.lastLimits(inLog: file.path, mtime: file.mtime) {
                 fromLog = snap
-                return
+                return switched
             }
         }
+        fromLog = nil
+        return switched
+    }
+
+    /// 지금 Codex 에 로그인한 ChatGPT 계정(auth.json 의 tokens.account_id 만 읽는다). API 키 로그인이면 nil
+    static func currentAccount() -> String? {
+        guard let data = FileManager.default.contents(atPath: homeDir + "/.codex/auth.json"),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        return (root["tokens"] as? [String: Any])?["account_id"] as? String
+    }
+
+    /// 기록 첫 줄(session_meta)의 creator_account_id — 그 기록을 만든 계정. 첫 줄은 길 수 있어 앞 1MB 에서 찾는다
+    static func creatorAccount(inLog path: String) -> String? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        guard let head = try? handle.read(upToCount: 1_000_000) else { return nil }
+        let firstLine = head.split(separator: 0x0A, maxSplits: 1, omittingEmptySubsequences: false).first ?? Data()
+        guard let text = String(data: firstLine, encoding: .utf8),
+              let match = text.range(of: #""creator_account_id"\s*:\s*"[^"]+""#, options: .regularExpression) else { return nil }
+        let pair = text[match]
+        guard let colon = pair.firstIndex(of: ":") else { return nil }
+        return pair[pair.index(after: colon)...].trimmingCharacters(in: CharacterSet(charactersIn: " \""))
     }
 
     func refreshServer(done: @escaping () -> Void) {
@@ -1366,10 +1451,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     @objc private func refreshLocal() {
         model.now = Date()
         model.claude = claude.read(now: model.now)
-        codex.readLog()
+        let codexSwitched = codex.readLog()
         model.codex = codex.current
         refreshSessions()
         afterUpdate()
+        if codexSwitched { refreshServer() }  // ChatGPT 계정이 바뀌었다: 5분 기다리지 않고 새 계정 값을 묻는다
     }
 
     /// 세션 상태는 자주 바뀌므로 3초마다 읽는다(파일 몇 개와 기록 끝부분만 읽어 가볍다)
@@ -1778,8 +1864,9 @@ enum StatusLine {
 
     static func saveLimits(_ root: [String: Any]) {
         guard let id = root["session_id"] as? String, id.range(of: "^[A-Za-z0-9_-]{1,128}$", options: .regularExpression) != nil,
-              let limits = root["rate_limits"] as? [String: Any],
-              let data = try? JSONSerialization.data(withJSONObject: limits) else { return }
+              var limits = root["rate_limits"] as? [String: Any] else { return }
+        limits["account"] = ClaudeCodeAccount.identity()  // 어느 계정 값인지(계정을 바꿔도 섞이지 않게)
+        guard let data = try? JSONSerialization.data(withJSONObject: limits) else { return }
         let dir = homeDir + "/.cache/ai-usage/claude"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let temp = "\(dir)/.\(id).tmp"
