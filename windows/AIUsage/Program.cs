@@ -17,7 +17,7 @@ static class Program
         if (!TakeMutex(mutex))
         {
             if (replacing is null)
-                MessageBox.Show("AI 사용량이 이미 실행 중입니다.", "AI 사용량", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show(L10n.T("AI 사용량이 이미 실행 중입니다."), L10n.T("AI 사용량"), MessageBoxButtons.OK, MessageBoxIcon.Information);
             else
                 Updater.Log("바꾸지 않음: 다른 창이 이미 떠 있음");
             return 0;

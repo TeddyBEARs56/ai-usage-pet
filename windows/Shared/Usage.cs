@@ -14,11 +14,134 @@ using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
+using static AIUsage.L10n;
 
 namespace AIUsage;
 
-public sealed record LimitWindow(string Id, string Label, int Minutes, double UsedPercent, DateTimeOffset? ResetsAt)
+/// 화면 글자의 언어 — 맥 판 L10n 과 같은 규칙. 처음엔 Windows 표시 언어(한국어·일본어·중국어면 그 언어, 그 밖엔 영어)를 따르고,
+/// 메뉴 「언어」로 고르면 ~/.cache/ai-usage/language 에 남긴다(상태 표시줄 프로그램도 같은 파일을 본다).
+/// 번역은 실행 파일 안 strings.json(저장소 i18n/strings.json, 맥 판과 같은 파일): 한국어 문장이 열쇠, {0} {1} 은 끼워 넣을 값.
+/// 시험: AIUSAGE_LANG=en 으로 언어를 정한다.
+public static class L10n
 {
+    public static readonly string[] Codes = { "ko", "en", "ja", "zh-Hans" };
+    public static readonly Dictionary<string, string> NativeNames = new()
+    {
+        ["ko"] = "한국어", ["en"] = "English", ["ja"] = "日本語", ["zh-Hans"] = "简体中文",
+    };
+    static readonly object Gate = new();
+    static string? resolved;
+    static Dictionary<string, Dictionary<string, string>>? table;
+
+    static string ChoiceFile => Path.Combine(Paths.Home, ".cache", "ai-usage", "language");
+
+    /// 고른 값: "auto"(시스템 언어) 또는 언어 코드
+    public static string Choice
+    {
+        get
+        {
+            if (Environment.GetEnvironmentVariable("AIUSAGE_LANG") is { } forced && Codes.Contains(forced)) return forced;
+            try
+            {
+                var saved = File.ReadAllText(ChoiceFile).Trim();
+                if (Codes.Contains(saved)) return saved;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+            return "auto";
+        }
+    }
+
+    public static string Current
+    {
+        get
+        {
+            lock (Gate)
+            {
+                if (resolved is null)
+                {
+                    var choice = Choice;
+                    resolved = choice == "auto" ? SystemLanguage() : choice;
+                }
+                return resolved;
+            }
+        }
+    }
+
+    public static void Choose(string value)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(ChoiceFile)!);
+        File.WriteAllText(ChoiceFile, value);
+        lock (Gate) resolved = null;
+    }
+
+    public static CultureInfo Culture => CultureInfo.GetCultureInfo(Current switch
+    {
+        "ko" => "ko-KR", "ja" => "ja-JP", "zh-Hans" => "zh-CN", _ => "en-US",
+    });
+
+    static string SystemLanguage()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return (GetUserDefaultUILanguage() & 0x3FF) switch  // 주 언어 번호
+            {
+                0x12 => "ko", 0x11 => "ja", 0x04 => "zh-Hans", _ => "en",
+            };
+        }
+        var name = CultureInfo.CurrentUICulture.Name.ToLowerInvariant();
+        return name.StartsWith("ko") ? "ko" : name.StartsWith("ja") ? "ja" : name.StartsWith("zh") ? "zh-Hans" : "en";
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    static extern ushort GetUserDefaultUILanguage();
+
+    static Dictionary<string, Dictionary<string, string>> Table
+    {
+        get
+        {
+            lock (Gate) return table ??= Load();
+        }
+    }
+
+    static Dictionary<string, Dictionary<string, string>> Load()
+    {
+        var result = new Dictionary<string, Dictionary<string, string>>();
+        try
+        {
+            using var stream = typeof(L10n).Assembly.GetManifestResourceStream("strings.json");
+            if (stream is null) return result;
+            using var doc = JsonDocument.Parse(stream, new JsonDocumentOptions { CommentHandling = JsonCommentHandling.Skip });
+            foreach (var entry in doc.RootElement.EnumerateObject())
+            {
+                if (entry.Value.ValueKind != JsonValueKind.Object) continue;
+                var languages = new Dictionary<string, string>();
+                foreach (var language in entry.Value.EnumerateObject())
+                    if (language.Value.ValueKind == JsonValueKind.String) languages[language.Name] = language.Value.GetString()!;
+                result[entry.Name] = languages;
+            }
+        }
+        catch (JsonException) { }
+        return result;
+    }
+
+    /// 한국어 문장 → 고른 언어(번역이 없으면 영어, 그것도 없으면 한국어 그대로). {0} {1} … 에 값을 차례로 넣는다.
+    public static string T(string korean, params object[] values)
+    {
+        var language = Current;
+        var text = korean;
+        if (language != "ko" && Table.TryGetValue(korean, out var translated))
+            text = translated.GetValueOrDefault(language) ?? translated.GetValueOrDefault("en") ?? korean;
+        for (var i = 0; i < values.Length; i++)
+            text = text.Replace("{" + i + "}", Convert.ToString(values[i], CultureInfo.InvariantCulture));
+        return text;
+    }
+}
+
+public sealed record LimitWindow(string Id, int Minutes, double UsedPercent, DateTimeOffset? ResetsAt)
+{
+    /// 「5시간」「주간」 — 고른 언어로(언어를 바꾸면 바로 바뀌게 그때그때 만든다)
+    public string Label => Fmt.WindowLabel(Minutes);
+
     /// 상태 표시줄과 같은 계산(100 - 사용률 내림). 초기화 시각이 지났으면 100.
     public int LeftPercent(DateTimeOffset now) =>
         ResetsAt is { } reset && reset <= now ? 100 : Math.Clamp(100 - (int)Math.Floor(UsedPercent), 0, 100);
@@ -106,16 +229,14 @@ static class J
 
 public static class Fmt
 {
-    static readonly CultureInfo Ko = CultureInfo.GetCultureInfo("ko-KR");
-
     public static string WindowLabel(int minutes) => minutes switch
     {
-        300 => "5시간",
-        10_080 => "주간",
-        > 0 when minutes % 1_440 == 0 => $"{minutes / 1_440}일",
-        > 0 when minutes % 60 == 0 => $"{minutes / 60}시간",
-        > 0 => $"{minutes}분",
-        _ => "한도",
+        300 => T("5시간"),
+        10_080 => T("주간"),
+        > 0 when minutes % 1_440 == 0 => T("{0}일", minutes / 1_440),
+        > 0 when minutes % 60 == 0 => T("{0}시간", minutes / 60),
+        > 0 => T("{0}분", minutes),
+        _ => T("한도"),
     };
 
     public static string? PlanName(string? raw) => raw switch
@@ -126,16 +247,16 @@ public static class Fmt
         _ => raw,
     };
 
-    public static string Clock(DateTimeOffset at) => at.ToLocalTime().ToString("HH:mm", Ko);
-    public static string FullTime(DateTimeOffset at) => at.ToLocalTime().ToString("M월 d일(ddd) HH:mm", Ko);
+    public static string Clock(DateTimeOffset at) => at.ToLocalTime().ToString("HH:mm", L10n.Culture);
+    public static string FullTime(DateTimeOffset at) => at.ToLocalTime().ToString(T("M월 d일(ddd) HH:mm"), L10n.Culture);
 
     public static string ResetText(DateTimeOffset? at, DateTimeOffset now)
     {
         if (at is not { } t) return "";
-        if (t <= now) return "초기화됨";
+        if (t <= now) return T("초기화됨");
         var local = t.ToLocalTime();
-        if (local.Date == now.ToLocalTime().Date) return local.ToString("HH:mm", Ko);
-        return local.ToString((t - now).TotalDays < 6 ? "ddd HH:mm" : "M'/'d HH:mm", Ko);
+        if (local.Date == now.ToLocalTime().Date) return local.ToString("HH:mm", L10n.Culture);
+        return local.ToString((t - now).TotalDays < 6 ? "ddd HH:mm" : "M'/'d HH:mm", L10n.Culture);
     }
 
     public static string AgeText(DateTimeOffset? at, DateTimeOffset now)
@@ -144,10 +265,10 @@ public static class Fmt
         var seconds = Math.Max(0, (now - t).TotalSeconds);
         return seconds switch
         {
-            < 60 => "방금",
-            < 3_600 => $"{(int)(seconds / 60)}분 전",
-            < 86_400 => $"{(int)(seconds / 3_600)}시간 전",
-            _ => $"{(int)(seconds / 86_400)}일 전",
+            < 60 => T("방금"),
+            < 3_600 => T("{0}분 전", (int)(seconds / 60)),
+            < 86_400 => T("{0}시간 전", (int)(seconds / 3_600)),
+            _ => T("{0}일 전", (int)(seconds / 86_400)),
         };
     }
 
@@ -155,11 +276,11 @@ public static class Fmt
     {
         var lines = new List<string>
         {
-            $"{title}{(snap.Plan is { } plan ? $" ({plan})" : "")} — 마지막 값 {(snap.ObservedAt is { } at ? FullTime(at) : "없음")}",
+            T("{0} — 마지막 값 {1}", title + (snap.Plan is { } plan ? $" ({plan})" : ""), snap.ObservedAt is { } at ? FullTime(at) : T("없음")),
         };
-        if (snap.Windows.Count == 0) lines.Add($"  {snap.Message ?? "값 없음"}");
+        if (snap.Windows.Count == 0) lines.Add("  " + (snap.Message ?? T("값 없음")));
         foreach (var w in snap.Windows)
-            lines.Add($"  {w.Label}: 사용 {w.UsedPercent.ToString(CultureInfo.InvariantCulture)}% → {w.LeftPercent(now)}% 남음, 초기화 {(w.ResetsAt is { } r ? FullTime(r) : "-")}");
+            lines.Add("  " + T("{0}: 사용 {1}% → {2}% 남음, 초기화 {3}", w.Label, w.UsedPercent, w.LeftPercent(now), w.ResetsAt is { } r ? FullTime(r) : "-"));
         return string.Join("\n", lines);
     }
 }
@@ -212,7 +333,7 @@ public sealed class ClaudeReader
         var desktop = ClaudeDesktopUsage.Latest(ClaudeCodeAccount.Organization(), now);
         var snap = new ProviderSnapshot();
         bool usedStatus = false, usedDesktop = false;
-        foreach (var (key, label, minutes) in new[] { ("five_hour", "5시간", 300), ("seven_day", "주간", 10_080) })
+        foreach (var (key, minutes) in new[] { ("five_hour", 300), ("seven_day", 10_080) })
         {
             var found = entries.Where(e => e.Limits.ContainsKey(key)).Select(e => e.Limits[key]).ToList();
             double? used = null;
@@ -238,13 +359,13 @@ public sealed class ClaudeReader
             }
             if (used is not { } u) continue;
             if (fromDesktop) usedDesktop = true; else usedStatus = true;
-            snap.Windows.Add(new LimitWindow(key, label, minutes, u, J.Epoch(reset)));
+            snap.Windows.Add(new LimitWindow(key, minutes, u, J.Epoch(reset)));
         }
         var seen = new List<DateTimeOffset>();
         if (usedStatus && statusAt is { } s) seen.Add(s);
         if (usedDesktop && desktop is { } dd) seen.Add(dd.At);
         snap.ObservedAt = seen.Count > 0 ? seen.Max() : null;
-        snap.Source = usedStatus && usedDesktop ? "Claude Code·데스크톱 앱" : usedDesktop ? "Claude 데스크톱 앱 기록" : "Claude Code 상태 표시줄";
+        snap.Source = usedStatus && usedDesktop ? T("Claude Code·데스크톱 앱") : usedDesktop ? T("Claude 데스크톱 앱 기록") : T("Claude Code 상태 표시줄");
         if (snap.Windows.Count == 0) snap.Message = ClaudeSettings.EmptyMessage();
         return snap;
     }
@@ -333,7 +454,7 @@ public sealed class CodexReader
     /// 기록과 서버 가운데 더 나중에 확인한 값을 쓴다
     public ProviderSnapshot Current =>
         new[] { FromLog, FromServer }.OfType<ProviderSnapshot>().OrderByDescending(s => s.ObservedAt ?? DateTimeOffset.MinValue).FirstOrDefault()
-        ?? new ProviderSnapshot { Message = ServerError ?? "Codex 한도를 읽는 중…" };
+        ?? new ProviderSnapshot { Message = ServerError ?? T("Codex 한도를 읽는 중…") };
 
     /// Codex 를 쓰는 동안 기록 파일에 찍히는 최신 한도(파일이 바뀌었을 때만 다시 읽는다)
     public void ReadLog()
@@ -374,7 +495,7 @@ public sealed class CodexReader
         {
             if (J.Obj(limits, key) is not { } w || J.Number(w, "usedPercent", "used_percent") is not { } used) continue;
             var minutes = (int)(J.Number(w, "windowDurationMins", "window_minutes") ?? 0);
-            windows.Add(new LimitWindow(key, Fmt.WindowLabel(minutes), minutes, used, J.Epoch(J.Number(w, "resetsAt", "resets_at"))));
+            windows.Add(new LimitWindow(key, minutes, used, J.Epoch(J.Number(w, "resetsAt", "resets_at"))));
         }
         return windows.OrderBy(w => w.Minutes).ToList();
     }
@@ -477,7 +598,7 @@ public sealed class CodexReader
     /// `codex app-server` 를 잠깐 띄워 account/rateLimits/read 로 지금 한도를 묻는다(인증은 codex 가 알아서 한다)
     public static async Task<(ProviderSnapshot? Snap, string? Error)> FetchServerAsync()
     {
-        if (FindCodex() is not { } exe) return (null, "codex 명령을 찾지 못했습니다(Codex CLI 설치 필요)");
+        if (FindCodex() is not { } exe) return (null, T("codex 명령을 찾지 못했습니다(Codex CLI 설치 필요)"));
         var start = new ProcessStartInfo
         {
             RedirectStandardInput = true,
@@ -507,7 +628,7 @@ public sealed class CodexReader
         }
         catch (Exception e) when (e is System.ComponentModel.Win32Exception or InvalidOperationException)
         {
-            return (null, "codex 를 실행하지 못했습니다");
+            return (null, T("codex 를 실행하지 못했습니다"));
         }
         process.ErrorDataReceived += (_, _) => { };  // 오류 출력이 쌓여 멈추지 않게 비워 둔다
         process.BeginErrorReadLine();
@@ -517,12 +638,12 @@ public sealed class CodexReader
         {
             await Send(process, """{"id":1,"method":"initialize","params":{"clientInfo":{"name":"ai-usage-pet","version":"1.0"}}}""");
             using (var init = await Receive(process, 1, timeout.Token))
-                if (init is null) return (null, "codex 가 응답하지 않습니다");
+                if (init is null) return (null, T("codex 가 응답하지 않습니다"));
             await Send(process, """{"method":"initialized"}""");
             await Send(process, """{"id":2,"method":"account/rateLimits/read"}""");
             using var response = await Receive(process, 2, timeout.Token);
-            if (response is null) return (null, "codex 가 응답하지 않습니다");
-            if (J.Obj(response.RootElement, "result") is not { } result) return (null, "Codex 한도를 읽지 못했습니다(로그인 확인)");
+            if (response is null) return (null, T("codex 가 응답하지 않습니다"));
+            if (J.Obj(response.RootElement, "result") is not { } result) return (null, T("Codex 한도를 읽지 못했습니다(로그인 확인)"));
 
             var limits = (J.Obj(result, "rateLimitsByLimitId") is { } byId ? J.Obj(byId, "codex") : null)
                          ?? J.Obj(result, "rateLimits");
@@ -532,12 +653,12 @@ public sealed class CodexReader
                 Plan = limits is { } l ? Fmt.PlanName(J.Str(l, "planType")) : null,
             };
             if (limits is { } found) snap.Windows.AddRange(WindowsFrom(found));
-            if (snap.Windows.Count == 0) snap.Message = "표시할 한도가 없습니다";
+            if (snap.Windows.Count == 0) snap.Message = T("표시할 한도가 없습니다");
             return (snap, null);
         }
         catch (Exception e) when (e is OperationCanceledException or IOException or InvalidOperationException)
         {
-            return (null, "codex 가 응답하지 않습니다");
+            return (null, T("codex 가 응답하지 않습니다"));
         }
         finally
         {
@@ -645,9 +766,9 @@ public static class StatusLine
         var workspace = J.Obj(root, "workspace");
         var location = new List<string>();
         if (workspace is { } ws && J.Obj(ws, "repo") is { } repo && J.Str(repo, "name") is { Length: > 0 } repoName)
-            location.Add($"저장소 {White}{repoName}{Reset}");
+            location.Add($"{T("저장소")} {White}{repoName}{Reset}");
         if (workspace is { } ws2 && J.Str(ws2, "git_worktree") is { Length: > 0 } worktree)
-            location.Add($"워크트리 {Sky}{worktree}{Reset}");
+            location.Add($"{T("워크트리")} {Sky}{worktree}{Reset}");
         if (J.Obj(root, "pr") is { } pr && J.Number(pr, "number") is { } number)
             location.Add($"PR #{(int)number}");
         if (location.Count > 0) lines.Add(string.Join($" {Dim}·{Reset} ", location));
@@ -656,11 +777,11 @@ public static class StatusLine
         var model = J.Obj(root, "model") is { } m ? J.Str(m, "display_name") : null;
         var line = $"{Cyan}{model ?? "?"}{Reset}";
         if (J.Obj(root, "effort") is { } effort && J.Str(effort, "level") is { Length: > 0 } level)
-            line += $" {Dim}·{Reset} 추론 강도 {EffortColor(level)}{level}{Reset}";
+            line += $" {Dim}·{Reset} {T("추론 강도")} {EffortColor(level)}{level}{Reset}";
         if (J.Obj(root, "context_window") is { } context && J.Number(context, "remaining_percentage") is { } remaining)
         {
             var left = (int)Math.Floor(remaining);
-            line += $" {Dim}│{Reset} 컨텍스트 {Color(left)}{left}% 남음{Reset} "
+            line += $" {Dim}│{Reset} {T("컨텍스트")} {Color(left)}{T("{0}% 남음", left)}{Reset} "
                   + $"{Dim}({K(J.Number(context, "total_input_tokens") ?? 0)}/{K(J.Number(context, "context_window_size") ?? 0)}){Reset}";
         }
         lines.Add(line);
@@ -672,14 +793,14 @@ public static class StatusLine
             if (J.Obj(limits, "five_hour") is { } five && J.Number(five, "used_percentage") is { } fiveUsed)
             {
                 var left = 100 - (int)Math.Floor(fiveUsed);
-                var text = $"5시간 한도 {Color(left)}{left}% 남음{Reset}";
-                if (J.Epoch(J.Number(five, "resets_at")) is { } at) text += $" {Dim}({Fmt.Clock(at)} 초기화){Reset}";
+                var text = $"{T("5시간 한도")} {Color(left)}{T("{0}% 남음", left)}{Reset}";
+                if (J.Epoch(J.Number(five, "resets_at")) is { } at) text += $" {Dim}{T("({0} 초기화)", Fmt.Clock(at))}{Reset}";
                 parts.Add(text);
             }
             if (J.Obj(limits, "seven_day") is { } week && J.Number(week, "used_percentage") is { } weekUsed)
             {
                 var left = 100 - (int)Math.Floor(weekUsed);
-                parts.Add($"주간 한도 {Color(left)}{left}% 남음{Reset}");
+                parts.Add($"{T("주간 한도")} {Color(left)}{T("{0}% 남음", left)}{Reset}");
             }
             if (parts.Count > 0) lines.Add(string.Join($" {Dim}·{Reset} ", parts));
         }
@@ -728,12 +849,12 @@ public static class ClaudeSettings
     /// Claude 칸에 값이 하나도 없을 때 보일 이유
     public static string EmptyMessage() => State() switch
     {
-        LinkState.NoClaudeCode => "Claude Code 나 Claude 데스크톱 앱을 쓰면 표시됩니다",
-        LinkState.NotConnected => "Claude Code 에 연결되지 않았습니다 — 오른쪽 클릭 → 「Claude Code 상태 표시줄 연결」",
-        LinkState.Broken => "Claude Code 연결이 끊겼습니다 — 오른쪽 클릭 → 「Claude Code 상태 표시줄 연결」",
+        LinkState.NoClaudeCode => T("Claude Code 나 Claude 데스크톱 앱을 쓰면 표시됩니다"),
+        LinkState.NotConnected => T("Claude Code 에 연결되지 않았습니다 — 오른쪽 클릭 → 「Claude Code 상태 표시줄 연결」"),
+        LinkState.Broken => T("Claude Code 연결이 끊겼습니다 — 오른쪽 클릭 → 「Claude Code 상태 표시줄 연결」"),
         _ => LastSeen() is { Limits: false }
-            ? "Claude Code 가 한도 값을 보내지 않습니다 — Claude 구독(Pro·Max·Team)으로 로그인했는지, Claude Code 가 최신인지 확인"
-            : "Claude Code 에서 한 번 대화하면 표시됩니다",
+            ? T("Claude Code 가 한도 값을 보내지 않습니다 — Claude 구독(Pro·Max·Team)으로 로그인했는지, Claude Code 가 최신인지 확인")
+            : T("Claude Code 에서 한 번 대화하면 표시됩니다"),
     };
 
     public static (DateTimeOffset At, bool Limits, string Version)? LastSeen()
@@ -759,7 +880,7 @@ public static class ClaudeSettings
         {
             var text = File.ReadAllText(Paths.ClaudeSettings);
             root = JsonNode.Parse(text, documentOptions: ReadOptions) as JsonObject
-                   ?? throw new InvalidDataException("settings.json 이 JSON 객체가 아닙니다");
+                   ?? throw new InvalidDataException(T("settings.json 이 JSON 객체가 아닙니다"));
             File.Copy(Paths.ClaudeSettings, $"{Paths.ClaudeSettings}.bak-{DateTime.Now:yyyyMMdd-HHmmss}");
         }
         root["statusLine"] = new JsonObject { ["type"] = "command", ["command"] = CommandFor(statusExe) };
@@ -784,23 +905,23 @@ public static class Report
         var claude = new ClaudeReader().Read(now);
         var link = ClaudeSettings.State() switch
         {
-            ClaudeSettings.LinkState.NoClaudeCode => "Claude Code 없음(~\\.claude 폴더 없음)",
-            ClaudeSettings.LinkState.NotConnected => $"안 됨 — 지금 명령: {ClaudeSettings.CurrentCommand() ?? "없음"}",
-            ClaudeSettings.LinkState.Broken => $"끊김(가리키는 AIUsageStatus.exe 가 없음) — 지금 명령: {ClaudeSettings.CurrentCommand()}",
-            _ => "됨",
+            ClaudeSettings.LinkState.NoClaudeCode => T("Claude Code 없음(~\\.claude 폴더 없음)"),
+            ClaudeSettings.LinkState.NotConnected => T("안 됨 — 지금 명령: {0}", ClaudeSettings.CurrentCommand() ?? T("없음")),
+            ClaudeSettings.LinkState.Broken => T("끊김(가리키는 AIUsageStatus.exe 가 없음) — 지금 명령: {0}", ClaudeSettings.CurrentCommand() ?? ""),
+            _ => T("됨"),
         };
         var lines = new List<string>
         {
             Fmt.Describe("Claude", claude, now),
-            $"  출처: {(claude.Windows.Count == 0 ? "-" : claude.Source)} · Claude Code 연결: {link}",
+            "  " + T("출처: {0} · Claude Code 연결: {1}", claude.Windows.Count == 0 ? "-" : claude.Source ?? "-", link),
         };
         if (ClaudeSettings.LastSeen() is { } seen)
-            lines.Add($"  상태 표시줄 마지막 실행 {Fmt.FullTime(seen.At)} · 한도 값 {(seen.Limits ? "옴" : "안 옴")} · Claude Code {seen.Version}");
+            lines.Add("  " + T("상태 표시줄 마지막 실행 {0} · 한도 값 {1} · Claude Code {2}", Fmt.FullTime(seen.At), seen.Limits ? T("옴") : T("안 옴"), seen.Version));
         return string.Join("\n", lines.Concat(new[]
         {
-            Fmt.Describe("ChatGPT · 기록", fromLog ?? new ProviderSnapshot { Message = "최근 기록 없음" }, now),
-            Fmt.Describe("ChatGPT · 서버", codex.FromServer ?? new ProviderSnapshot { Message = codex.ServerError ?? "실패" }, now),
-            Fmt.Describe("ChatGPT · 표시", codex.Current, now),
+            Fmt.Describe(T("ChatGPT · 기록"), fromLog ?? new ProviderSnapshot { Message = T("최근 기록 없음") }, now),
+            Fmt.Describe(T("ChatGPT · 서버"), codex.FromServer ?? new ProviderSnapshot { Message = codex.ServerError ?? T("실패") }, now),
+            Fmt.Describe(T("ChatGPT · 표시"), codex.Current, now),
         }));
     }
 }

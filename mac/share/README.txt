@@ -1,3 +1,5 @@
+AI 사용량 (AI Usage) — 한국어 안내 아래에 English 가 있습니다. English instructions are below the Korean.
+
 AI 사용량 — Claude·ChatGPT(Codex)의 남은 사용 한도를 화면 위에 띄워 두는 작은 창
 
 ━━ 이런 경우에 값이 나옵니다 ━━
@@ -20,6 +22,7 @@ AI 사용량 — Claude·ChatGPT(Codex)의 남은 사용 한도를 화면 위에
 • 창은 끌어서 옮기고, 두 번 클릭하면 새로고침합니다.
 • 안 쓰는 칸 숨기기: 창(또는 Dock 아이콘) 오른쪽 클릭 → 「Claude 보이기」·「ChatGPT 보이기」를 눌러 체크를 끕니다.
   다시 누르면 다시 보입니다. 둘 다 끌 수는 없습니다.
+• 언어 바꾸기: 창 오른쪽 클릭 → 「언어 (Language)」. 처음엔 맥의 언어를 따릅니다(한국어·영어·일본어·중국어 간체).
 • 칸 순서 바꾸기: 같은 메뉴의 「칸 순서」에서 고릅니다(세션·Claude·ChatGPT 를 놓는 순서).
 • 컴퓨터를 켤 때마다 자동으로 열기: 같은 메뉴의 「로그인할 때 자동으로 열기」.
 • 끄기: Dock 아이콘 오른쪽 클릭 → 종료.
@@ -40,3 +43,58 @@ AI 사용량 — Claude·ChatGPT(Codex)의 남은 사용 한도를 화면 위에
 1. 「로그인할 때 자동으로 열기」를 켜 두셨다면 먼저 끕니다.
 2. 터미널에 zsh 와 빈칸 하나를 치고, 「지우기.sh」를 끌어다 놓고 Enter.
    앱과 기록을 지우고 Claude Code 상태 표시줄을 설치 전으로 되돌립니다.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+AI Usage (AI 사용량) — a small window that keeps your remaining Claude and
+ChatGPT (Codex) usage limits on screen.
+
+━━ When values appear ━━
+• macOS 14 or later (Apple silicon and Intel)
+• Claude: when you use Claude Code (terminal) signed in with a Claude
+  subscription (Pro·Max·Team), or the Claude desktop app (values received
+  while the app is in use, without reset times).
+  — claude.ai on the web alone does not provide values.
+  — If no value shows, the Claude section explains why. If it says
+    "Not connected", right-click the window → "Connect to Claude Code".
+• ChatGPT: when you use Codex signed in with a ChatGPT account.
+• Use only one of them? Hide the other section after installing (see below).
+
+━━ Install ━━
+1. Keep this folder as it is (it can stay in Downloads).
+2. Open Terminal (⌘+Space → type "Terminal" → Enter).
+3. Type zsh and a space, drag "설치.sh" (install) from this folder into the
+   Terminal window, and press Enter.
+4. When the window appears at the top right of the screen, you're done.
+   An icon also appears in the Dock.
+
+━━ How to use ━━
+• Drag the window to move it; double-click to refresh.
+• Language: right-click the window → "Language". It follows the macOS
+  language at first (Korean, English, Japanese, Simplified Chinese).
+• Hide a section: right-click the window (or the Dock icon) → uncheck
+  "Show Claude" or "Show ChatGPT". You can't hide both.
+• Section order: "Section Order" in the same menu.
+• Open at every login: "Open at Login" in the same menu.
+• Quit: right-click the Dock icon → Quit.
+
+━━ New versions ━━
+• Every 6 hours the app checks for a new version and replaces itself.
+  If the window disappears for a second and comes back in the same place,
+  it was updated. No need to reinstall.
+• To check right away: "Check for Updates" in the same menu.
+
+━━ What the installer does to Claude Code ━━
+• Hooks this app into the status line (statusLine) in
+  ~/.claude/settings.json. The file before the change is kept as
+  settings.json.bak-<date>.
+• If you already had a status line, it keeps showing; usage limits are
+  just saved in the background.
+• If you had none, a model · context · usage line appears at the bottom
+  of Claude Code.
+
+━━ Uninstall ━━
+1. If you turned on "Open at Login", turn it off first.
+2. In Terminal, type zsh and a space, drag "지우기.sh" (uninstall) in, and
+   press Enter. It removes the app and its data and restores the Claude
+   Code status line to how it was before installing.

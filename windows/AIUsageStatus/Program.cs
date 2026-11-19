@@ -32,5 +32,5 @@ if (args.Contains("--statusline"))
     return 0;
 }
 
-Write("사용법: AIUsageStatus --statusline (Claude Code 상태 표시줄) | --print (값 확인)\n");
+Write(AIUsage.L10n.T("사용법: AIUsageStatus --statusline (Claude Code 상태 표시줄) | --print (값 확인)") + "\n");
 return 1;

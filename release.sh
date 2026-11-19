@@ -17,7 +17,8 @@ export PATH=/opt/homebrew/bin:$PATH
 case $target in
   mac)
     version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' mac/Info.plist)
-    install_note="처음 설치: 아래 zip 을 받아 풀고 「읽어 주세요.txt」대로(터미널에 zsh + 설치.sh 끌어다 놓기). 맥 1.4 이상이 깔려 있으면 앱이 알아서 바꾼다." ;;
+    install_note="처음 설치: 아래 zip 을 받아 풀고 「읽어 주세요 (Read me).txt」대로(터미널에 zsh + 설치.sh 끌어다 놓기). 맥 1.4 이상이 깔려 있으면 앱이 알아서 바꾼다.
+First install: unzip and follow “읽어 주세요 (Read me).txt”. Installed apps (Mac 1.4+) update themselves." ;;
   windows)
     version=$(sed -nE 's:.*<Version>([0-9.]+)</Version>.*:\1:p' windows/AIUsage/AIUsage.csproj)
     status_version=$(sed -nE 's:.*<Version>([0-9.]+)</Version>.*:\1:p' windows/AIUsageStatus/AIUsageStatus.csproj)

@@ -7,13 +7,14 @@ Claude 와 ChatGPT(Codex) 사용 한도를 화면 위에 계속 띄워 두는 �
 | [`mac/`](mac/) | 맥 앱(Swift). Dock 에서 켜고 끈다 | [mac/README.md](mac/README.md) |
 | [`windows/`](windows/) | Windows 앱(C# .NET 10, 맥에서 빌드). 작업 표시줄에서 켜고 끈다. 실행 파일은 Releases | [windows/README.md](windows/README.md) |
 | [`icon/`](icon/) | 아이콘 원본 스크립트. 그림을 고치면 `zsh icon/make-icons.sh` 로 두 판의 아이콘을 한 번에 다시 만든다 | |
+| [`i18n/`](i18n/) | 화면 글자 번역(한국어·English·日本語·简体中文). 두 판이 같은 `strings.json` 을 쓴다 | [언어](#언어) |
 | `release.sh` | 새 판을 Releases 에 올린다 → 깔린 앱이 알아서 받아 바꾼다 | [자동 업데이트](#자동-업데이트) |
 
 ## 받기
 
 | | 버전 | 받기 | 설치 |
 |---|---|---|---|
-| 맥 (macOS 14 이상, 애플 칩·인텔) | 1.4 | [AIUsage-mac-1.4.zip](https://github.com/TeddyBEARs56/ai-usage-pet/releases/download/mac-v1.4/AIUsage-mac-1.4.zip) | 압축을 풀고 「읽어 주세요.txt」대로: 터미널에 `zsh ` 를 치고 `설치.sh` 를 끌어다 놓은 뒤 Enter |
+| 맥 (macOS 14 이상, 애플 칩·인텔) | 1.4 | [AIUsage-mac-1.4.zip](https://github.com/TeddyBEARs56/ai-usage-pet/releases/download/mac-v1.4/AIUsage-mac-1.4.zip) | 압축을 풀고 「읽어 주세요 (Read me).txt」대로: 터미널에 `zsh ` 를 치고 `설치.sh` 를 끌어다 놓은 뒤 Enter |
 | Windows 10·11 (64비트) | 1.1.0 | [AIUsage.exe](https://github.com/TeddyBEARs56/ai-usage-pet/releases/download/windows-v1.1.0/AIUsage.exe) | 실행 → 「Windows의 PC 보호」가 뜨면 **추가 정보 → 실행** → 「이 PC에 설치할까요?」 **예** |
 
 한 번 깔면 그 뒤로는 앱이 새 판을 알아서 받는다([자동 업데이트](#자동-업데이트)). 지난 판은 [Releases](https://github.com/TeddyBEARs56/ai-usage-pet/releases). 위 링크는 `release.sh` 가 새 판을 올릴 때 고친다.
@@ -40,6 +41,15 @@ ChatGPT 대화(웹·앱) 자체의 한도는 밖에서 읽을 방법이 없어 C
 - **ChatGPT**: 5분마다 `codex app-server` 를 잠깐 띄워 `account/rateLimits/read` 로 묻는다(1초 정도, 인증은 codex 가 처리). Codex 를 쓰는 동안은 `~/.codex/sessions` 기록에 찍히는 값을 15초마다 읽는다. 둘 중 나중에 확인한 값을 쓴다.
 
 규칙을 바꿀 때는 두 판을 같이 고친다: 맥 `mac/AIUsagePet.swift`, Windows `windows/Shared/Usage.cs`.
+
+## 언어
+
+한국어·English·日本語·简体中文. 처음엔 맥·Windows 의 언어를 따르고(그 밖의 언어면 영어), 창 오른쪽 클릭 → 「언어 (Language)」 에서 고르면 기억한다. 창·메뉴·알림·Claude Code 상태 표시줄(이 앱을 상태 표시줄로 건 경우) 글자가 바뀐다. 맥은 Finder·Dock 의 앱 이름도 시스템 언어를 따른다(AI Usage · AI 使用量 · AI 用量). 맥 설치 묶음의 안내는 한국어·영어를 함께 쓴다.
+
+- 번역은 [`i18n/strings.json`](i18n/strings.json) 하나: 코드가 쓰는 한국어 문장이 열쇠이고 `{0}` `{1}` 은 끼워 넣을 값. 맥은 앱 Resources 에, Windows 는 실행 파일 안에 들어간다.
+- 문구를 고치거나 새로 넣으면 같은 열쇠로 `en`·`ja`·`zh-Hans` 를 함께 넣고 `zsh i18n/check.sh` 로 빠진 번역·`{0}` 자리를 확인한다. 번역이 없으면 영어, 그것도 없으면 한국어로 나온다.
+- 고른 언어: 맥은 앱 설정 `language`, Windows 는 `%USERPROFILE%\.cache\ai-usage\language`(`auto` 또는 `ko`·`en`·`ja`·`zh-Hans`). 시험할 때는 `AIUSAGE_LANG=en` 으로 띄운다.
+- 앱 파일 이름(`AI 사용량.app`)과 Windows 시작 메뉴 바로 가기 이름은 언어와 상관없이 그대로다(Claude Code 연결 경로·이미 깐 바로 가기가 어긋나지 않게).
 
 ## 자동 업데이트
 

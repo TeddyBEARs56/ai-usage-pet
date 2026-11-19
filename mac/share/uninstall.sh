@@ -1,5 +1,6 @@
 #!/bin/zsh
 # 「AI 사용량」 지우기 — 터미널에 zsh 와 빈칸 하나를 치고, 이 파일을 끌어다 놓은 뒤 Enter.
+# Uninstall "AI Usage" — type zsh and a space in Terminal, drag this file in, press Enter.
 # 앱·기록을 지우고, Claude Code 상태 표시줄을 설치 전으로 되돌린다.
 set -u
 
@@ -19,10 +20,10 @@ if [[ -f "$claude_dir/settings.json" && -f "$helper" ]]; then
     "$claude_dir/settings.json" "$app/Contents/MacOS/AIUsagePet" "$claude_dir/ai-usage-statusline.sh" \
     "$claude_dir/ai-usage-statusline.original.json" "$claude_dir/settings.json.bak-$stamp" 2>&1)
   case "$result" in
-    restored)  print "✓ Claude Code 상태 표시줄을 쓰시던 것으로 되돌렸습니다." ;;
-    removed)   print "✓ Claude Code 상태 표시줄 연결을 뺐습니다." ;;
-    untouched) print -- "- Claude Code 설정에는 연결이 없어 그대로 두었습니다." ;;
-    *)         print "✗ Claude Code 설정을 되돌리지 못했습니다 — ${result#error:}" ;;
+    restored)  print "✓ Claude Code 상태 표시줄을 쓰시던 것으로 되돌렸습니다. / Restored your previous Claude Code status line." ;;
+    removed)   print "✓ Claude Code 상태 표시줄 연결을 뺐습니다. / Removed the Claude Code status line connection." ;;
+    untouched) print -- "- Claude Code 설정에는 연결이 없어 그대로 두었습니다. / Claude Code settings had no connection; left as is." ;;
+    *)         print "✗ Claude Code 설정을 되돌리지 못했습니다 / Couldn't restore Claude Code settings — ${result#error:}" ;;
   esac
   case "$result" in
     restored|removed) rm -f "$claude_dir/ai-usage-statusline.sh" "$claude_dir/ai-usage-statusline.original.json" ;;
@@ -31,5 +32,6 @@ fi
 
 rm -rf "$app" "$HOME/.cache/ai-usage"
 [[ -z "${AI_USAGE_NO_LAUNCH:-}" ]] && defaults delete com.local.ai-usage-pet >/dev/null 2>&1
-print "✓ 앱과 기록을 지웠습니다."
+print "✓ 앱과 기록을 지웠습니다. / Removed the app and its data."
 print "  「로그인할 때 자동으로 열기」를 켜 두셨다면 시스템 설정 → 일반 → 로그인 항목에서 「AI 사용량」을 빼 주세요."
+print "  If you turned on “Open at Login”, remove “AI Usage” in System Settings → General → Login Items."

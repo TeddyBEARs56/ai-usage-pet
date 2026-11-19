@@ -26,14 +26,82 @@ let homeDir: String = {
     return NSHomeDirectory()
 }()
 
+// MARK: - 언어
+
+/// 화면 글자의 언어. 처음엔 시스템 언어(선호 언어 목록에서 한국어·영어·일본어·중국어 가운데 먼저 나오는 것, 없으면 영어)를 따르고,
+/// 메뉴 「언어」로 고르면 기억한다(앱 설정 language). 상태 표시줄(--statusline)도 같은 설정을 본다.
+/// 번역은 앱 안 Resources/strings.json(저장소 i18n/strings.json, 윈도우 판과 같은 파일): 한국어 문장이 열쇠, {0} {1} 은 끼워 넣을 값.
+/// 시험: AIUSAGE_LANG=en 으로 언어를, AIUSAGE_STRINGS=<경로> 로 번역 파일을 정한다.
+enum L10n {
+    static let codes = ["ko", "en", "ja", "zh-Hans"]
+    static let nativeNames = ["ko": "한국어", "en": "English", "ja": "日本語", "zh-Hans": "简体中文"]
+    static let key = "language"
+    private static let lock = NSLock()
+    private static var resolved: String?
+
+    /// 고른 값: "auto"(시스템 언어) 또는 언어 코드
+    static var choice: String {
+        if let forced = ProcessInfo.processInfo.environment["AIUSAGE_LANG"], codes.contains(forced) { return forced }
+        let saved = UserDefaults.standard.string(forKey: key) ?? "auto"
+        return codes.contains(saved) ? saved : "auto"
+    }
+
+    static var current: String {
+        lock.lock()
+        defer { lock.unlock() }
+        if let resolved { return resolved }
+        let value = choice == "auto" ? system : choice
+        resolved = value
+        return value
+    }
+
+    static func choose(_ value: String) {
+        UserDefaults.standard.set(value, forKey: key)
+        lock.lock()
+        resolved = nil
+        lock.unlock()
+    }
+
+    static var system: String {
+        for id in Locale.preferredLanguages.map({ $0.lowercased() }) {
+            if id.hasPrefix("ko") { return "ko" }
+            if id.hasPrefix("ja") { return "ja" }
+            if id.hasPrefix("zh") { return "zh-Hans" }
+            if id.hasPrefix("en") { return "en" }
+        }
+        return "en"
+    }
+
+    static var locale: Locale {
+        Locale(identifier: ["ko": "ko_KR", "ja": "ja_JP", "zh-Hans": "zh_Hans_CN"][current] ?? "en_US")
+    }
+
+    static let table: [String: [String: String]] = {
+        let path = ProcessInfo.processInfo.environment["AIUSAGE_STRINGS"] ?? Bundle.main.path(forResource: "strings", ofType: "json")
+        guard let path, let data = FileManager.default.contents(atPath: path),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return [:] }
+        return root.compactMapValues { $0 as? [String: String] }
+    }()
+}
+
+/// 한국어 문장 → 고른 언어(번역이 없으면 영어, 그것도 없으면 한국어 그대로). {0} {1} … 에 값을 차례로 넣는다.
+func T(_ korean: String, _ values: Any...) -> String {
+    let language = L10n.current
+    var text = language == "ko" ? korean : (L10n.table[korean]?[language] ?? L10n.table[korean]?["en"] ?? korean)
+    for (index, value) in values.enumerated() { text = text.replacingOccurrences(of: "{\(index)}", with: "\(value)") }
+    return text
+}
+
 // MARK: - 값
 
 struct LimitWindow: Identifiable {
     let id: String
-    let label: String
     let minutes: Int
     let usedPercent: Double
     let resetsAt: Date?
+
+    /// 「5시간」「주간」 — 고른 언어로
+    var label: String { windowLabel(minutes: minutes) }
 
     /// 상태 표시줄과 같은 계산(100 - 사용률 내림). 초기화 시각이 지났으면 100.
     func leftPercent(now: Date) -> Int {
@@ -70,12 +138,12 @@ func number(_ value: Any?) -> Double? {
 
 func windowLabel(minutes: Int) -> String {
     switch minutes {
-    case 300: return "5시간"
-    case 10_080: return "주간"
-    case let m where m > 0 && m % 1_440 == 0: return "\(m / 1_440)일"
-    case let m where m > 0 && m % 60 == 0: return "\(m / 60)시간"
-    case let m where m > 0: return "\(m)분"
-    default: return "한도"
+    case 300: return T("5시간")
+    case 10_080: return T("주간")
+    case let m where m > 0 && m % 1_440 == 0: return T("{0}일", m / 1_440)
+    case let m where m > 0 && m % 60 == 0: return T("{0}시간", m / 60)
+    case let m where m > 0: return T("{0}분", m)
+    default: return T("한도")
     }
 }
 
@@ -122,7 +190,7 @@ final class ClaudeReader {
         let desktop = ClaudeDesktopUsage.latest(org: ClaudeCodeAccount.organization(), now: now)
         var snap = ProviderSnapshot()
         var usedStatus = false, usedDesktop = false
-        for (key, label, minutes) in [("five_hour", "5시간", 300), ("seven_day", "주간", 10_080)] {
+        for (key, minutes) in [("five_hour", 300), ("seven_day", 10_080)] {
             let found = entries.compactMap { entry -> (used: Double, reset: Double)? in
                 guard let w = entry.limits[key] as? [String: Any], let used = number(w["used_percentage"]) else { return nil }
                 return (used, number(w["resets_at"]) ?? 0)
@@ -146,11 +214,11 @@ final class ClaudeReader {
             }
             guard let used else { continue }
             if fromDesktop { usedDesktop = true } else { usedStatus = true }
-            snap.windows.append(LimitWindow(id: key, label: label, minutes: minutes, usedPercent: used,
+            snap.windows.append(LimitWindow(id: key, minutes: minutes, usedPercent: used,
                                             resetsAt: reset > 0 ? Date(timeIntervalSince1970: reset) : nil))
         }
         snap.observedAt = [usedStatus ? statusAt : nil, usedDesktop ? desktop?.at : nil].compactMap { $0 }.max()
-        snap.source = usedStatus && usedDesktop ? "Claude Code·데스크톱 앱" : usedDesktop ? "Claude 데스크톱 앱 기록" : "Claude Code 상태 표시줄"
+        snap.source = usedStatus && usedDesktop ? T("Claude Code·데스크톱 앱") : usedDesktop ? T("Claude 데스크톱 앱 기록") : T("Claude Code 상태 표시줄")
         if snap.windows.isEmpty { snap.message = ClaudeCodeLink.emptyMessage() }
         return snap
     }
@@ -267,18 +335,18 @@ enum ClaudeCodeLink {
     static func emptyMessage() -> String {
         switch state() {
         case .noClaudeCode:
-            return "Claude Code 나 Claude 데스크톱 앱을 쓰면 표시됩니다"
+            return T("Claude Code 나 Claude 데스크톱 앱을 쓰면 표시됩니다")
         case .notConnected:
-            return "Claude Code 에 연결되지 않았습니다 — 오른쪽 클릭 → 「Claude Code 에 연결」"
+            return T("Claude Code 에 연결되지 않았습니다 — 오른쪽 클릭 → 「Claude Code 에 연결」")
         case .broken:
-            return "Claude Code 연결이 끊겼습니다 — 오른쪽 클릭 → 「Claude Code 에 연결」"
+            return T("Claude Code 연결이 끊겼습니다 — 오른쪽 클릭 → 「Claude Code 에 연결」")
         case .connected:
             if let data = FileManager.default.contents(atPath: seenPath),
                let seen = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                seen["limits"] as? Bool == false {
-                return "Claude Code 가 한도 값을 보내지 않습니다 — Claude 구독(Pro·Max·Team)으로 로그인했는지, Claude Code 가 최신인지 확인"
+                return T("Claude Code 가 한도 값을 보내지 않습니다 — Claude 구독(Pro·Max·Team)으로 로그인했는지, Claude Code 가 최신인지 확인")
             }
-            return "Claude Code 에서 한 번 대화하면 표시됩니다"
+            return T("Claude Code 에서 한 번 대화하면 표시됩니다")
         }
     }
 
@@ -286,7 +354,7 @@ enum ClaudeCodeLink {
     @discardableResult
     static func connect() -> String {
         guard let script = Bundle.main.path(forResource: "claude-settings", ofType: "js"),
-              let bin = Bundle.main.executablePath else { return "error:앱 안에 claude-settings.js 가 없습니다" }
+              let bin = Bundle.main.executablePath else { return "error:" + T("앱 안에 claude-settings.js 가 없습니다") }
         try? FileManager.default.createDirectory(atPath: claudeDir, withIntermediateDirectories: true)
         let stamp = makeFormatter("yyyyMMdd-HHmmss").string(from: Date())
         let process = Process()
@@ -296,7 +364,7 @@ enum ClaudeCodeLink {
         let output = Pipe()
         process.standardOutput = output
         process.standardError = output
-        do { try process.run() } catch { return "error:osascript 를 실행하지 못했습니다" }
+        do { try process.run() } catch { return "error:" + T("osascript 를 실행하지 못했습니다") }
         let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         if FileManager.default.fileExists(atPath: wrapperPath) { chmod(wrapperPath, 0o755) }  // 새로 쓴 감싸는 스크립트는 실행 권한이 없다
@@ -318,7 +386,7 @@ final class CodexReader {
     var current: ProviderSnapshot {
         let both = [fromLog, fromServer].compactMap { $0 }
         if let best = both.max(by: { ($0.observedAt ?? .distantPast) < ($1.observedAt ?? .distantPast) }) { return best }
-        return ProviderSnapshot(message: serverError ?? "Codex 한도를 읽는 중…")
+        return ProviderSnapshot(message: serverError ?? T("Codex 한도를 읽는 중…"))
     }
 
     /// Codex 를 쓰는 동안 기록 파일에 찍히는 최신 한도(파일이 바뀌었을 때만 다시 읽는다)
@@ -365,7 +433,7 @@ final class CodexReader {
             guard let w = limits[key] as? [String: Any], let used = number(w["usedPercent"] ?? w["used_percent"]) else { continue }
             let minutes = Int(number(w["windowDurationMins"] ?? w["window_minutes"]) ?? 0)
             let reset = number(w["resetsAt"] ?? w["resets_at"]).map { Date(timeIntervalSince1970: $0) }
-            out.append(LimitWindow(id: key, label: windowLabel(minutes: minutes), minutes: minutes, usedPercent: used, resetsAt: reset))
+            out.append(LimitWindow(id: key, minutes: minutes, usedPercent: used, resetsAt: reset))
         }
         return out.sorted { $0.minutes < $1.minutes }
     }
@@ -426,7 +494,7 @@ final class CodexReader {
 
     /// `codex app-server` 를 잠깐 띄워 account/rateLimits/read 로 지금 한도를 묻는다(인증은 codex 가 알아서 한다)
     static func fetchServerSync() -> (snapshot: ProviderSnapshot?, error: String?) {
-        guard let exe = codexExecutable() else { return (nil, "codex 명령을 찾지 못했습니다") }
+        guard let exe = codexExecutable() else { return (nil, T("codex 명령을 찾지 못했습니다")) }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: exe)
         process.arguments = ["app-server"]
@@ -441,7 +509,7 @@ final class CodexReader {
         process.standardInput = input
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { return (nil, "codex 를 실행하지 못했습니다") }
+        do { try process.run() } catch { return (nil, T("codex 를 실행하지 못했습니다")) }
 
         let killer = DispatchWorkItem { if process.isRunning { process.terminate() } }
         DispatchQueue.global().asyncAfter(deadline: .now() + 20, execute: killer)
@@ -474,18 +542,18 @@ final class CodexReader {
         }
 
         guard send(#"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"ai-usage-pet","version":"1.0"}}}"#),
-              receive(id: 1) != nil else { return (nil, "codex 가 응답하지 않습니다") }
+              receive(id: 1) != nil else { return (nil, T("codex 가 응답하지 않습니다")) }
         _ = send(#"{"method":"initialized"}"#)
         guard send(#"{"id":2,"method":"account/rateLimits/read"}"#),
-              let response = receive(id: 2) else { return (nil, "codex 가 응답하지 않습니다") }
+              let response = receive(id: 2) else { return (nil, T("codex 가 응답하지 않습니다")) }
         guard let result = response["result"] as? [String: Any] else {
-            return (nil, "Codex 한도를 읽지 못했습니다(로그인 확인)")
+            return (nil, T("Codex 한도를 읽지 못했습니다(로그인 확인)"))
         }
         let byId = result["rateLimitsByLimitId"] as? [String: Any]
         let limits = (byId?["codex"] as? [String: Any]) ?? (result["rateLimits"] as? [String: Any]) ?? [:]
         var snap = ProviderSnapshot(windows: windows(from: limits), observedAt: Date(),
                                     plan: planName(limits["planType"] as? String))
-        if snap.windows.isEmpty { snap.message = "표시할 한도가 없습니다" }
+        if snap.windows.isEmpty { snap.message = T("표시할 한도가 없습니다") }
         return (snap, nil)
     }
 }
@@ -826,53 +894,64 @@ private func makeFormatter(_ format: String) -> DateFormatter {
     f.dateFormat = format
     return f
 }
-private let clockFormat = makeFormatter("HH:mm")
-private let weekdayClockFormat = makeFormatter("E HH:mm")
-private let dateClockFormat = makeFormatter("M/d HH:mm")
-private let fullFormat = makeFormatter("M월 d일(E) HH:mm")
+private var formatters: [String: DateFormatter] = [:]
+private let formattersLock = NSLock()
 
-func clock(_ date: Date) -> String { clockFormat.string(from: date) }
-func fullTime(_ date: Date) -> String { fullFormat.string(from: date) }
+/// 고른 언어의 시각 형식(요일 이름 등). 언어마다 한 번 만들어 둔다.
+private func formatter(_ format: String) -> DateFormatter {
+    let key = L10n.current + "|" + format
+    formattersLock.lock()
+    defer { formattersLock.unlock() }
+    if let cached = formatters[key] { return cached }
+    let made = DateFormatter()
+    made.locale = L10n.locale
+    made.dateFormat = format
+    formatters[key] = made
+    return made
+}
+
+func clock(_ date: Date) -> String { formatter("HH:mm").string(from: date) }
+func fullTime(_ date: Date) -> String { formatter(T("M월 d일(E) HH:mm")).string(from: date) }
 
 func resetText(_ date: Date?, now: Date) -> String {
     guard let date else { return "" }
-    if date <= now { return "초기화됨" }
-    if Calendar.current.isDate(date, inSameDayAs: now) { return clockFormat.string(from: date) }
-    return (date.timeIntervalSince(now) < 6 * 86_400 ? weekdayClockFormat : dateClockFormat).string(from: date)
+    if date <= now { return T("초기화됨") }
+    if Calendar.current.isDate(date, inSameDayAs: now) { return clock(date) }
+    return formatter(date.timeIntervalSince(now) < 6 * 86_400 ? "E HH:mm" : "M/d HH:mm").string(from: date)
 }
 
 func ageText(_ date: Date?, now: Date) -> String {
     guard let date else { return "" }
     let seconds = max(0, now.timeIntervalSince(date))
-    if seconds < 60 { return "방금" }
-    if seconds < 3_600 { return "\(Int(seconds / 60))분 전" }
-    if seconds < 86_400 { return "\(Int(seconds / 3_600))시간 전" }
-    return "\(Int(seconds / 86_400))일 전"
+    if seconds < 60 { return T("방금") }
+    if seconds < 3_600 { return T("{0}분 전", Int(seconds / 60)) }
+    if seconds < 86_400 { return T("{0}시간 전", Int(seconds / 3_600)) }
+    return T("{0}일 전", Int(seconds / 86_400))
 }
 
 /// 「12분」「1시간 5분」, 1분이 안 되면 nil
 func durationText(since: Date, now: Date) -> String? {
     let minutes = Int(max(0, now.timeIntervalSince(since)) / 60)
     if minutes < 1 { return nil }
-    if minutes < 60 { return "\(minutes)분" }
-    return minutes % 60 == 0 ? "\(minutes / 60)시간" : "\(minutes / 60)시간 \(minutes % 60)분"
+    if minutes < 60 { return T("{0}분", minutes) }
+    return minutes % 60 == 0 ? T("{0}시간", minutes / 60) : T("{0}시간 {1}분", minutes / 60, minutes % 60)
 }
 
 /// 세션 줄 오른쪽 글자: 「진행 중 12분」「답 나옴 8분 전」「확인 기다림」「멈춤 25분 전」
 func sessionStatusText(_ s: AgentSession, now: Date) -> String {
     switch s.state {
-    case .working: return ["진행 중", durationText(since: s.since, now: now)].compactMap { $0 }.joined(separator: " ")
-    case .answered: return "답 나옴 \(ageText(s.since, now: now))"
-    case .waiting: return "확인 기다림"
-    case .stopped: return "멈춤 \(ageText(s.since, now: now))"
-    case .unknown: return "알 수 없음"
+    case .working: return [T("진행 중"), durationText(since: s.since, now: now)].compactMap { $0 }.joined(separator: " ")
+    case .answered: return T("답 나옴 {0}", ageText(s.since, now: now))
+    case .waiting: return T("확인 기다림")
+    case .stopped: return T("멈춤 {0}", ageText(s.since, now: now))
+    case .unknown: return T("알 수 없음")
     }
 }
 
 func describeSession(_ s: AgentSession, now: Date) -> String {
     let home = homeDir
     let place = s.cwd.hasPrefix(home) ? "~" + s.cwd.dropFirst(home.count) : s.cwd
-    let note = s.background ? " (뒤에서 명령이 아직 도는 중)" : ""
+    let note = s.background ? " " + T("(뒤에서 명령이 아직 도는 중)") : ""
     return "\(s.tool == .claude ? "Claude" : "Codex") · \(s.name) — \(sessionStatusText(s, now: now))\(note)\(place.isEmpty ? "" : " · \(place)")"
 }
 
@@ -884,10 +963,10 @@ func statusColor(_ left: Int) -> Color {
 }
 
 func describe(_ title: String, _ snap: ProviderSnapshot, now: Date) -> String {
-    var lines = ["\(title)\(snap.plan.map { " (\($0))" } ?? "") — 마지막 값 \(snap.observedAt.map(fullTime) ?? "없음")"]
-    if snap.windows.isEmpty { lines.append("  \(snap.message ?? "값 없음")") }
+    var lines = [T("{0} — 마지막 값 {1}", title + (snap.plan.map { " (\($0))" } ?? ""), snap.observedAt.map(fullTime) ?? T("없음"))]
+    if snap.windows.isEmpty { lines.append("  \(snap.message ?? T("값 없음"))") }
     for w in snap.windows {
-        lines.append("  \(w.label): 사용 \(w.usedPercent)% → \(w.leftPercent(now: now))% 남음, 초기화 \(w.resetsAt.map(fullTime) ?? "-")")
+        lines.append("  " + T("{0}: 사용 {1}% → {2}% 남음, 초기화 {3}", w.label, w.usedPercent, w.leftPercent(now: now), w.resetsAt.map(fullTime) ?? "-"))
     }
     return lines.joined(separator: "\n")
 }
@@ -917,7 +996,7 @@ enum Pane: String {
 
     var title: String {
         switch self {
-        case .sessions: return "세션"
+        case .sessions: return T("세션")
         case .claude: return "Claude"
         case .codex: return "ChatGPT"
         }
@@ -1006,7 +1085,7 @@ struct ProviderSection: View {
                 Text(ageText(snap.observedAt, now: now)).font(.system(size: 10)).foregroundStyle(.tertiary)
             }
             if snap.windows.isEmpty {
-                Text(snap.message ?? "값이 없습니다").font(.system(size: 11)).foregroundStyle(.secondary)
+                Text(snap.message ?? T("값이 없습니다")).font(.system(size: 11)).foregroundStyle(.secondary)
             }
             ForEach(snap.windows) { window in
                 WindowRow(window: window, now: now)
@@ -1024,12 +1103,12 @@ struct WindowRow: View {
         let tint = statusColor(left)
         let reset = resetText(window.resetsAt, now: now)
         HStack(spacing: 8) {
-            Text(window.label).font(.system(size: 11)).foregroundStyle(.secondary).frame(width: 30, alignment: .leading)
+            Text(window.label).font(.system(size: 11)).foregroundStyle(.secondary).frame(width: L10n.current == "en" ? 40 : 30, alignment: .leading)
             Bar(fraction: Double(left) / 100, color: tint)
-            Text("\(left)% 남음").font(.system(size: 11, weight: .semibold).monospacedDigit())
+            Text(T("{0}% 남음", left)).font(.system(size: 11, weight: .semibold).monospacedDigit())
                 .foregroundStyle(tint).frame(width: 62, alignment: .trailing)
             Group {
-                if reset.isEmpty || reset == "초기화됨" {
+                if reset.isEmpty || reset == T("초기화됨") {
                     Text(reset)
                 } else {
                     Text("\(Image(systemName: "arrow.counterclockwise")) \(reset)")
@@ -1068,17 +1147,17 @@ struct SessionSection: View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {
                 Image(systemName: "list.bullet").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary).frame(width: 7)
-                Text("세션").font(.system(size: 12, weight: .semibold))
+                Text(T("세션")).font(.system(size: 12, weight: .semibold))
                 Spacer(minLength: 4)
-                Text("진행 \(count(.working)) · 답 \(count(.answered)) · 확인 \(count(.waiting))")
+                Text(T("진행 {0} · 답 {1} · 확인 {2}", count(.working), count(.answered), count(.waiting)))
                     .font(.system(size: 10).monospacedDigit()).foregroundStyle(.tertiary)
             }
             if sessions.isEmpty {
-                Text("켜져 있는 세션이 없습니다").font(.system(size: 11)).foregroundStyle(.secondary)
+                Text(T("켜져 있는 세션이 없습니다")).font(.system(size: 11)).foregroundStyle(.secondary)
             }
             ForEach(sessions.prefix(Self.maxRows)) { SessionRow(session: $0, now: now) }
             if sessions.count > Self.maxRows {
-                Text("외 \(sessions.count - Self.maxRows)개").font(.system(size: 10)).foregroundStyle(.tertiary).padding(.leading, 30)
+                Text(T("외 {0}개", sessions.count - Self.maxRows)).font(.system(size: 10)).foregroundStyle(.tertiary).padding(.leading, 30)
             }
         }
     }
@@ -1154,7 +1233,7 @@ final class SpinnerView: NSView {
     init(name: String, color: NSColor) {
         let config = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
             .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
-        image = NSImage(systemSymbolName: name, accessibilityDescription: "진행 중")?.withSymbolConfiguration(config)
+        image = NSImage(systemSymbolName: name, accessibilityDescription: T("진행 중"))?.withSymbolConfiguration(config)
         super.init(frame: NSRect(x: 0, y: 0, width: 13, height: 13))
         wantsLayer = true
         symbol.contentsGravity = .center
@@ -1400,20 +1479,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let now = model.now
         var lines: [String] = []
         func add(_ title: String, _ snap: ProviderSnapshot) {
-            lines.append("\(title) · 마지막 값 \(snap.observedAt.map(fullTime) ?? "없음")")
+            lines.append(T("{0} · 마지막 값 {1}", title, snap.observedAt.map(fullTime) ?? T("없음")))
             for w in snap.windows {
-                lines.append("    \(w.label) \(w.leftPercent(now: now))% 남음 · 초기화 \(w.resetsAt.map(fullTime) ?? "-")")
+                lines.append("    " + T("{0} {1}% 남음 · 초기화 {2}", w.label, w.leftPercent(now: now), w.resetsAt.map(fullTime) ?? "-"))
             }
         }
         for pane in model.order {  // 창과 같은 순서로
             switch pane {
             case .claude where model.showClaude:
-                add("Claude (\(model.claude.source ?? "Claude Code 상태 표시줄"))", model.claude)
+                add("Claude (\(model.claude.source ?? T("Claude Code 상태 표시줄")))", model.claude)
             case .codex where model.showCodex:
-                add("ChatGPT (Codex 한도)", model.codex)
-                lines.append("Codex 서버 확인 \(codex.serverCheckedAt.map(clock) ?? "전")\(codex.serverError.map { " — \($0)" } ?? "")")
+                add(T("ChatGPT (Codex 한도)"), model.codex)
+                lines.append(T("Codex 서버 확인 {0}", codex.serverCheckedAt.map(clock) ?? T("전")) + (codex.serverError.map { " — \($0)" } ?? ""))
             case .sessions where model.showSessions:
-                for s in model.sessions { lines.append("세션 · " + describeSession(s, now: now)) }
+                for s in model.sessions { lines.append(T("세션 · {0}", describeSession(s, now: now))) }
             default:
                 break
             }
@@ -1429,21 +1508,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             menu.addItem(info)
         }
         menu.addItem(.separator())
-        menu.addItem(menuItem("지금 새로고침", #selector(refreshAll)))
-        menu.addItem(menuItem("위치 초기화", #selector(resetPosition)))
+        menu.addItem(menuItem(T("지금 새로고침"), #selector(refreshAll)))
+        menu.addItem(menuItem(T("위치 초기화"), #selector(resetPosition)))
         addShownItems(to: menu)
-        menu.addItem(menuItem("로그인할 때 자동으로 열기", #selector(toggleLoginItem)))
+        menu.addItem(menuItem(T("로그인할 때 자동으로 열기"), #selector(toggleLoginItem)))
         addConnectItem(to: menu)
         menu.addItem(updateMenuItem())
         menu.addItem(.separator())
-        menu.addItem(menuItem("종료", #selector(quit)))
+        menu.addItem(menuItem(T("종료"), #selector(quit)))
         NSMenu.popUpContextMenu(menu, with: event, for: container)
     }
 
     // MARK: 자동 업데이트
 
     private func updateMenuItem() -> NSMenuItem {
-        menuItem("업데이트 확인 (지금 \(Updater.current))", #selector(manualCheckForUpdate))
+        menuItem(T("업데이트 확인 (지금 {0})", Updater.current), #selector(manualCheckForUpdate))
     }
 
     @objc private func autoCheckForUpdate() { checkForUpdate(manual: false) }
@@ -1462,9 +1541,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                     Updater.relaunch(after: getpid(), app: Bundle.main.bundleURL, old: old)
                     NSApp.terminate(nil)
                 case .upToDate(let latest):
-                    if manual { inform("최신 버전입니다", "지금 \(Updater.current)" + (latest.map { " · 올라온 최신 \($0)" } ?? "")) }
+                    if manual { inform(T("최신 버전입니다"), T("지금 {0}", Updater.current) + (latest.map { " " + T("· 올라온 최신 {0}", $0) } ?? "")) }
                 case .failed(let message):
-                    if manual { inform("업데이트하지 못했습니다", message) }
+                    if manual { inform(T("업데이트하지 못했습니다"), message) }
                 }
             }
         }
@@ -1482,26 +1561,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private func addConnectItem(to menu: NSMenu) {
         let state = ClaudeCodeLink.state()
         guard state == .notConnected || state == .broken else { return }
-        menu.addItem(menuItem("Claude Code 에 연결…", #selector(connectClaudeCode)))
+        menu.addItem(menuItem(T("Claude Code 에 연결…"), #selector(connectClaudeCode)))
     }
 
     @objc private func connectClaudeCode() {
         let alert = NSAlert()
-        alert.messageText = "Claude Code 에 연결할까요?"
-        alert.informativeText = "Claude 값을 받으려고 Claude Code 상태 표시줄(~/.claude/settings.json)에 이 앱을 겁니다.\n"
-            + "쓰시던 상태 표시줄이 있으면 그대로 보입니다. 고치기 전 파일은 settings.json.bak-날짜 로 남깁니다."
-        alert.addButton(withTitle: "연결")
-        alert.addButton(withTitle: "취소")
+        alert.messageText = T("Claude Code 에 연결할까요?")
+        alert.informativeText = T("Claude 값을 받으려고 Claude Code 상태 표시줄(~/.claude/settings.json)에 이 앱을 겁니다.\n쓰시던 상태 표시줄이 있으면 그대로 보입니다. 고치기 전 파일은 settings.json.bak-날짜 로 남깁니다.")
+        alert.addButton(withTitle: T("연결"))
+        alert.addButton(withTitle: T("취소"))
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let result = ClaudeCodeLink.connect()
         let done = NSAlert()
         if result.hasPrefix("error:") || ClaudeCodeLink.state() != .connected {
-            done.messageText = "연결하지 못했습니다"
-            done.informativeText = result.hasPrefix("error:") ? String(result.dropFirst(6)) : "결과: \(result)"
+            done.messageText = T("연결하지 못했습니다")
+            done.informativeText = result.hasPrefix("error:") ? T(String(result.dropFirst(6))) : T("결과: {0}", result)
         } else {
-            done.messageText = "연결했습니다"
-            done.informativeText = "Claude Code 에서 한 번 대화하면 Claude 값이 나타납니다."
+            done.messageText = T("연결했습니다")
+            done.informativeText = T("Claude Code 에서 한 번 대화하면 Claude 값이 나타납니다.")
         }
         done.runModal()
         refreshLocal()
@@ -1516,10 +1594,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     /// 「Claude 보이기」「ChatGPT 보이기」「세션 보이기」「칸 순서」 — 앞뒤를 구분선으로 묶는다
     private func addShownItems(to menu: NSMenu) {
         menu.addItem(.separator())
-        menu.addItem(menuItem("Claude 보이기", #selector(toggleClaude)))
-        menu.addItem(menuItem("ChatGPT 보이기", #selector(toggleCodex)))
-        menu.addItem(menuItem("세션 보이기", #selector(toggleSessions)))
+        menu.addItem(menuItem(T("Claude 보이기"), #selector(toggleClaude)))
+        menu.addItem(menuItem(T("ChatGPT 보이기"), #selector(toggleCodex)))
+        menu.addItem(menuItem(T("세션 보이기"), #selector(toggleSessions)))
         menu.addItem(orderMenuItem())
+        menu.addItem(languageMenuItem())
         menu.addItem(.separator())
     }
 
@@ -1531,9 +1610,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             item.representedObject = order.map(\.rawValue)
             submenu.addItem(item)
         }
-        let item = NSMenuItem(title: "칸 순서", action: nil, keyEquivalent: "")
+        let item = NSMenuItem(title: T("칸 순서"), action: nil, keyEquivalent: "")
         item.submenu = submenu
         return item
+    }
+
+    /// 「언어」 — 자동(시스템 언어)과 언어 이름(각 언어로 적은 이름). 체크는 validateMenuItem 이 붙인다.
+    private func languageMenuItem() -> NSMenuItem {
+        let submenu = NSMenu()
+        let auto = menuItem(T("자동 (시스템 언어)"), #selector(chooseLanguage(_:)))
+        auto.representedObject = "auto"
+        submenu.addItem(auto)
+        submenu.addItem(.separator())
+        for code in L10n.codes {
+            let item = menuItem(L10n.nativeNames[code] ?? code, #selector(chooseLanguage(_:)))
+            item.representedObject = code
+            submenu.addItem(item)
+        }
+        let item = NSMenuItem(title: T("언어 (Language)"), action: nil, keyEquivalent: "")
+        item.submenu = submenu
+        return item
+    }
+
+    @objc private func chooseLanguage(_ sender: NSMenuItem) {
+        guard let code = sender.representedObject as? String, code != L10n.choice else { return }
+        L10n.choose(code)
+        buildMainMenu()
+        refreshAll()  // 값에 붙은 안내 글도 새 언어로 다시 만든다
+        model.objectWillChange.send()
+        afterUpdate()
     }
 
     @objc private func chooseOrder(_ sender: NSMenuItem) {
@@ -1571,13 +1676,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     /// 앱이 앞에 있을 때 위쪽 메뉴 막대에 나오는 메뉴(⌘R 새로고침, ⌘Q 종료)
     private func buildMainMenu() {
         let appMenu = NSMenu()
-        appMenu.addItem(menuItem("지금 새로고침", #selector(refreshAll), key: "r"))
-        appMenu.addItem(menuItem("위치 초기화", #selector(resetPosition)))
+        appMenu.addItem(menuItem(T("지금 새로고침"), #selector(refreshAll), key: "r"))
+        appMenu.addItem(menuItem(T("위치 초기화"), #selector(resetPosition)))
         addShownItems(to: appMenu)
-        appMenu.addItem(menuItem("로그인할 때 자동으로 열기", #selector(toggleLoginItem)))
+        appMenu.addItem(menuItem(T("로그인할 때 자동으로 열기"), #selector(toggleLoginItem)))
         appMenu.addItem(updateMenuItem())
         appMenu.addItem(.separator())
-        appMenu.addItem(menuItem("AI 사용량 종료", #selector(quit), key: "q"))
+        appMenu.addItem(menuItem(T("AI 사용량 종료"), #selector(quit), key: "q"))
         let appItem = NSMenuItem()
         appItem.submenu = appMenu
         let mainMenu = NSMenu()
@@ -1594,10 +1699,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     /// Dock 아이콘 오른쪽 클릭 메뉴(「종료」는 macOS 가 붙여 준다)
     func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
         let menu = NSMenu()
-        menu.addItem(menuItem("지금 새로고침", #selector(refreshAll)))
-        menu.addItem(menuItem("위치 초기화", #selector(resetPosition)))
+        menu.addItem(menuItem(T("지금 새로고침"), #selector(refreshAll)))
+        menu.addItem(menuItem(T("위치 초기화"), #selector(resetPosition)))
         addShownItems(to: menu)
-        menu.addItem(menuItem("로그인할 때 자동으로 열기", #selector(toggleLoginItem)))
+        menu.addItem(menuItem(T("로그인할 때 자동으로 열기"), #selector(toggleLoginItem)))
         addConnectItem(to: menu)
         menu.addItem(updateMenuItem())
         return menu
@@ -1614,10 +1719,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             }
         } catch {
             let alert = NSAlert()
-            alert.messageText = "로그인 항목을 바꾸지 못했습니다"
-            alert.informativeText = "시스템 설정 → 일반 → 로그인 항목에서 「AI 사용량」을 직접 추가하거나 빼 주세요.\n(\(error.localizedDescription))"
-            alert.addButton(withTitle: "시스템 설정 열기")
-            alert.addButton(withTitle: "닫기")
+            alert.messageText = T("로그인 항목을 바꾸지 못했습니다")
+            alert.informativeText = T("시스템 설정 → 일반 → 로그인 항목에서 「AI 사용량」을 직접 추가하거나 빼 주세요.\n({0})", error.localizedDescription)
+            alert.addButton(withTitle: T("시스템 설정 열기"))
+            alert.addButton(withTitle: T("닫기"))
             NSApp.activate(ignoringOtherApps: true)
             if alert.runModal() == .alertFirstButtonReturn { SMAppService.openSystemSettingsLoginItems() }
             return
@@ -1639,6 +1744,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             menuItem.state = model.showSessions ? .on : .off
         case #selector(chooseOrder(_:)):
             menuItem.state = (menuItem.representedObject as? [String]) == model.order.map(\.rawValue) ? .on : .off
+        case #selector(chooseLanguage(_:)):
+            menuItem.state = (menuItem.representedObject as? String) == L10n.choice ? .on : .off
         case #selector(manualCheckForUpdate):
             return !updating  // 받는 중에는 흐리게
         default:
@@ -1698,19 +1805,19 @@ enum StatusLine {
         // 1줄: 저장소 · 워크트리 · PR (git 저장소 밖이면 생략)
         let workspace = root["workspace"] as? [String: Any]
         var location: [String] = []
-        if let repo = (workspace?["repo"] as? [String: Any])?["name"] as? String, !repo.isEmpty { location.append("저장소 \(white)\(repo)\(reset)") }
-        if let worktree = workspace?["git_worktree"] as? String, !worktree.isEmpty { location.append("워크트리 \(sky)\(worktree)\(reset)") }
+        if let repo = (workspace?["repo"] as? [String: Any])?["name"] as? String, !repo.isEmpty { location.append("\(T("저장소")) \(white)\(repo)\(reset)") }
+        if let worktree = workspace?["git_worktree"] as? String, !worktree.isEmpty { location.append("\(T("워크트리")) \(sky)\(worktree)\(reset)") }
         if let pr = number((root["pr"] as? [String: Any])?["number"]) { location.append("PR #\(Int(pr))") }
         if !location.isEmpty { lines.append(location.joined(separator: sep)) }
 
         // 2줄: 모델 · 추론 강도 │ 컨텍스트
         var line = "\(cyan)\((root["model"] as? [String: Any])?["display_name"] as? String ?? "?")\(reset)"
         if let level = (root["effort"] as? [String: Any])?["level"] as? String, !level.isEmpty {
-            line += "\(sep)추론 강도 \(effortColor(level))\(level)\(reset)"
+            line += "\(sep)\(T("추론 강도")) \(effortColor(level))\(level)\(reset)"
         }
         if let context = root["context_window"] as? [String: Any], let remaining = number(context["remaining_percentage"]) {
             let left = Int(remaining.rounded(.down))
-            line += " \(dim)│\(reset) 컨텍스트 \(color(left))\(left)% 남음\(reset) "
+            line += " \(dim)│\(reset) \(T("컨텍스트")) \(color(left))\(T("{0}% 남음", left))\(reset) "
                 + "\(dim)(\(k(number(context["total_input_tokens"]) ?? 0))/\(k(number(context["context_window_size"]) ?? 0)))\(reset)"
         }
         lines.append(line)
@@ -1720,13 +1827,13 @@ enum StatusLine {
             var parts: [String] = []
             if let five = limits["five_hour"] as? [String: Any], let used = number(five["used_percentage"]) {
                 let left = 100 - Int(used.rounded(.down))
-                var text = "5시간 한도 \(color(left))\(left)% 남음\(reset)"
-                if let at = number(five["resets_at"]), at > 0 { text += " \(dim)(\(clock(Date(timeIntervalSince1970: at))) 초기화)\(reset)" }
+                var text = "\(T("5시간 한도")) \(color(left))\(T("{0}% 남음", left))\(reset)"
+                if let at = number(five["resets_at"]), at > 0 { text += " \(dim)\(T("({0} 초기화)", clock(Date(timeIntervalSince1970: at))))\(reset)" }
                 parts.append(text)
             }
             if let week = limits["seven_day"] as? [String: Any], let used = number(week["used_percentage"]) {
                 let left = 100 - Int(used.rounded(.down))
-                parts.append("주간 한도 \(color(left))\(left)% 남음\(reset)")
+                parts.append("\(T("주간 한도")) \(color(left))\(T("{0}% 남음", left))\(reset)")
             }
             if !parts.isEmpty { lines.append(parts.joined(separator: sep)) }
         }
@@ -1799,13 +1906,13 @@ enum Updater {
     }
 
     private static func fetch(_ url: URL) throws -> Data {
-        var result: Result<Data, Error> = .failure(Failure("응답 없음"))
+        var result: Result<Data, Error> = .failure(Failure(T("응답 없음")))
         let done = DispatchSemaphore(value: 0)
         URLSession.shared.dataTask(with: request(url, accept: "application/vnd.github+json", timeout: 30)) { data, response, error in
             if let error {
                 result = .failure(error)
             } else if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-                result = .failure(Failure("GitHub 응답 \(http.statusCode)" + (http.statusCode == 404 ? "(저장소가 비공개거나 없음)" : "")))
+                result = .failure(Failure(T("GitHub 응답 {0}", http.statusCode) + (http.statusCode == 404 ? T("(저장소가 비공개거나 없음)") : "")))
             } else {
                 result = .success(data ?? Data())
             }
@@ -1821,8 +1928,8 @@ enum Updater {
         URLSession.shared.downloadTask(with: request(url, accept: "application/octet-stream", timeout: 120)) { location, response, error in
             defer { done.signal() }
             if let error { failure = error; return }
-            if let http = response as? HTTPURLResponse, http.statusCode != 200 { failure = Failure("내려받기 응답 \(http.statusCode)"); return }
-            guard let location else { failure = Failure("받은 파일이 없음"); return }
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 { failure = Failure(T("내려받기 응답 {0}", http.statusCode)); return }
+            guard let location else { failure = Failure(T("받은 파일이 없음")); return }
             do {
                 try? FileManager.default.removeItem(at: target)
                 try FileManager.default.moveItem(at: location, to: target)  // 이 블록이 끝나면 임시 파일이 지워진다
@@ -1837,7 +1944,7 @@ enum Updater {
     /// 올라온 맥 판 가운데 가장 높은 것(초안·미리 보기 판은 뺀다)
     static func latest() throws -> Release? {
         guard let list = try JSONSerialization.jsonObject(with: fetch(feed)) as? [[String: Any]] else {
-            throw Failure("Releases 목록을 읽지 못함")
+            throw Failure(T("Releases 목록을 읽지 못함"))
         }
         var best: Release?
         for item in list {
@@ -1858,10 +1965,10 @@ enum Updater {
 
     /// 이 자리의 앱을 바꿀 수 없으면 그 까닭
     static func cannotReplace(_ app: URL) -> String? {
-        guard app.pathExtension == "app" else { return "앱(.app)으로 실행되지 않았습니다" }
-        if app.path.contains("/AppTranslocation/") { return "격리된 임시 위치에서 실행 중입니다(설치.sh 로 다시 설치해 주세요)" }
+        guard app.pathExtension == "app" else { return T("앱(.app)으로 실행되지 않았습니다") }
+        if app.path.contains("/AppTranslocation/") { return T("격리된 임시 위치에서 실행 중입니다(설치.sh 로 다시 설치해 주세요)") }
         let parent = app.deletingLastPathComponent().path
-        guard FileManager.default.isWritableFile(atPath: parent) else { return "\(parent) 에 쓸 수 없습니다" }
+        guard FileManager.default.isWritableFile(atPath: parent) else { return T("{0} 에 쓸 수 없습니다", parent) }
         return nil
     }
 
@@ -1887,11 +1994,11 @@ enum Updater {
             try download(release.url, to: zip)
             if let expected = release.sha256 {
                 let actual = SHA256.hash(data: try Data(contentsOf: zip)).map { String(format: "%02x", $0) }.joined()
-                guard actual == expected else { throw Failure("받은 파일이 올라온 것과 다릅니다(SHA-256)") }
+                guard actual == expected else { throw Failure(T("받은 파일이 올라온 것과 다릅니다(SHA-256)")) }
             }
             let unpacked = work.appendingPathComponent("unpacked")
-            guard runTool("/usr/bin/ditto", ["-x", "-k", zip.path, unpacked.path]) == 0 else { throw Failure("압축을 풀지 못했습니다") }
-            guard let newApp = findApp(in: unpacked) else { throw Failure("묶음 안에 앱이 없습니다") }
+            guard runTool("/usr/bin/ditto", ["-x", "-k", zip.path, unpacked.path]) == 0 else { throw Failure(T("압축을 풀지 못했습니다")) }
+            guard let newApp = findApp(in: unpacked) else { throw Failure(T("묶음 안에 앱이 없습니다")) }
             try check(newApp, version: release.version)
             let old = try swap(app: app, with: newApp)
             log("\(release.version) 으로 바꿈")
@@ -1917,11 +2024,11 @@ enum Updater {
     /// 같은 앱인지(번들 id), 태그와 같은 버전인지, 서명이 깨지지 않았는지, 이 맥에서 실제로 도는지
     private static func check(_ newApp: URL, version: String) throws {
         guard let info = NSDictionary(contentsOf: newApp.appendingPathComponent("Contents/Info.plist")),
-              info["CFBundleIdentifier"] as? String == Bundle.main.bundleIdentifier else { throw Failure("다른 앱이 들어 있습니다") }
-        guard info["CFBundleShortVersionString"] as? String == version else { throw Failure("묶음 안 앱의 버전이 \(version) 이 아닙니다") }
-        guard runTool("/usr/bin/codesign", ["--verify", "--deep", "--strict", newApp.path]) == 0 else { throw Failure("서명 확인에 실패했습니다") }
+              info["CFBundleIdentifier"] as? String == Bundle.main.bundleIdentifier else { throw Failure(T("다른 앱이 들어 있습니다")) }
+        guard info["CFBundleShortVersionString"] as? String == version else { throw Failure(T("묶음 안 앱의 버전이 {0} 이 아닙니다", version)) }
+        guard runTool("/usr/bin/codesign", ["--verify", "--deep", "--strict", newApp.path]) == 0 else { throw Failure(T("서명 확인에 실패했습니다")) }
         guard output(newApp.appendingPathComponent("Contents/MacOS/AIUsagePet").path, ["--version"]) == version else {
-            throw Failure("새 판이 이 맥에서 실행되지 않습니다")
+            throw Failure(T("새 판이 이 맥에서 실행되지 않습니다"))
         }
         runTool("/usr/bin/xattr", ["-dr", "com.apple.quarantine", newApp.path])
     }
@@ -2066,21 +2173,21 @@ func takeSingleInstanceLock() -> Bool {
     print(describe("Claude", claude, now: now))
     let link: String
     switch ClaudeCodeLink.state() {
-    case .noClaudeCode: link = "Claude Code 없음(~/.claude 폴더 없음)"
-    case .notConnected: link = "안 됨 — 지금 명령: \(ClaudeCodeLink.command() ?? "없음")"
-    case .broken: link = "끊김(가리키는 앱 경로가 없음) — 지금 명령: \(ClaudeCodeLink.command() ?? "없음")"
-    case .connected: link = "됨"
+    case .noClaudeCode: link = T("Claude Code 없음(~/.claude 폴더 없음)")
+    case .notConnected: link = T("안 됨 — 지금 명령: {0}", ClaudeCodeLink.command() ?? T("없음"))
+    case .broken: link = T("끊김(가리키는 앱 경로가 없음) — 지금 명령: {0}", ClaudeCodeLink.command() ?? T("없음"))
+    case .connected: link = T("됨")
     }
-    print("  출처: \(claude.windows.isEmpty ? "-" : claude.source ?? "-") · Claude Code 연결: \(link)")
+    print("  " + T("출처: {0} · Claude Code 연결: {1}", claude.windows.isEmpty ? "-" : claude.source ?? "-", link))
     if let data = FileManager.default.contents(atPath: ClaudeCodeLink.seenPath),
        let seen = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any], let at = number(seen["at"]) {
-        print("  상태 표시줄 마지막 실행 \(fullTime(Date(timeIntervalSince1970: at))) · 한도 값 \(seen["limits"] as? Bool == true ? "옴" : "안 옴") · Claude Code \(seen["version"] as? String ?? "?")")
+        print("  " + T("상태 표시줄 마지막 실행 {0} · 한도 값 {1} · Claude Code {2}", fullTime(Date(timeIntervalSince1970: at)), seen["limits"] as? Bool == true ? T("옴") : T("안 옴"), seen["version"] as? String ?? "?"))
     }
-    print(describe("ChatGPT · 기록", fromLog ?? ProviderSnapshot(message: "최근 기록 없음"), now: now))
-    print(describe("ChatGPT · 서버", codex.fromServer ?? ProviderSnapshot(message: codex.serverError ?? "실패"), now: now))
-    print(describe("ChatGPT · 표시", codex.current, now: now))
+    print(describe(T("ChatGPT · 기록"), fromLog ?? ProviderSnapshot(message: T("최근 기록 없음")), now: now))
+    print(describe(T("ChatGPT · 서버"), codex.fromServer ?? ProviderSnapshot(message: codex.serverError ?? T("실패")), now: now))
+    print(describe(T("ChatGPT · 표시"), codex.current, now: now))
     let sessions = sortSessions(ClaudeSessionReader().read(now: now) + CodexSessionReader().read(now: now))
-    print("세션 \(sessions.count)개")
+    print(T("세션 {0}개", sessions.count))
     for s in sessions { print("  " + describeSession(s, now: now)) }
 }
 
@@ -2089,28 +2196,28 @@ func checkUpdateOnce() {
     do {
         if let release = try Updater.latest() {
             let newer = Updater.isNewer(release.version, than: Updater.current)
-            print("지금 \(Updater.current) · 올라온 최신 \(release.version) — \(newer ? "새 판 있음" : "최신")")
+            print(T("지금 {0} · 올라온 최신 {1} — {2}", Updater.current, release.version, newer ? T("새 판 있음") : T("최신")))
             print("  \(release.url.absoluteString)")
-            print("  sha256 \(release.sha256 ?? "(GitHub 이 주지 않음 — 검사 생략)")")
+            print("  sha256 \(release.sha256 ?? T("(GitHub 이 주지 않음 — 검사 생략)"))")
         } else {
-            print("지금 \(Updater.current) · 올라온 맥 판 없음")
+            print(T("지금 {0} · 올라온 맥 판 없음", Updater.current))
         }
     } catch let failure as Updater.Failure {
-        print("확인 실패: \(failure.message)")
+        print(T("확인 실패: {0}", failure.message))
     } catch {
-        print("확인 실패: \(error.localizedDescription)")
+        print(T("확인 실패: {0}", error.localizedDescription))
     }
-    if let reason = Updater.cannotReplace(Bundle.main.bundleURL) { print("  이 자리에서는 자동으로 바꿀 수 없음: \(reason)") }
-    print("  자동 업데이트 \(Updater.autoEnabled ? "켬" : "끔(defaults autoUpdate false)") · 기록 \(Updater.logPath)")
+    if let reason = Updater.cannotReplace(Bundle.main.bundleURL) { print("  " + T("이 자리에서는 자동으로 바꿀 수 없음: {0}", reason)) }
+    print("  " + T("자동 업데이트 {0} · 기록 {1}", Updater.autoEnabled ? T("켬") : T("끔(defaults autoUpdate false)"), Updater.logPath))
 }
 
 /// --update: 메뉴의 「업데이트 확인」과 같은 일. 같은 자리의 앱이 떠 있으면 끄고 새 판으로 다시 띄운다.
 func updateOnce() {
     switch Updater.run() {
     case .upToDate(let latest):
-        print("최신 버전입니다(지금 \(Updater.current), 올라온 최신 \(latest ?? "없음"))")
+        print(T("최신 버전입니다(지금 {0}, 올라온 최신 {1})", Updater.current, latest ?? T("없음")))
     case .failed(let message):
-        print("업데이트하지 못했습니다: \(message)")
+        print(T("업데이트하지 못했습니다: {0}", message))
     case .installed(let version, let old):
         let app = Bundle.main.bundleURL
         let running = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
@@ -2118,10 +2225,10 @@ func updateOnce() {
         if let running {
             Updater.relaunch(after: running.processIdentifier, app: app, old: old)
             running.terminate()
-            print("\(version) 으로 바꿨습니다 — 떠 있던 창을 새 판으로 다시 띄웁니다")
+            print(T("{0} 으로 바꿨습니다 — 떠 있던 창을 새 판으로 다시 띄웁니다", version))
         } else {
             try? FileManager.default.removeItem(at: old)
-            print("\(version) 으로 바꿨습니다")
+            print(T("{0} 으로 바꿨습니다", version))
         }
     }
 }

@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 using Microsoft.Win32;
+using static AIUsage.L10n;
 
 namespace AIUsage;
 
@@ -11,7 +12,9 @@ sealed class MainForm : Form
 {
     // 96 DPI 기준 픽셀. S() 로 화면 배율을 곱한다.
     const int BaseWidth = 300, PadX = 12, PadY = 10, HeaderH = 18, RowH = 16, Gap = 5, SectionGap = 9;
-    const int LabelW = 34, PercentW = 72, ResetW = 82, ColGap = 8, BarH = 5, DotSize = 8;
+    const int PercentW = 72, ResetW = 82, ColGap = 8, BarH = 5, DotSize = 8;
+    /// 「5시간」「주간」 칸 너비 — 영어(Weekly)는 조금 넓게
+    static int LabelW => L10n.Current == "en" ? 44 : 34;
     const TextFormatFlags TextFlags = TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix;
 
     readonly Mutex mutex;
@@ -32,7 +35,7 @@ sealed class MainForm : Form
     {
         this.mutex = mutex;
         this.afterInstall = afterInstall;
-        Text = "AI 사용량";
+        Text = T("AI 사용량");
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = true;
         TopMost = true;
@@ -104,7 +107,7 @@ sealed class MainForm : Form
         if (!Installer.IsInstalled)
         {
             if (manual)
-                MessageBox.Show("설치한 뒤에 업데이트할 수 있습니다.\n창 오른쪽 클릭 → 「설치(시작 메뉴에 등록)」", "AI 사용량",
+                MessageBox.Show(T("설치한 뒤에 업데이트할 수 있습니다.\n창 오른쪽 클릭 → 「설치(시작 메뉴에 등록)」"), T("AI 사용량"),
                                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
@@ -118,8 +121,8 @@ sealed class MainForm : Form
             {
                 Updater.Log($"확인: 최신(올라온 최신 {release?.Version ?? "없음"})");
                 if (manual)
-                    MessageBox.Show($"최신 버전입니다.\n\n지금 {Updater.Current}" + (release is null ? "" : $" · 올라온 최신 {release.Version}"),
-                                    "AI 사용량", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    MessageBox.Show(T("최신 버전입니다") + "\n\n" + T("지금 {0}", Updater.Current) + (release is null ? "" : " " + T("· 올라온 최신 {0}", release.Version)),
+                                    T("AI 사용량"), MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
             Updater.Log($"새 판 {release.Version} 받기 시작");
@@ -132,7 +135,7 @@ sealed class MainForm : Form
         {
             Updater.Log($"실패: {e.Message}");
             if (manual)
-                MessageBox.Show($"업데이트하지 못했습니다.\n\n{e.Message}", "AI 사용량", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(T("업데이트하지 못했습니다") + "\n\n" + e.Message, T("AI 사용량"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
         finally
         {
@@ -311,7 +314,7 @@ sealed class MainForm : Form
         {
             y += S(Gap);
             var height = S(RowH) * 2 + S(Gap);
-            TextRenderer.DrawText(g, snap.Message ?? "값이 없습니다", fontRow, new Rectangle(left, y, right - left, height),
+            TextRenderer.DrawText(g, snap.Message ?? T("값이 없습니다"), fontRow, new Rectangle(left, y, right - left, height),
                                   Palette.Secondary, TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.WordBreak
                                   | TextFormatFlags.EndEllipsis);
             return y + height;
@@ -339,10 +342,10 @@ sealed class MainForm : Form
         using (var track = new SolidBrush(Palette.Track)) FillCapsule(g, track, barX, barY, barWidth, S(BarH));
         using (var fill = new SolidBrush(tint)) FillCapsule(g, fill, barX, barY, Math.Max(S(3), barWidth * leftPercent / 100f), S(BarH));
 
-        TextRenderer.DrawText(g, $"{leftPercent}% 남음", fontPercent, new Rectangle(percentX, y, S(PercentW), height), tint,
+        TextRenderer.DrawText(g, T("{0}% 남음", leftPercent), fontPercent, new Rectangle(percentX, y, S(PercentW), height), tint,
                               TextFlags | TextFormatFlags.Right);
         var reset = Fmt.ResetText(window.ResetsAt, now);
-        if (reset.Length > 0 && reset != "초기화됨") reset = "↺ " + reset;
+        if (reset.Length > 0 && reset != T("초기화됨")) reset = "↺ " + reset;
         TextRenderer.DrawText(g, reset, fontSmall, new Rectangle(resetX, y, S(ResetW), height), Palette.Secondary,
                               TextFlags | TextFormatFlags.Right);
     }
@@ -364,29 +367,57 @@ sealed class MainForm : Form
         menu.Items.Clear();
         foreach (var line in DetailLines()) menu.Items.Add(new ToolStripMenuItem(line) { Enabled = false });
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("지금 새로고침", null, (_, _) => RefreshAll());
-        menu.Items.Add("위치 초기화", null, (_, _) => PlaceWindow(reset: true));
-        var orderMenu = new ToolStripMenuItem("칸 순서");
+        menu.Items.Add(T("지금 새로고침"), null, (_, _) => RefreshAll());
+        menu.Items.Add(T("위치 초기화"), null, (_, _) => PlaceWindow(reset: true));
+        var orderMenu = new ToolStripMenuItem(T("칸 순서"));
         foreach (var choice in Settings.Orders)
             orderMenu.DropDownItems.Add(new ToolStripMenuItem(string.Join(" → ", choice.Select(Settings.Title)), null, (_, _) => ChooseOrder(choice))
             {
                 Checked = choice.SequenceEqual(order),
             });
         menu.Items.Add(orderMenu);
-        menu.Items.Add(new ToolStripMenuItem("Windows 시작할 때 자동으로 열기", null, (_, _) => AutoStart.Set(!AutoStart.IsOn)) { Checked = AutoStart.IsOn });
-        menu.Items.Add(new ToolStripMenuItem("Claude Code 상태 표시줄 연결", null, (_, _) => { ClaudeLink.Ask(fromMenu: true); RefreshLocal(); })
+        menu.Items.Add(LanguageMenu());
+        menu.Items.Add(new ToolStripMenuItem(T("Windows 시작할 때 자동으로 열기"), null, (_, _) => AutoStart.Set(!AutoStart.IsOn)) { Checked = AutoStart.IsOn });
+        menu.Items.Add(new ToolStripMenuItem(T("Claude Code 상태 표시줄 연결"), null, (_, _) => { ClaudeLink.Ask(fromMenu: true); RefreshLocal(); })
         {
             Checked = ClaudeSettings.State() == ClaudeSettings.LinkState.Connected,
         });
         if (!Installer.IsInstalled)
-            menu.Items.Add("설치(시작 메뉴에 등록)", null, (_, _) => { if (Installer.InstallAndRelaunch(mutex)) Close(); });
-        menu.Items.Add(new ToolStripMenuItem($"업데이트 확인 (지금 {Updater.Current})", null, (_, _) => CheckForUpdate(manual: true))
+            menu.Items.Add(T("설치(시작 메뉴에 등록)"), null, (_, _) => { if (Installer.InstallAndRelaunch(mutex)) Close(); });
+        menu.Items.Add(new ToolStripMenuItem(T("업데이트 확인 (지금 {0})", Updater.Current), null, (_, _) => CheckForUpdate(manual: true))
         {
             Enabled = !updating,
         });
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("종료", null, (_, _) => Close());
+        menu.Items.Add(T("종료"), null, (_, _) => Close());
         e.Cancel = false;  // 항목을 여기서 채우므로 열리게 둔다
+    }
+
+    /// 「언어」 — 자동(Windows 표시 언어)과 언어 이름(각 언어로 적은 이름)
+    ToolStripMenuItem LanguageMenu()
+    {
+        var item = new ToolStripMenuItem(T("언어 (Language)"));
+        var choice = L10n.Choice;
+        item.DropDownItems.Add(new ToolStripMenuItem(T("자동 (시스템 언어)"), null, (_, _) => ChooseLanguage("auto")) { Checked = choice == "auto" });
+        item.DropDownItems.Add(new ToolStripSeparator());
+        foreach (var code in L10n.Codes)
+            item.DropDownItems.Add(new ToolStripMenuItem(L10n.NativeNames[code], null, (_, _) => ChooseLanguage(code)) { Checked = choice == code });
+        return item;
+    }
+
+    void ChooseLanguage(string code)
+    {
+        if (code == L10n.Choice) return;
+        try
+        {
+            L10n.Choose(code);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            return;
+        }
+        Text = T("AI 사용량");
+        RefreshAll();  // 값에 붙은 안내 글도 새 언어로 다시 만든다
     }
 
     void ChooseOrder(Pane[] choice)
@@ -399,14 +430,14 @@ sealed class MainForm : Form
     IEnumerable<string> DetailLines()
     {
         foreach (var (title, snap) in order.Select(p => p == Pane.Codex
-                     ? ("ChatGPT (Codex 한도)", codexSnap)
-                     : ($"Claude ({claudeSnap.Source ?? "Claude Code 상태 표시줄"})", claudeSnap)))
+                     ? (T("ChatGPT (Codex 한도)"), codexSnap)
+                     : ($"Claude ({claudeSnap.Source ?? T("Claude Code 상태 표시줄")})", claudeSnap)))
         {
-            yield return $"{title} · 마지막 값 {(snap.ObservedAt is { } at ? Fmt.FullTime(at) : "없음")}";
+            yield return T("{0} · 마지막 값 {1}", title, snap.ObservedAt is { } at ? Fmt.FullTime(at) : T("없음"));
             foreach (var w in snap.Windows)
-                yield return $"    {w.Label} {w.LeftPercent(now)}% 남음 · 초기화 {(w.ResetsAt is { } r ? Fmt.FullTime(r) : "-")}";
+                yield return "    " + T("{0} {1}% 남음 · 초기화 {2}", w.Label, w.LeftPercent(now), w.ResetsAt is { } r ? Fmt.FullTime(r) : "-");
         }
-        yield return $"Codex 서버 확인 {(codex.ServerCheckedAt is { } c ? Fmt.Clock(c) : "전")}{(codex.ServerError is { } error ? " — " + error : "")}";
+        yield return T("Codex 서버 확인 {0}", codex.ServerCheckedAt is { } c ? Fmt.Clock(c) : T("전")) + (codex.ServerError is { } error ? " — " + error : "");
     }
 }
 

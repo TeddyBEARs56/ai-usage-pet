@@ -11,6 +11,8 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$here/Info.plist" "$app/Contents/Info.plist"
 cp "$here/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 cp "$here/share/claude-settings.js" "$app/Contents/Resources/claude-settings.js"
+cp "$here/../i18n/strings.json" "$app/Contents/Resources/strings.json"  # 화면 글자 번역(윈도우 판과 같은 파일)
+cp -R "$here/lproj/" "$app/Contents/Resources/"                         # Finder·Dock 의 앱 이름(시스템 언어별)
 swiftc -O -swift-version 5 -parse-as-library "$here/AIUsagePet.swift" -o "$app/Contents/MacOS/AIUsagePet"
 codesign --force --sign - "$app"
 # Finder·Dock 이 바뀐 아이콘을 다시 읽게 한다

@@ -9,6 +9,7 @@ using System.Globalization;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text.Json;
+using static AIUsage.L10n;
 
 namespace AIUsage;
 
@@ -56,8 +57,8 @@ static class Updater
         request.Headers.Accept.ParseAdd("application/vnd.github+json");
         using var response = await Http.SendAsync(request, token);
         if (!response.IsSuccessStatusCode)
-            throw new HttpRequestException($"GitHub 응답 {(int)response.StatusCode}"
-                                           + (response.StatusCode == HttpStatusCode.NotFound ? "(저장소가 비공개거나 없음)" : ""));
+            throw new HttpRequestException(T("GitHub 응답 {0}", (int)response.StatusCode)
+                                           + (response.StatusCode == HttpStatusCode.NotFound ? T("(저장소가 비공개거나 없음)") : ""));
         await using var stream = await response.Content.ReadAsStreamAsync(token);
         using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: token);
         return Pick(doc.RootElement);
@@ -65,7 +66,7 @@ static class Updater
 
     internal static Release? Pick(JsonElement list)
     {
-        if (list.ValueKind != JsonValueKind.Array) throw new InvalidDataException("Releases 목록을 읽지 못함");
+        if (list.ValueKind != JsonValueKind.Array) throw new InvalidDataException(T("Releases 목록을 읽지 못함"));
         Release? best = null;
         foreach (var item in list.EnumerateArray())
         {
@@ -100,7 +101,7 @@ static class Updater
         {
             request.Headers.Accept.ParseAdd("application/octet-stream");
             using var response = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
-            if (!response.IsSuccessStatusCode) throw new HttpRequestException($"내려받기 응답 {(int)response.StatusCode}");
+            if (!response.IsSuccessStatusCode) throw new HttpRequestException(T("내려받기 응답 {0}", (int)response.StatusCode));
             await using var file = File.Create(partial);
             await response.Content.CopyToAsync(file, token);
         }
@@ -112,7 +113,7 @@ static class Updater
             if (actual != expected)
             {
                 File.Delete(partial);
-                throw new InvalidDataException("받은 파일이 올라온 것과 다릅니다(SHA-256)");
+                throw new InvalidDataException(T("받은 파일이 올라온 것과 다릅니다(SHA-256)"));
             }
         }
         // Windows 에서는 exe 의 파일 버전이 읽힌다. 태그와 다르면(잘못 올린 판) 바꾸고 나서 또 받는 일이 되풀이되므로 버린다.
@@ -121,7 +122,7 @@ static class Updater
         if (fileVersion is not null && Parts(fileVersion) is not null && Compare(fileVersion, release.Version) != 0)
         {
             File.Delete(partial);
-            throw new InvalidDataException($"받은 exe 의 버전({fileVersion})이 {release.Version} 이 아닙니다");
+            throw new InvalidDataException(T("받은 exe 의 버전({0})이 {1} 이 아닙니다", fileVersion, release.Version));
         }
         File.Move(partial, target, overwrite: true);
         return target;

@@ -3,6 +3,7 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Microsoft.Win32;
+using static AIUsage.L10n;
 
 namespace AIUsage;
 
@@ -31,10 +32,9 @@ static class Installer
         var update = File.Exists(InstalledExe);
         if (!update && Settings.InstallDeclined) return false;
         var question = update
-            ? "설치된 AI 사용량을 지금 이 파일로 바꿀까요?"
-            : "AI 사용량을 이 PC에 설치할까요?\n\n· 시작 메뉴에 「AI 사용량」이 생깁니다(작업 표시줄에 고정할 수 있습니다)\n"
-              + $"· 설치 위치: {Dir}\n\n「아니요」를 누르면 설치하지 않고 이 파일로 실행합니다.";
-        if (MessageBox.Show(question, "AI 사용량", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            ? T("설치된 AI 사용량을 지금 이 파일로 바꿀까요?")
+            : T("AI 사용량을 이 PC에 설치할까요?\n\n· 시작 메뉴에 「AI 사용량」이 생깁니다(작업 표시줄에 고정할 수 있습니다)\n· 설치 위치: {0}\n\n「아니요」를 누르면 설치하지 않고 이 파일로 실행합니다.", Dir);
+        if (MessageBox.Show(question, T("AI 사용량"), MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
         {
             if (!update) Settings.InstallDeclined = true;
             return false;
@@ -55,7 +55,7 @@ static class Installer
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or COMException or InvalidOperationException)
         {
-            MessageBox.Show($"설치하지 못했습니다: {e.Message}\n\n설치하지 않고 이 파일로 실행합니다.", "AI 사용량",
+            MessageBox.Show(T("설치하지 못했습니다: {0}\n\n설치하지 않고 이 파일로 실행합니다.", e.Message), T("AI 사용량"),
                             MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return false;
         }
@@ -82,7 +82,7 @@ static class Installer
     static void Extract(string resource, string target)
     {
         using var stream = typeof(Installer).Assembly.GetManifestResourceStream(resource)
-                           ?? throw new InvalidOperationException($"{resource} 가 실행 파일 안에 없습니다");
+                           ?? throw new InvalidOperationException(T("{0} 가 실행 파일 안에 없습니다", resource));
         var bytes = new byte[stream.Length];
         stream.ReadExactly(bytes);
         // 내용이 같으면 그대로 둔다(상태 표시줄이 쓰는 중이라 덮어쓸 수 없을 수 있다)
@@ -92,7 +92,7 @@ static class Installer
 
     static void CreateShortcut(string link, string target, string icon)
     {
-        var type = Type.GetTypeFromProgID("WScript.Shell") ?? throw new InvalidOperationException("WScript.Shell 을 찾지 못했습니다");
+        var type = Type.GetTypeFromProgID("WScript.Shell") ?? throw new InvalidOperationException(T("WScript.Shell 을 찾지 못했습니다"));
         dynamic shell = Activator.CreateInstance(type)!;
         try
         {
@@ -100,7 +100,7 @@ static class Installer
             shortcut.TargetPath = target;
             shortcut.WorkingDirectory = Path.GetDirectoryName(target);
             shortcut.IconLocation = icon + ",0";
-            shortcut.Description = "Claude·ChatGPT 사용 한도를 화면 위에 띄워 둔다";
+            shortcut.Description = T("Claude·ChatGPT 사용 한도를 화면 위에 띄워 둔다");
             shortcut.Save();
         }
         finally
@@ -217,25 +217,25 @@ static class ClaudeLink
         var current = ClaudeSettings.CurrentCommand();
         if (ClaudeSettings.State() == ClaudeSettings.LinkState.Connected)
         {
-            if (fromMenu) MessageBox.Show($"이미 연결돼 있습니다.\n\n{current}", "AI 사용량", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            if (fromMenu) MessageBox.Show(T("이미 연결돼 있습니다.\n\n{0}", current ?? ""), T("AI 사용량"), MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
         // 설치 직후 자동으로 물을 때는 Claude Code 를 쓰는 PC 에서만
         if (!fromMenu && !Directory.Exists(Path.GetDirectoryName(Paths.ClaudeSettings))) return;
 
-        var question = "Claude 값을 받으려면 Claude Code 상태 표시줄을 이 프로그램과 연결해야 합니다.\n\n"
-            + (current is null || ClaudeSettings.IsConnected(current) ? "" : $"지금 쓰는 상태 표시줄({current})은 AI 사용량의 상태 표시줄로 바뀝니다. 원래 설정은 settings.json.bak-날짜 파일로 남깁니다.\n\n")
-            + "연결할까요?";
-        if (MessageBox.Show(question, "AI 사용량", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        var question = T("Claude 값을 받으려면 Claude Code 상태 표시줄을 이 프로그램과 연결해야 합니다.") + "\n\n"
+            + (current is null || ClaudeSettings.IsConnected(current) ? "" : T("지금 쓰는 상태 표시줄({0})은 AI 사용량의 상태 표시줄로 바뀝니다. 원래 설정은 settings.json.bak-날짜 파일로 남깁니다.", current) + "\n\n")
+            + T("연결할까요?");
+        if (MessageBox.Show(question, T("AI 사용량"), MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
         try
         {
             ClaudeSettings.Connect(Installer.EnsureStatusExe());
-            MessageBox.Show("연결했습니다. Claude Code 에서 한 번 대화하면 Claude 값이 나타납니다.", "AI 사용량",
+            MessageBox.Show(T("연결했습니다. Claude Code 에서 한 번 대화하면 Claude 값이 나타납니다."), T("AI 사용량"),
                             MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or InvalidDataException or System.Text.Json.JsonException)
         {
-            MessageBox.Show($"연결하지 못했습니다: {e.Message}", "AI 사용량", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show(T("연결하지 못했습니다: {0}", e.Message), T("AI 사용량"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 }

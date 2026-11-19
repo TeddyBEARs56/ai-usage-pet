@@ -27,6 +27,7 @@ Dock 에서 켜고 끄는 맥 앱. 창은 Codex 펫처럼 다른 창 위·모든
 - Claude 세션은 터미널을 닫을 때까지 보인다. 끝난 Codex 작업은 30분 뒤 빠지고, 같은 폴더에서 다시 돌리면 앞의 끝난 기록은 빠진다. Codex 가 스스로 띄운 하위 작업은 보이지 않는다.
 - Claude 쪽 파일은 공식 문서에 없는 형식이라 Claude Code 업데이트로 바뀔 수 있다. 모르는 상태 값은 회색 「알 수 없음」으로 보인다.
 - claude.ai 웹·ChatGPT 앱 안의 대화는 보이지 않는다.
+- **언어**: 창(또는 Dock 아이콘) 오른쪽 클릭 → 「언어 (Language)」 → 자동(시스템 언어)·한국어·English·日本語·简体中文. 자세한 것은 [맨 위 README](../README.md#언어).
 - **로그인할 때 자동으로 열기**: Dock 아이콘 오른쪽 클릭(또는 창 오른쪽 클릭) → 「로그인할 때 자동으로 열기」. 켜지면 체크 표시가 붙고 시스템 설정 → 일반 → 로그인 항목에 들어간다. 다시 누르면 빠진다.
 
 창은 끌어서 옮기고(위치 기억), 두 번 클릭하면 새로고침. 오른쪽 클릭 메뉴에 마지막 값·초기화 날짜·값의 출처, 세션별 상태와 폴더, 새로고침, 위치 초기화(메인 화면 오른쪽 위), 자동 실행, 업데이트 확인, 종료가 있다.
@@ -55,6 +56,7 @@ Claude 칸에 이유가 나온다(값을 어디서 읽는지는 [맨 위 README]
 | `AppIcon.icns` | 앱 아이콘(`icon/make-icons.sh` 로 만든다) |
 | `build.sh` | 소스를 고쳤을 때만: 다시 빌드해 `~/Applications/AI 사용량.app` 에 두고 다시 띄운다(이 맥 전용) |
 | `package.sh` | 다른 맥에 줄 설치 묶음 zip(애플 칩·인텔, macOS 14+) |
+| `lproj/` | Finder·Dock 의 앱 이름(시스템 언어별 `InfoPlist.strings`). 앱 안 글자는 `i18n/strings.json` |
 | `share/` | 묶음에 들어가는 설치·지우기 스크립트, 안내문, Claude Code 설정 도구(`claude-settings.js`, 앱 안 Resources 로 들어감) |
 
 ## 고친 뒤 다시 만들기
@@ -78,7 +80,7 @@ zip 이름의 버전은 `Info.plist` 의 `CFBundleShortVersionString`. 새로 �
 
 1.4 부터는 직접 건넬 필요가 없다: `zsh release.sh mac` 이 같은 묶음을 `AIUsage-mac-<버전>.zip` 으로 Releases 에 올리고, 깔린 앱이 알아서 받아 바꾼다. 처음 까는 사람은 Releases 에서 그 zip 을 받는다.
 
-zip 을 건네면 받는 쪽은 `읽어 주세요.txt` 대로 터미널에 `zsh ` + `설치.sh` 끌어다 놓기 → Enter. 설치가 하는 일:
+zip 을 건네면 받는 쪽은 `읽어 주세요 (Read me).txt`(한국어·영어) 대로 터미널에 `zsh ` + `설치.sh` 끌어다 놓기 → Enter. 설치가 하는 일:
 
 1. 앱을 `~/Applications` 에 넣고 받은 파일 표시(quarantine)를 지운다 — 개발자 인증(공증) 없는 임시 서명이라 이게 없으면 「확인되지 않은 개발자」 창이 뜬다. `.command` 더블클릭 대신 `zsh 설치.sh` 로 돌리는 것도 같은 이유.
 2. Claude Code 가 있으면 `~/.claude/settings.json` 의 `statusLine` 을 앱의 `--statusline` 으로 건다(jq 불필요, 0.01초). 이미 다른 상태 표시줄이 있으면 `~/.claude/ai-usage-statusline.sh` 로 감싸 원래 줄을 그대로 보이게 하고, 원래 설정은 `ai-usage-statusline.original.json` 에 남긴다. 고치기 전 파일은 `settings.json.bak-날짜`. JSON 이 깨져 있으면 손대지 않는다. 이미 이 앱이 걸려 있는데 경로가 다르면(다시 설치·옮김) 새 경로로 고친다. 앱 안에도 같은 `claude-settings.js` 가 들어 있어서 앱의 「Claude Code 에 연결」·켤 때 고치기가 이것을 쓴다.
