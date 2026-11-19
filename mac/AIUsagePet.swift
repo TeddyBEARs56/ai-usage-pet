@@ -10,9 +10,13 @@
 //             Codex 의 ~/.codex/sessions rollout 기록 마지막 표시(+ 그 파일을 연 codex 프로세스가 있는지), 3초마다
 //
 // 실행 옵션: --print (값만 출력), --snapshot <png> (창 모양을 그림으로 저장), --connect (Claude Code 상태 표시줄에 연결),
-//           --statusline (Claude Code 상태 표시줄: 한도를 남기고 상태 표시줄 글자를 낸다)
+//           --statusline (Claude Code 상태 표시줄: 한도를 남기고 상태 표시줄 글자를 낸다),
+//           --version, --check-update (올라온 새 판 보기), --update (새 판으로 바꾸기)
+//
+// 자동 업데이트: 켠 뒤 1분, 그 뒤 6시간마다 GitHub Releases 의 mac-v<버전> 을 보고 높으면 받아 바꾼 뒤 다시 띄운다(Updater)
 
 import AppKit
+import CryptoKit
 import ServiceManagement
 import SwiftUI
 
@@ -1227,8 +1231,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var anchorFromOldTop = false  // 예전 판이 기억한 위 모서리로 처음 띄웠으면, 값이 다 찬 높이로 한 번 다시 잰다
     private var container: ContainerView!
     private var hosting: NSHostingView<PetView>!
+    private var updating = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Updater.afterLaunch()
         // 앱을 옮기거나 다시 깔아 상태 표시줄이 없는 경로를 가리키면, 이 앱이 걸었던 것이니 묻지 않고 새 경로로 고친다
         if ClaudeCodeLink.state() == .broken { ClaudeCodeLink.connect() }
         buildMainMenu()
@@ -1237,6 +1243,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         Timer.scheduledTimer(timeInterval: 15, target: self, selector: #selector(refreshLocal), userInfo: nil, repeats: true)
         Timer.scheduledTimer(timeInterval: 3, target: self, selector: #selector(refreshSessions), userInfo: nil, repeats: true)
         Timer.scheduledTimer(timeInterval: 300, target: self, selector: #selector(refreshServer), userInfo: nil, repeats: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Updater.firstDelay) { [weak self] in self?.checkForUpdate(manual: false) }
+        Timer.scheduledTimer(timeInterval: Updater.interval, target: self, selector: #selector(autoCheckForUpdate), userInfo: nil, repeats: true)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(refreshAll),
                                                           name: NSWorkspace.didWakeNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(savePosition),
@@ -1426,9 +1434,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         addShownItems(to: menu)
         menu.addItem(menuItem("로그인할 때 자동으로 열기", #selector(toggleLoginItem)))
         addConnectItem(to: menu)
+        menu.addItem(updateMenuItem())
         menu.addItem(.separator())
         menu.addItem(menuItem("종료", #selector(quit)))
         NSMenu.popUpContextMenu(menu, with: event, for: container)
+    }
+
+    // MARK: 자동 업데이트
+
+    private func updateMenuItem() -> NSMenuItem {
+        menuItem("업데이트 확인 (지금 \(Updater.current))", #selector(manualCheckForUpdate))
+    }
+
+    @objc private func autoCheckForUpdate() { checkForUpdate(manual: false) }
+    @objc private func manualCheckForUpdate() { checkForUpdate(manual: true) }
+
+    /// 새 판이 있으면 받아 바꾸고 다시 띄운다. 자동 확인은 조용히 하고, 메뉴에서 누른 확인만 결과를 알린다.
+    private func checkForUpdate(manual: Bool) {
+        guard !updating, manual || Updater.autoEnabled else { return }
+        updating = true
+        DispatchQueue.global(qos: .utility).async {
+            let outcome = Updater.run()
+            DispatchQueue.main.async { [self] in
+                updating = false
+                switch outcome {
+                case .installed(_, let old):
+                    Updater.relaunch(after: getpid(), app: Bundle.main.bundleURL, old: old)
+                    NSApp.terminate(nil)
+                case .upToDate(let latest):
+                    if manual { inform("최신 버전입니다", "지금 \(Updater.current)" + (latest.map { " · 올라온 최신 \($0)" } ?? "")) }
+                case .failed(let message):
+                    if manual { inform("업데이트하지 못했습니다", message) }
+                }
+            }
+        }
+    }
+
+    private func inform(_ title: String, _ text: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = text
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     /// Claude Code 가 있는데 상태 표시줄이 안 걸렸거나 끊겼을 때만 「Claude Code 에 연결」
@@ -1528,6 +1575,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         appMenu.addItem(menuItem("위치 초기화", #selector(resetPosition)))
         addShownItems(to: appMenu)
         appMenu.addItem(menuItem("로그인할 때 자동으로 열기", #selector(toggleLoginItem)))
+        appMenu.addItem(updateMenuItem())
         appMenu.addItem(.separator())
         appMenu.addItem(menuItem("AI 사용량 종료", #selector(quit), key: "q"))
         let appItem = NSMenuItem()
@@ -1551,6 +1599,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         addShownItems(to: menu)
         menu.addItem(menuItem("로그인할 때 자동으로 열기", #selector(toggleLoginItem)))
         addConnectItem(to: menu)
+        menu.addItem(updateMenuItem())
         return menu
     }
 
@@ -1590,6 +1639,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             menuItem.state = model.showSessions ? .on : .off
         case #selector(chooseOrder(_:)):
             menuItem.state = (menuItem.representedObject as? [String]) == model.order.map(\.rawValue) ? .on : .off
+        case #selector(manualCheckForUpdate):
+            return !updating  // 받는 중에는 흐리게
         default:
             break
         }
@@ -1683,6 +1734,310 @@ enum StatusLine {
     }
 }
 
+// MARK: - 자동 업데이트
+
+/// GitHub 저장소 Releases 에 올린 새 판(태그 mac-v<버전>, 설치 묶음 AIUsage-mac-<버전>.zip)을 받아 지금 앱과 바꾼다.
+/// 켠 뒤 1분, 그 뒤 6시간마다 확인한다. 끄기: defaults write com.local.ai-usage-pet autoUpdate -bool false
+/// 순서: 받기 → SHA-256·번들 id·버전·서명·실행 확인 → 지금 앱을 옆에 숨긴 이름(.<이름>.old)으로 비키고 새 앱을 그 자리에 → 앱이 꺼지면 다시 띄움
+enum Updater {
+    static let repo = "TeddyBEARs56/ai-usage-pet"
+    static let tagPrefix = "mac-v"
+    static let assetPrefix = "AIUsage-mac-"
+    static let autoKey = "autoUpdate"
+    static let reRegisterKey = "updateReRegisterLoginItem"
+    static let interval: TimeInterval = 6 * 3600
+    static let workDir = homeDir + "/.cache/ai-usage/update"
+    static let logPath = homeDir + "/.cache/ai-usage/update.log"
+
+    struct Release {
+        let version: String
+        let url: URL
+        let sha256: String?
+    }
+
+    enum Outcome {
+        case upToDate(latest: String?)
+        case installed(version: String, old: URL)
+        case failed(String)
+    }
+
+    struct Failure: Error {
+        let message: String
+        init(_ message: String) { self.message = message }
+    }
+
+    static var current: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0" }
+    static var autoEnabled: Bool { UserDefaults.standard.object(forKey: autoKey) as? Bool ?? true }
+
+    /// 시험할 때는 AIUSAGE_UPDATE_FEED 로 Releases 목록 주소를, AIUSAGE_UPDATE_DELAY 로 첫 확인까지 초를 바꾼다
+    static var feed: URL {
+        if let text = ProcessInfo.processInfo.environment["AIUSAGE_UPDATE_FEED"], let url = URL(string: text) { return url }
+        return URL(string: "https://api.github.com/repos/\(repo)/releases?per_page=30")!
+    }
+    static var firstDelay: TimeInterval { Double(ProcessInfo.processInfo.environment["AIUSAGE_UPDATE_DELAY"] ?? "") ?? 60 }
+
+    static func parts(_ version: String) -> [Int]? {
+        let parts = version.split(separator: ".", omittingEmptySubsequences: false).map { Int($0) }
+        guard !parts.isEmpty, parts.allSatisfy({ ($0 ?? -1) >= 0 }) else { return nil }
+        return parts.map { $0! }
+    }
+
+    static func isNewer(_ a: String, than b: String) -> Bool {
+        guard let x = parts(a), let y = parts(b) else { return false }
+        for i in 0..<max(x.count, y.count) {
+            let l = i < x.count ? x[i] : 0, r = i < y.count ? y[i] : 0
+            if l != r { return l > r }
+        }
+        return false
+    }
+
+    private static func request(_ url: URL, accept: String, timeout: TimeInterval) -> URLRequest {
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
+        request.setValue(accept, forHTTPHeaderField: "Accept")
+        request.setValue("AIUsage-updater", forHTTPHeaderField: "User-Agent")
+        return request
+    }
+
+    private static func fetch(_ url: URL) throws -> Data {
+        var result: Result<Data, Error> = .failure(Failure("응답 없음"))
+        let done = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: request(url, accept: "application/vnd.github+json", timeout: 30)) { data, response, error in
+            if let error {
+                result = .failure(error)
+            } else if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                result = .failure(Failure("GitHub 응답 \(http.statusCode)" + (http.statusCode == 404 ? "(저장소가 비공개거나 없음)" : "")))
+            } else {
+                result = .success(data ?? Data())
+            }
+            done.signal()
+        }.resume()
+        done.wait()
+        return try result.get()
+    }
+
+    private static func download(_ url: URL, to target: URL) throws {
+        var failure: Error?
+        let done = DispatchSemaphore(value: 0)
+        URLSession.shared.downloadTask(with: request(url, accept: "application/octet-stream", timeout: 120)) { location, response, error in
+            defer { done.signal() }
+            if let error { failure = error; return }
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 { failure = Failure("내려받기 응답 \(http.statusCode)"); return }
+            guard let location else { failure = Failure("받은 파일이 없음"); return }
+            do {
+                try? FileManager.default.removeItem(at: target)
+                try FileManager.default.moveItem(at: location, to: target)  // 이 블록이 끝나면 임시 파일이 지워진다
+            } catch {
+                failure = error
+            }
+        }.resume()
+        done.wait()
+        if let failure { throw failure }
+    }
+
+    /// 올라온 맥 판 가운데 가장 높은 것(초안·미리 보기 판은 뺀다)
+    static func latest() throws -> Release? {
+        guard let list = try JSONSerialization.jsonObject(with: fetch(feed)) as? [[String: Any]] else {
+            throw Failure("Releases 목록을 읽지 못함")
+        }
+        var best: Release?
+        for item in list {
+            guard item["draft"] as? Bool != true, item["prerelease"] as? Bool != true,
+                  let tag = item["tag_name"] as? String, tag.hasPrefix(tagPrefix) else { continue }
+            let version = String(tag.dropFirst(tagPrefix.count))
+            guard parts(version) != nil, best.map({ isNewer(version, than: $0.version) }) ?? true,
+                  let asset = (item["assets"] as? [[String: Any]])?.first(where: {
+                      let name = $0["name"] as? String ?? ""
+                      return name.hasPrefix(assetPrefix) && name.hasSuffix(".zip")
+                  }),
+                  let link = asset["browser_download_url"] as? String, let url = URL(string: link) else { continue }
+            let digest = asset["digest"] as? String ?? ""
+            best = Release(version: version, url: url, sha256: digest.hasPrefix("sha256:") ? String(digest.dropFirst(7)).lowercased() : nil)
+        }
+        return best
+    }
+
+    /// 이 자리의 앱을 바꿀 수 없으면 그 까닭
+    static func cannotReplace(_ app: URL) -> String? {
+        guard app.pathExtension == "app" else { return "앱(.app)으로 실행되지 않았습니다" }
+        if app.path.contains("/AppTranslocation/") { return "격리된 임시 위치에서 실행 중입니다(설치.sh 로 다시 설치해 주세요)" }
+        let parent = app.deletingLastPathComponent().path
+        guard FileManager.default.isWritableFile(atPath: parent) else { return "\(parent) 에 쓸 수 없습니다" }
+        return nil
+    }
+
+    /// 확인 → 받기 → 검사 → 바꿔 끼우기. 바꿨으면 옛 앱(숨긴 이름) 경로를 돌려준다. 다시 띄우는 일은 부른 쪽이 한다.
+    static func run() -> Outcome {
+        let app = Bundle.main.bundleURL
+        do {
+            guard let release = try latest() else {
+                log("확인: 올라온 맥 판 없음(지금 \(current))")
+                return .upToDate(latest: nil)
+            }
+            guard isNewer(release.version, than: current) else {
+                log("확인: 최신(지금 \(current), 올라온 최신 \(release.version))")
+                return .upToDate(latest: release.version)
+            }
+            if let reason = cannotReplace(app) { throw Failure(reason) }
+            log("새 판 \(release.version) 받기 시작(지금 \(current))")
+            let work = URL(fileURLWithPath: workDir)
+            try? FileManager.default.removeItem(at: work)
+            try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: work) }
+            let zip = work.appendingPathComponent("update.zip")
+            try download(release.url, to: zip)
+            if let expected = release.sha256 {
+                let actual = SHA256.hash(data: try Data(contentsOf: zip)).map { String(format: "%02x", $0) }.joined()
+                guard actual == expected else { throw Failure("받은 파일이 올라온 것과 다릅니다(SHA-256)") }
+            }
+            let unpacked = work.appendingPathComponent("unpacked")
+            guard runTool("/usr/bin/ditto", ["-x", "-k", zip.path, unpacked.path]) == 0 else { throw Failure("압축을 풀지 못했습니다") }
+            guard let newApp = findApp(in: unpacked) else { throw Failure("묶음 안에 앱이 없습니다") }
+            try check(newApp, version: release.version)
+            let old = try swap(app: app, with: newApp)
+            log("\(release.version) 으로 바꿈")
+            return .installed(version: release.version, old: old)
+        } catch let failure as Failure {
+            log("실패: \(failure.message)")
+            return .failed(failure.message)
+        } catch {
+            log("실패: \(error.localizedDescription)")
+            return .failed(error.localizedDescription)
+        }
+    }
+
+    private static func findApp(in dir: URL) -> URL? {
+        guard let items = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return nil }
+        for case let url as URL in items {
+            if url.pathExtension == "app" { return url }
+            if items.level >= 2 { items.skipDescendants() }
+        }
+        return nil
+    }
+
+    /// 같은 앱인지(번들 id), 태그와 같은 버전인지, 서명이 깨지지 않았는지, 이 맥에서 실제로 도는지
+    private static func check(_ newApp: URL, version: String) throws {
+        guard let info = NSDictionary(contentsOf: newApp.appendingPathComponent("Contents/Info.plist")),
+              info["CFBundleIdentifier"] as? String == Bundle.main.bundleIdentifier else { throw Failure("다른 앱이 들어 있습니다") }
+        guard info["CFBundleShortVersionString"] as? String == version else { throw Failure("묶음 안 앱의 버전이 \(version) 이 아닙니다") }
+        guard runTool("/usr/bin/codesign", ["--verify", "--deep", "--strict", newApp.path]) == 0 else { throw Failure("서명 확인에 실패했습니다") }
+        guard output(newApp.appendingPathComponent("Contents/MacOS/AIUsagePet").path, ["--version"]) == version else {
+            throw Failure("새 판이 이 맥에서 실행되지 않습니다")
+        }
+        runTool("/usr/bin/xattr", ["-dr", "com.apple.quarantine", newApp.path])
+    }
+
+    /// 새 앱을 지금 앱 자리에 넣는다. 지금 앱은 같은 폴더에 숨긴 이름으로 비켜 두고 그 경로를 돌려준다(실패하면 되돌린다).
+    private static func swap(app: URL, with newApp: URL) throws -> URL {
+        let fm = FileManager.default
+        let staged = siblings(of: app).new, old = siblings(of: app).old
+        try? fm.removeItem(at: staged)
+        try? fm.removeItem(at: old)
+        try fm.moveItem(at: newApp, to: staged)  // 다른 디스크면 복사된다 — 그래서 먼저 같은 폴더로 옮겨 둔다
+        try fm.moveItem(at: app, to: old)
+        do {
+            try fm.moveItem(at: staged, to: app)
+        } catch {
+            try? fm.moveItem(at: old, to: app)
+            try? fm.removeItem(at: staged)
+            throw error
+        }
+        return old
+    }
+
+    static func siblings(of app: URL) -> (new: URL, old: URL) {
+        let parent = app.deletingLastPathComponent()
+        return (parent.appendingPathComponent("." + app.lastPathComponent + ".new"),
+                parent.appendingPathComponent("." + app.lastPathComponent + ".old"))
+    }
+
+    /// pid 프로세스(지금 떠 있는 창)가 끝나면 옛 앱을 지우고 새 앱을 띄운다. 로그인 항목이었으면 새 앱이 다시 등록한다.
+    static func relaunch(after pid: pid_t, app: URL, old: URL) {
+        if SMAppService.mainApp.status == .enabled {
+            UserDefaults.standard.set(true, forKey: reRegisterKey)
+            UserDefaults.standard.synchronize()
+        }
+        let script = """
+            while /bin/kill -0 "$1" 2>/dev/null; do /bin/sleep 0.2; done
+            /bin/rm -rf "$3"
+            /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$2" >/dev/null 2>&1
+            /usr/bin/open "$2"
+            """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", script, "sh", String(pid), app.path, old.path]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+    }
+
+    /// 새 판으로 처음 켜졌을 때: 남은 옛 앱을 지우고, 로그인 항목이었으면 다시 등록한다(임시 서명이라 바뀐 앱을 못 알아볼 수 있다)
+    static func afterLaunch() {
+        try? FileManager.default.removeItem(at: siblings(of: Bundle.main.bundleURL).old)
+        guard UserDefaults.standard.bool(forKey: reRegisterKey) else { return }
+        UserDefaults.standard.removeObject(forKey: reRegisterKey)
+        if SMAppService.mainApp.status != .enabled {
+            do {
+                try SMAppService.mainApp.register()
+                log("로그인 항목 다시 등록")
+            } catch {
+                log("로그인 항목 다시 등록 실패: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    static func log(_ line: String) {
+        let fm = FileManager.default
+        if let size = (try? fm.attributesOfItem(atPath: logPath))?[.size] as? Int, size > 100_000 { try? fm.removeItem(atPath: logPath) }
+        let data = Data("\(logFormat.string(from: Date())) \(current) \(line)\n".utf8)
+        if let handle = FileHandle(forWritingAtPath: logPath) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            try? handle.close()
+        } else {
+            try? fm.createDirectory(atPath: (logPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            fm.createFile(atPath: logPath, contents: data)
+        }
+    }
+
+    private static let logFormat: DateFormatter = {
+        let format = DateFormatter()
+        format.locale = Locale(identifier: "en_US_POSIX")
+        format.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return format
+    }()
+
+    @discardableResult
+    private static func runTool(_ path: String, _ arguments: [String]) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return -1 }
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+
+    /// 실행해서 표준 출력을 돌려준다(10초 넘게 걸리면 끊는다)
+    private static func output(_ path: String, _ arguments: [String]) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        let killer = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 10, execute: killer)
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        killer.cancel()
+        guard process.terminationStatus == 0 else { return nil }
+        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 // MARK: - 시작
 
 /// 이미 떠 있으면 false (로그인 자동 실행과 직접 실행이 겹쳐도 하나만 뜨게).
@@ -1690,7 +2045,8 @@ enum StatusLine {
 func takeSingleInstanceLock() -> Bool {
     let dir = homeDir + "/.cache/ai-usage"
     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    let fd = open(dir + "/pet.lock", O_CREAT | O_RDWR, 0o644)
+    // O_CLOEXEC: 띄우는 프로그램(codex, 다시 띄우기 도우미)이 잠금을 물려받아 쥐고 있지 않게
+    let fd = open(dir + "/pet.lock", O_CREAT | O_RDWR | O_CLOEXEC, 0o644)
     if fd < 0 { return true }
     for _ in 0..<30 {
         if flock(fd, LOCK_EX | LOCK_NB) == 0 { return true }  // fd 는 닫지 않는다(프로세스가 끝나면 풀린다)
@@ -1728,6 +2084,48 @@ func takeSingleInstanceLock() -> Bool {
     for s in sessions { print("  " + describeSession(s, now: now)) }
 }
 
+/// --check-update: 올라온 최신 판만 본다(바꾸지 않음)
+func checkUpdateOnce() {
+    do {
+        if let release = try Updater.latest() {
+            let newer = Updater.isNewer(release.version, than: Updater.current)
+            print("지금 \(Updater.current) · 올라온 최신 \(release.version) — \(newer ? "새 판 있음" : "최신")")
+            print("  \(release.url.absoluteString)")
+            print("  sha256 \(release.sha256 ?? "(GitHub 이 주지 않음 — 검사 생략)")")
+        } else {
+            print("지금 \(Updater.current) · 올라온 맥 판 없음")
+        }
+    } catch let failure as Updater.Failure {
+        print("확인 실패: \(failure.message)")
+    } catch {
+        print("확인 실패: \(error.localizedDescription)")
+    }
+    if let reason = Updater.cannotReplace(Bundle.main.bundleURL) { print("  이 자리에서는 자동으로 바꿀 수 없음: \(reason)") }
+    print("  자동 업데이트 \(Updater.autoEnabled ? "켬" : "끔(defaults autoUpdate false)") · 기록 \(Updater.logPath)")
+}
+
+/// --update: 메뉴의 「업데이트 확인」과 같은 일. 같은 자리의 앱이 떠 있으면 끄고 새 판으로 다시 띄운다.
+func updateOnce() {
+    switch Updater.run() {
+    case .upToDate(let latest):
+        print("최신 버전입니다(지금 \(Updater.current), 올라온 최신 \(latest ?? "없음"))")
+    case .failed(let message):
+        print("업데이트하지 못했습니다: \(message)")
+    case .installed(let version, let old):
+        let app = Bundle.main.bundleURL
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+            .first { $0.bundleURL?.standardizedFileURL.path == app.standardizedFileURL.path }
+        if let running {
+            Updater.relaunch(after: running.processIdentifier, app: app, old: old)
+            running.terminate()
+            print("\(version) 으로 바꿨습니다 — 떠 있던 창을 새 판으로 다시 띄웁니다")
+        } else {
+            try? FileManager.default.removeItem(at: old)
+            print("\(version) 으로 바꿨습니다")
+        }
+    }
+}
+
 @MainActor func saveSnapshot(to path: String) {
     _ = NSApplication.shared
     renderingStill = true
@@ -1762,6 +2160,10 @@ enum Main {
     @MainActor static func main() {
         signal(SIGPIPE, SIG_IGN)
         let args = CommandLine.arguments
+        if args.contains("--version") {  // 자동 업데이트가 받은 새 판이 이 맥에서 도는지 볼 때도 쓴다
+            print(Updater.current)
+            return
+        }
         if args.contains("--statusline") {
             // 상태 표시줄이 실패해도 Claude Code 는 그대로 돌아야 하므로, 읽지 못하면 아무것도 내지 않는다
             let input = FileHandle.standardInput.readDataToEndOfFile()
@@ -1778,6 +2180,14 @@ enum Main {
         }
         if let i = args.firstIndex(of: "--snapshot"), args.indices.contains(i + 1) {
             saveSnapshot(to: args[i + 1])
+            return
+        }
+        if args.contains("--check-update") {
+            checkUpdateOnce()
+            return
+        }
+        if args.contains("--update") {
+            updateOnce()
             return
         }
         guard takeSingleInstanceLock() else { return }

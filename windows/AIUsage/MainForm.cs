@@ -20,11 +20,12 @@ sealed class MainForm : Form
     readonly CodexReader codex = new();
     readonly System.Windows.Forms.Timer localTimer = new() { Interval = 15_000 };
     readonly System.Windows.Forms.Timer serverTimer = new() { Interval = 300_000 };
+    readonly System.Windows.Forms.Timer updateTimer = new() { Interval = (int)Updater.FirstDelay.TotalMilliseconds };
     readonly ContextMenuStrip menu = new();
     ProviderSnapshot claudeSnap = new(), codexSnap = new();
     Pane[] order = Settings.Order;
     DateTimeOffset now = DateTimeOffset.Now;
-    bool fetching, useRegion;
+    bool fetching, updating, useRegion;
     Font? fontName, fontSmall, fontRow, fontPercent;
 
     public MainForm(Mutex mutex, bool afterInstall)
@@ -47,6 +48,11 @@ sealed class MainForm : Form
         MouseDoubleClick += (_, e) => { if (e.Button == MouseButtons.Left) RefreshAll(); };
         localTimer.Tick += (_, _) => RefreshLocal();
         serverTimer.Tick += (_, _) => RefreshServer();
+        updateTimer.Tick += (_, _) =>
+        {
+            updateTimer.Interval = (int)Updater.Interval.TotalMilliseconds;  // 처음은 켠 뒤 1분, 그 뒤 6시간마다
+            CheckForUpdate(manual: false);
+        };
         SystemEvents.PowerModeChanged += OnPowerModeChanged;
         DpiChanged += (_, _) => { MakeFonts(); FitSize(); Invalidate(); };
     }
@@ -74,6 +80,7 @@ sealed class MainForm : Form
         ApplyCorners();
         localTimer.Start();
         serverTimer.Start();
+        updateTimer.Start();
         RefreshServer();
         if (afterInstall) BeginInvoke(new Action(() => ClaudeLink.Ask(fromMenu: false)));
     }
@@ -83,7 +90,54 @@ sealed class MainForm : Form
         SystemEvents.PowerModeChanged -= OnPowerModeChanged;
         localTimer.Dispose();
         serverTimer.Dispose();
+        updateTimer.Dispose();
         base.OnFormClosed(e);
+    }
+
+    // MARK: 자동 업데이트
+
+    /// 새 판이 있으면 받아서 그 exe 에 바꾸기를 맡기고 이 창은 닫는다(새 판이 다시 띄운다).
+    /// 자동 확인은 조용히 하고, 메뉴에서 누른 확인만 결과를 알린다.
+    async void CheckForUpdate(bool manual)
+    {
+        if (updating) return;
+        if (!Installer.IsInstalled)
+        {
+            if (manual)
+                MessageBox.Show("설치한 뒤에 업데이트할 수 있습니다.\n창 오른쪽 클릭 → 「설치(시작 메뉴에 등록)」", "AI 사용량",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        if (!manual && !Settings.AutoUpdate) return;
+        updating = true;
+        try
+        {
+            Updater.CleanUp();
+            var release = await Updater.LatestAsync();
+            if (release is null || Updater.Compare(release.Version, Updater.Current) <= 0)
+            {
+                Updater.Log($"확인: 최신(올라온 최신 {release?.Version ?? "없음"})");
+                if (manual)
+                    MessageBox.Show($"최신 버전입니다.\n\n지금 {Updater.Current}" + (release is null ? "" : $" · 올라온 최신 {release.Version}"),
+                                    "AI 사용량", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            Updater.Log($"새 판 {release.Version} 받기 시작");
+            var exe = await Updater.DownloadAsync(release);
+            Updater.Launch(exe);
+            Close();
+        }
+        catch (Exception e) when (e is HttpRequestException or TaskCanceledException or IOException or UnauthorizedAccessException
+                                      or InvalidDataException or System.Text.Json.JsonException or Win32Exception)
+        {
+            Updater.Log($"실패: {e.Message}");
+            if (manual)
+                MessageBox.Show($"업데이트하지 못했습니다.\n\n{e.Message}", "AI 사용량", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            updating = false;
+        }
     }
 
     // MARK: 값
@@ -326,6 +380,10 @@ sealed class MainForm : Form
         });
         if (!Installer.IsInstalled)
             menu.Items.Add("설치(시작 메뉴에 등록)", null, (_, _) => { if (Installer.InstallAndRelaunch(mutex)) Close(); });
+        menu.Items.Add(new ToolStripMenuItem($"업데이트 확인 (지금 {Updater.Current})", null, (_, _) => CheckForUpdate(manual: true))
+        {
+            Enabled = !updating,
+        });
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("종료", null, (_, _) => Close());
         e.Cancel = false;  // 항목을 여기서 채우므로 열리게 둔다

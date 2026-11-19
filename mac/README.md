@@ -29,7 +29,9 @@ Dock 에서 켜고 끄는 맥 앱. 창은 Codex 펫처럼 다른 창 위·모든
 - claude.ai 웹·ChatGPT 앱 안의 대화는 보이지 않는다.
 - **로그인할 때 자동으로 열기**: Dock 아이콘 오른쪽 클릭(또는 창 오른쪽 클릭) → 「로그인할 때 자동으로 열기」. 켜지면 체크 표시가 붙고 시스템 설정 → 일반 → 로그인 항목에 들어간다. 다시 누르면 빠진다.
 
-창은 끌어서 옮기고(위치 기억), 두 번 클릭하면 새로고침. 오른쪽 클릭 메뉴에 마지막 값·초기화 날짜·값의 출처, 세션별 상태와 폴더, 새로고침, 위치 초기화(메인 화면 오른쪽 위), 자동 실행, 종료가 있다.
+창은 끌어서 옮기고(위치 기억), 두 번 클릭하면 새로고침. 오른쪽 클릭 메뉴에 마지막 값·초기화 날짜·값의 출처, 세션별 상태와 폴더, 새로고침, 위치 초기화(메인 화면 오른쪽 위), 자동 실행, 업데이트 확인, 종료가 있다.
+
+- **자동 업데이트**: 켠 뒤 1분, 그 뒤 6시간마다 저장소 Releases 에 더 높은 맥 판(`mac-v<버전>`)이 있으면 받아서 바꾸고 다시 띄운다(창이 1~2초 사라졌다 같은 자리에). 메뉴 「업데이트 확인 (지금 <버전>)」으로 바로 확인. 자세한 것·끄는 법은 [맨 위 README](../README.md#자동-업데이트). 이 맥에서 `build.sh` 로 만든 앱도 같은 규칙이라, 올라온 판보다 버전이 낮으면 올라온 판으로 바뀐다.
 
 ## Claude 값이 안 나올 때
 
@@ -62,6 +64,7 @@ zsh ~/Documents/GitHub/ai-usage-pet/mac/build.sh
 ```
 
 값만 확인(창 없이): `~/Applications/"AI 사용량.app"/Contents/MacOS/AIUsagePet --print`
+업데이트: `… --version`, `… --check-update`(올라온 최신 판만 보기), `… --update`(바로 바꾸고, 떠 있으면 다시 띄움)
 창 모양을 그림으로: `… --snapshot ~/Desktop/ai-usage.png`
 다른 홈 폴더로 시험(Claude Code·데스크톱 앱 파일 위치를 바꿔 볼 때): `AIUSAGE_HOME=/tmp/시험 … --print` — Windows 판과 같다.
 
@@ -71,7 +74,9 @@ zsh ~/Documents/GitHub/ai-usage-pet/mac/build.sh
 zsh ~/Documents/GitHub/ai-usage-pet/mac/package.sh   # → ~/Downloads/AI사용량-mac-<버전>.zip
 ```
 
-zip 이름의 버전은 `Info.plist` 의 `CFBundleShortVersionString`. 새로 건넬 묶음을 만들 때마다 먼저 그것(예: 1.3 → 1.4)과 `CFBundleVersion`(4 → 5)을 올린다. 같은 버전 zip 이 이미 있으면 덮어쓰지 않고 멈춘다.
+zip 이름의 버전은 `Info.plist` 의 `CFBundleShortVersionString`. 새로 건넬 묶음을 만들 때마다 먼저 그것(예: 1.4 → 1.5)과 `CFBundleVersion`(5 → 6)을 올린다. 같은 버전 zip 이 이미 있으면 덮어쓰지 않고 멈춘다.
+
+1.4 부터는 직접 건넬 필요가 없다: `zsh release.sh mac` 이 같은 묶음을 `AIUsage-mac-<버전>.zip` 으로 Releases 에 올리고, 깔린 앱이 알아서 받아 바꾼다. 처음 까는 사람은 Releases 에서 그 zip 을 받는다.
 
 zip 을 건네면 받는 쪽은 `읽어 주세요.txt` 대로 터미널에 `zsh ` + `설치.sh` 끌어다 놓기 → Enter. 설치가 하는 일:
 
@@ -92,5 +97,5 @@ printf '%s' "$input" | "$HOME/Applications/AI 사용량.app/Contents/MacOS/AIUsa
 ## 지우기
 
 1. 자동 실행을 켰다면 메뉴에서 끈다. Dock 아이콘 오른쪽 클릭 → 옵션 → Dock 에서 제거.
-2. 앱을 끄고 `~/Applications/AI 사용량.app` 과 `~/.cache/ai-usage` 를 휴지통으로.
+2. 앱을 끄고 `~/Applications/AI 사용량.app` 과 `~/.cache/ai-usage`(업데이트 기록 포함) 를 휴지통으로.
 3. `~/.claude/statusline.sh` 의 「AI 사용량 창」 부분(주석 포함 7줄)을 지운다. 고치기 전 원본: `~/.claude/statusline.sh.bak-20261026`.

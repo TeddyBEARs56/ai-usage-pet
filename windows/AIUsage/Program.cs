@@ -9,10 +9,22 @@ static class Program
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
 
+        // 자동 업데이트로 받은 새 exe 로 띄워졌으면: 앞의 창이 꺼지길 기다렸다가 설치된 것을 바꾸고 다시 띄운다
+        var replacing = Updater.ApplyTarget(args);
+        if (replacing is { } oldPid) Updater.WaitForExit(oldPid);
+
         using var mutex = new Mutex(false, @"Local\AIUsagePet");
         if (!TakeMutex(mutex))
         {
-            MessageBox.Show("AI 사용량이 이미 실행 중입니다.", "AI 사용량", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            if (replacing is null)
+                MessageBox.Show("AI 사용량이 이미 실행 중입니다.", "AI 사용량", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            else
+                Updater.Log("바꾸지 않음: 다른 창이 이미 떠 있음");
+            return 0;
+        }
+        if (replacing is not null)
+        {
+            Updater.ApplyAndRelaunch(mutex);
             return 0;
         }
         if (Installer.OfferOnStart(mutex)) return 0;  // 설치하고 설치된 쪽으로 다시 띄웠다

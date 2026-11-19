@@ -9,7 +9,7 @@ namespace AIUsage;
 static class Installer
 {
     public static string ExePath => Environment.ProcessPath ?? Application.ExecutablePath;
-    static string Dir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "AIUsage");
+    internal static string Dir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "AIUsage");
     public static string InstalledExe => Path.Combine(Dir, "AIUsage.exe");
     public static string StatusExe => Path.Combine(Dir, "AIUsageStatus.exe");
     static string IconFile => Path.Combine(Dir, "AIUsage.ico");
@@ -49,8 +49,7 @@ static class Installer
         {
             Directory.CreateDirectory(Dir);
             File.Copy(ExePath, InstalledExe, overwrite: true);
-            Extract("AIUsage.ico", IconFile);
-            Extract("AIUsageStatus.exe", StatusExe);
+            ExtractFiles();
             CreateShortcut(Shortcut, InstalledExe, IconFile);
             if (AutoStart.IsOn) AutoStart.Set(true, InstalledExe);  // 자동 실행도 설치된 쪽을 가리키게
         }
@@ -63,6 +62,13 @@ static class Installer
         try { mutex.ReleaseMutex(); } catch (ApplicationException) { }
         Process.Start(new ProcessStartInfo(InstalledExe, "--after-install") { UseShellExecute = true });
         return true;
+    }
+
+    /// 아이콘·상태 표시줄 프로그램을 설치 폴더에 꺼내 둔다. 상태 표시줄 프로그램이 마침 돌고 있어 잠겨 있으면 잠시 기다렸다 다시 한다.
+    internal static void ExtractFiles()
+    {
+        Extract("AIUsage.ico", IconFile);
+        Updater.Retry(() => Extract("AIUsageStatus.exe", StatusExe));
     }
 
     /// 상태 표시줄 프로그램을 설치 폴더에 꺼내 두고 경로를 돌려준다(설치하지 않고 쓸 때도 같은 곳)
@@ -156,6 +162,16 @@ static class Settings
         {
             using var key = Registry.CurrentUser.CreateSubKey(Key);
             key.SetValue("InstallDeclined", value ? 1 : 0, RegistryValueKind.DWord);
+        }
+    }
+
+    /// 자동 업데이트(값 AutoUpdate). 값이 없으면 켬, 0 이면 끔.
+    public static bool AutoUpdate
+    {
+        get
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(Key);
+            return key?.GetValue("AutoUpdate") is not int v || v != 0;
         }
     }
 

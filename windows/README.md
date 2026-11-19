@@ -9,7 +9,9 @@
 3. 「이 PC에 설치할까요?」 → **예**. `%LOCALAPPDATA%\Programs\AIUsage` 에 들어가고 시작 메뉴에 「AI 사용량」이 생긴다. 작업 표시줄 단추를 오른쪽 클릭 → **작업 표시줄에 고정**.
 4. Claude Code 를 쓰는 PC 면 설치 뒤 「상태 표시줄 연결」을 묻는다 → **예**.
 
-새 버전은 받은 `AIUsage.exe` 를 실행하면 「설치된 것을 바꿀까요?」라고 묻는다(먼저 켜져 있는 것은 끈다).
+**새 버전은 알아서 바뀐다(1.1.0 부터)**: 켠 뒤 1분, 그 뒤 6시간마다 Releases 에 더 높은 Windows 판(`windows-v<버전>`)이 있으면 받아서 바꾸고 다시 띄운다(창이 1~2초 사라졌다 같은 자리에). 설치 폴더에서 켰을 때만 바꾸고, 받은 파일은 SHA-256 과 exe 파일 버전을 확인한다. 바로 확인: 창 오른쪽 클릭 → 「업데이트 확인 (지금 <버전>)」. 끄기: 레지스트리 `HKCU\Software\AIUsage` 에 DWORD `AutoUpdate`=0. 기록: `%USERPROFILE%\.cache\ai-usage\update.log`. 자세한 것은 [맨 위 README](../README.md#자동-업데이트).
+
+1.0.0 을 쓰고 있으면 한 번만 손으로: Releases 에서 새 `AIUsage.exe` 를 받아 실행 → 「설치된 것을 바꿀까요?」 예(먼저 켜져 있는 것은 끈다).
 
 ## 켜고 끄기
 
@@ -18,7 +20,7 @@
 - **Windows 를 켤 때 자동으로**: 창 오른쪽 클릭 → 「Windows 시작할 때 자동으로 열기」
 - **칸 순서**: 창 오른쪽 클릭 → 「칸 순서」 → 「Claude → ChatGPT」 또는 「ChatGPT → Claude」. 고른 순서는 기억한다(레지스트리 `HKCU\Software\AIUsage` 의 `Order`).
 
-창은 끌어서 옮기고(위치 기억), 두 번 클릭하면 새로고침. 오른쪽 클릭 메뉴에 마지막 값·초기화 날짜, 위치 초기화, 칸 순서, 상태 표시줄 연결, 종료가 있다.
+창은 끌어서 옮기고(위치 기억), 두 번 클릭하면 새로고침. 오른쪽 클릭 메뉴에 마지막 값·초기화 날짜, 위치 초기화, 칸 순서, 상태 표시줄 연결, 업데이트 확인, 종료가 있다.
 
 ## 값이 뜨려면
 
@@ -41,7 +43,7 @@ Windows 에는 jq 가 없어서 상태 표시줄은 같이 들어 있는 작은 
 | 파일 | 내용 |
 |---|---|
 | `Shared/Usage.cs` | 값 읽기·상태 표시줄 처리(맥판과 같은 규칙, 맥에서도 돌려 볼 수 있음) |
-| `AIUsage/` | 창 프로그램(WinForms). `MainForm.cs` 화면, `Setup.cs` 설치·자동 실행·연결 |
+| `AIUsage/` | 창 프로그램(WinForms). `MainForm.cs` 화면, `Setup.cs` 설치·자동 실행·연결, `Updater.cs` 자동 업데이트 |
 | `AIUsageStatus/` | 상태 표시줄 콘솔 프로그램. 창 프로그램 안에 들어가 있다가 설치할 때 꺼내진다 |
 | `build.sh` | 맥에서 빌드 → `dist/AIUsage.exe` |
 | `AIUsage/AIUsage.ico` | 아이콘(`icon/make-icons.sh` 로 만든다) |
@@ -58,6 +60,6 @@ zsh windows/build.sh
 ## 지우기
 
 1. 창 오른쪽 클릭 → 자동 실행 끄기 → 종료.
-2. `%LOCALAPPDATA%\Programs\AIUsage` 폴더, 시작 메뉴 `AI 사용량` 바로 가기, `%USERPROFILE%\.cache\ai-usage` 를 지운다.
+2. `%LOCALAPPDATA%\Programs\AIUsage` 폴더(받아 둔 새 판 `update\` 포함), 시작 메뉴 `AI 사용량` 바로 가기, `%USERPROFILE%\.cache\ai-usage` 를 지운다.
 3. Claude Code 를 연결했으면 `~\.claude\settings.json` 을 `.bak-날짜` 파일로 되돌린다.
 4. (선택) 레지스트리 `HKCU\Software\AIUsage`.

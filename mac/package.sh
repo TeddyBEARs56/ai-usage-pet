@@ -5,6 +5,7 @@
 # 받는 쪽은 읽어 주세요.txt 대로 터미널에서 zsh 설치.sh 만 하면 된다(앱은 개발자 인증 없이 임시 서명).
 # 버전은 Info.plist 의 CFBundleShortVersionString. 새로 건넬 묶음을 만들 땐 먼저 그것과 CFBundleVersion 을 올린다 —
 # 같은 버전 zip 이 이미 있으면 덮어쓰지 않고 멈춘다(경로를 직접 주면 덮어쓴다).
+# release.sh mac 도 이 스크립트로 같은 묶음을 만들어 Releases 에 올린다(자동 업데이트가 그 zip 을 받는다).
 set -euo pipefail
 
 here=${0:A:h}
