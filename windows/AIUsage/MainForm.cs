@@ -32,6 +32,7 @@ sealed class MainForm : Form
     Pane[] order = Settings.Order;
     DateTimeOffset now = DateTimeOffset.Now;
     DateTimeOffset? usageAskedAt;
+    int labelWidth;  // 그릴 때마다 정한다(OnPaint)
     bool fetching, updating, useRegion, askingUsage;
     Font? fontName, fontSmall, fontRow, fontPercent;
 
@@ -307,6 +308,10 @@ sealed class MainForm : Form
         if (fontName is null) return;
         var g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
+        // 칸 이름 너비: 기본보다 긴 이름(모델별 한도 「Fable」 등)이 있으면 그만큼 넓힌다 — 두 칸의 막대가 같은 자리에서 시작하게
+        labelWidth = S(LabelW);
+        foreach (var window in claudeSnap.Windows.Concat(codexSnap.Windows))
+            labelWidth = Math.Max(labelWidth, TextRenderer.MeasureText(g, window.Label, fontRow, Size.Empty, TextFlags).Width + S(2));
         var y = S(PadY);
         for (var i = 0; i < order.Length; i++)  // 고른 순서대로(「칸 순서」 메뉴), 칸 사이에 구분선
         {
@@ -370,10 +375,10 @@ sealed class MainForm : Form
         var height = S(RowH);
         var leftPercent = window.LeftPercent(now);
         var tint = Palette.Status(leftPercent);
-        TextRenderer.DrawText(g, window.Label, fontRow, new Rectangle(left, y, S(LabelW), height), Palette.Secondary, TextFlags);
+        TextRenderer.DrawText(g, window.Label, fontRow, new Rectangle(left, y, labelWidth, height), Palette.Secondary, TextFlags | TextFormatFlags.EndEllipsis);
 
         int resetX = right - S(ResetW), percentX = resetX - S(ColGap) - S(PercentW);
-        int barX = left + S(LabelW) + S(ColGap), barWidth = Math.Max(S(10), percentX - S(ColGap) - barX);
+        int barX = left + labelWidth + S(ColGap), barWidth = Math.Max(S(10), percentX - S(ColGap) - barX);
         float barY = y + (height - S(BarH)) / 2f;
         using (var track = new SolidBrush(Palette.Track)) FillCapsule(g, track, barX, barY, barWidth, S(BarH));
         using (var fill = new SolidBrush(tint)) FillCapsule(g, fill, barX, barY, Math.Max(S(3), barWidth * leftPercent / 100f), S(BarH));

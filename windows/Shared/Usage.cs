@@ -137,10 +137,11 @@ public static class L10n
     }
 }
 
-public sealed record LimitWindow(string Id, int Minutes, double UsedPercent, DateTimeOffset? ResetsAt)
+/// Name 이 있으면 모델별 한도(예: Claude 의 「Fable」 주간) — 그 이름을 칸 이름으로 쓴다
+public sealed record LimitWindow(string Id, int Minutes, double UsedPercent, DateTimeOffset? ResetsAt, string? Name = null)
 {
-    /// 「5시간」「주간」 — 고른 언어로(언어를 바꾸면 바로 바뀌게 그때그때 만든다)
-    public string Label => Fmt.WindowLabel(Minutes);
+    /// 「5시간」「주간」(고른 언어로, 언어를 바꾸면 바로 바뀌게 그때그때 만든다) 또는 모델 이름
+    public string Label => Name ?? Fmt.WindowLabel(Minutes);
 
     /// 상태 표시줄과 같은 계산(100 - 사용률 내림). 초기화 시각이 지났으면 100.
     public int LeftPercent(DateTimeOffset now) =>
@@ -402,6 +403,12 @@ public sealed class ClaudeReader
         var seen = new List<DateTimeOffset>();
         if (usedStatus && statusAt is { } s) seen.Add(s);
         if (usedDesktop && desktop is { } dd) seen.Add(dd.At);
+        // 모델별 주간 한도(예: Fable)는 `claude /usage` 에만 있다: 1시간 안에 받은 가장 새 /usage 기록의 것을 주간 아래에 붙인다
+        var latestCommand = entries.Where(e => e.Command).OrderByDescending(e => e.Mtime).FirstOrDefault();
+        if (latestCommand.Limits is { } commandLimits && now.UtcDateTime - latestCommand.Mtime <= TimeSpan.FromHours(1))
+            foreach (var (key, (used, reset)) in commandLimits.Where(kv => kv.Key.StartsWith(ModelPrefix, StringComparison.Ordinal))
+                                                              .OrderBy(kv => kv.Key, StringComparer.Ordinal))
+                snap.Windows.Add(new LimitWindow(key, 10_080, used, J.Epoch(reset), key[ModelPrefix.Length..]));
         snap.ObservedAt = seen.Count > 0 ? seen.Max() : null;
         // 가장 새 기록이 `claude /usage` 로 받은 것이면 그렇게 적는다
         var statusName = entries.Count > 0 && entries.MaxBy(e => e.Mtime).Command ? T("Claude Code /usage") : T("Claude Code 상태 표시줄");
@@ -410,12 +417,20 @@ public sealed class ClaudeReader
         return snap;
     }
 
+    /// 모델별 주간 한도의 열쇠 앞머리(「seven_day:Fable」)
+    public const string ModelPrefix = "seven_day:";
+
     static Dictionary<string, (double Used, double Reset)> FromRateLimits(JsonElement limits)
     {
         var result = new Dictionary<string, (double Used, double Reset)>();
         foreach (var key in new[] { "five_hour", "seven_day" })
             if (J.Obj(limits, key) is { } w && J.Number(w, "used_percentage") is { } used)
                 result[key] = (used, J.Number(w, "resets_at") ?? 0);
+        // `claude /usage` 기록에만 있는 모델별 주간: {"models":{"Fable":{"used_percentage":89,"resets_at":…}}}
+        if (J.Obj(limits, "models") is { } models)
+            foreach (var model in models.EnumerateObject())
+                if (model.Value.ValueKind == JsonValueKind.Object && J.Number(model.Value, "used_percentage") is { } used && model.Name.Length > 0)
+                    result[ModelPrefix + model.Name] = (used, J.Number(model.Value, "resets_at") ?? 0);
         return result;
     }
 }
@@ -638,9 +653,11 @@ public static class ClaudeUsageCommand
     }
 
     // 「Current session: 8% used · resets Nov 20, 3:10pm (Asia/Seoul)」「Current week (all models): 70% used · resets …」
-    static readonly Regex UsageLine = new(@"^Current (?<kind>session|week \(all models\))\s*:\s*(?<used>\d+(?:\.\d+)?)\s*%\s*used(?:\s*·\s*resets\s+(?<reset>.+?))?\s*$",
+    // 「Current week (Fable): 89% used · resets …」(모델별 주간 — 옛 판은 「(Sonnet only)」)
+    static readonly Regex UsageLine = new(@"^Current (?:(?<session>session)|week \((?<scope>[^)]+)\))\s*:\s*(?<used>\d+(?:\.\d+)?)\s*%\s*used(?:\s*·\s*resets\s+(?<reset>.+?))?\s*$",
                                          RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
+    /// 열쇠: five_hour, seven_day, 모델별 주간은 「seven_day:<모델>」(ClaudeReader.ModelPrefix)
     public static Dictionary<string, (double Used, double Reset)> ParseText(string text, DateTimeOffset now)
     {
         var result = new Dictionary<string, (double Used, double Reset)>();
@@ -648,7 +665,19 @@ public static class ClaudeUsageCommand
         {
             var match = UsageLine.Match(raw.Trim());
             if (!match.Success) continue;
-            var key = match.Groups["kind"].Value.StartsWith("session", StringComparison.OrdinalIgnoreCase) ? "five_hour" : "seven_day";
+            string key;
+            if (match.Groups["session"].Success) key = "five_hour";
+            else
+            {
+                var scope = match.Groups["scope"].Value.Trim();
+                if (scope.Equals("all models", StringComparison.OrdinalIgnoreCase)) key = "seven_day";
+                else
+                {
+                    if (scope.EndsWith(" only", StringComparison.OrdinalIgnoreCase)) scope = scope[..^5].TrimEnd();
+                    if (scope.Length == 0) continue;
+                    key = ClaudeReader.ModelPrefix + scope;
+                }
+            }
             var used = double.Parse(match.Groups["used"].Value, CultureInfo.InvariantCulture);
             var reset = match.Groups["reset"].Success ? ParseReset(match.Groups["reset"].Value, now) ?? 0 : 0;
             result[key] = (used, reset);
@@ -714,8 +743,14 @@ public static class ClaudeUsageCommand
         {
             Directory.CreateDirectory(Paths.ClaudeCache);
             var node = new JsonObject();
+            var models = new JsonObject();
             foreach (var (key, (used, reset)) in limits)
-                node[key] = new JsonObject { ["used_percentage"] = used, ["resets_at"] = reset };
+            {
+                var window = new JsonObject { ["used_percentage"] = used, ["resets_at"] = reset };
+                if (key.StartsWith(ClaudeReader.ModelPrefix, StringComparison.Ordinal)) models[key[ClaudeReader.ModelPrefix.Length..]] = window;
+                else node[key] = window;
+            }
+            if (models.Count > 0) node["models"] = models;
             node["account"] = account;
             node["source"] = "usage";
             var temp = Path.Combine(Paths.ClaudeCache, "." + FileName + ".tmp");
@@ -745,8 +780,10 @@ public static class ClaudeUsageCommand
         if (error is not null ? error == lastLoggedError : lastLoggedError is null && SameLimits(limits, lastLoggedLimits)) return;
         lastLoggedError = error;
         lastLoggedLimits = error is null ? limits : null;
-        var summary = error ?? string.Join(" · ", (limits ?? new()).OrderBy(kv => kv.Key == "five_hour" ? 0 : 1).Select(kv =>
-            $"{(kv.Key == "five_hour" ? "5시간" : "주간")} {kv.Value.Used.ToString(CultureInfo.InvariantCulture)}%"
+        static string Name(string key) => key == "five_hour" ? "5시간" : key == "seven_day" ? "주간" : key.Replace(ClaudeReader.ModelPrefix, "주간 ");
+        var summary = error ?? string.Join(" · ", (limits ?? new()).OrderBy(kv => kv.Key == "five_hour" ? 0 : kv.Key == "seven_day" ? 1 : 2)
+                                                                   .ThenBy(kv => kv.Key, StringComparer.Ordinal).Select(kv =>
+            $"{Name(kv.Key)} {kv.Value.Used.ToString(CultureInfo.InvariantCulture)}%"
             + (J.Epoch(kv.Value.Reset) is { } r ? $"(초기화 {r.ToLocalTime():MM-dd HH:mm})" : "")));
         try
         {

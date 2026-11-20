@@ -33,7 +33,7 @@ ChatGPT 대화(웹·앱) 자체의 한도는 밖에서 읽을 방법이 없어 C
 ## 값의 출처(두 판 공통)
 
 - **Claude**: 세 곳(맥 판은 아래 두 곳)에서 읽고, 가장 나중에 받은 값을 쓴다. Claude Code 로그인 토큰은 읽지 않는다.
-  - **`claude /usage`(Windows 1.3.2 부터)**: Codex 처럼 Claude Code 에게 직접 묻는다 — `claude -p "/usage" --output-format json --no-session-persistence` 를 창 없이 잠깐 띄운다(5초쯤). `/usage` 는 모델을 부르지 않는 Claude Code 안의 명령이라 한도를 쓰지 않고, 인증은 Claude Code 가 한다. 대화 기록도 남기지 않는다(`~/.cache/ai-usage/claude-usage` 폴더에서 띄우므로 `~/.claude.json` 에 그 폴더 항목 하나가 생긴다). 받은 값은 상태 표시줄 기록과 같은 모양으로 `~/.cache/ai-usage/claude/usage-command.json` 에 남겨 같은 규칙으로 합치고, 초기화 시각도 있다.
+  - **`claude /usage`(Windows 1.3.2 부터)**: Codex 처럼 Claude Code 에게 직접 묻는다 — `claude -p "/usage" --output-format json --no-session-persistence` 를 창 없이 잠깐 띄운다(5초쯤). `/usage` 는 모델을 부르지 않는 Claude Code 안의 명령이라 한도를 쓰지 않고, 인증은 Claude Code 가 한다. 대화 기록도 남기지 않는다(`~/.cache/ai-usage/claude-usage` 폴더에서 띄우므로 `~/.claude.json` 에 그 폴더 항목 하나가 생긴다). 받은 값은 상태 표시줄 기록과 같은 모양으로 `~/.cache/ai-usage/claude/usage-command.json` 에 남겨 같은 규칙으로 합치고, 초기화 시각도 있다. 모델별 주간 한도(예: 「Current week (Fable)」)가 있으면 주간 아래에 그 모델 이름으로 한 줄 더 보인다(Windows 1.3.3 부터, 1시간 안에 받은 /usage 값일 때만).
     - **언제 묻나**: 앱을 켤 때, 이 PC 에서 Claude Code 가 응답했을 때(CLI·데스크톱 앱 Code 탭 모두 — `~/.claude/projects` 의 대화 기록이 바뀌는 것을 지켜본다: 응답이 끝나고 5초 잠잠하면, 긴 작업이면 30초마다, 두 번 사이는 1분 이상), 그리고 5분마다(claude.ai 웹·모바일·데스크톱 앱 Chat 처럼 이 PC 에 흔적이 없는 사용 몫). 창을 두 번 누르거나 「지금 새로고침」 하면 바로.
     - **어느 claude 를 쓰나**: `~\.local\bin\claude.exe`·npm 의 `claude.cmd`·PATH, 없으면 Claude 데스크톱 앱이 품은 것(`Claude-Data\claude_<id>\claude-code\<버전>\…\claude.exe`, 가장 높은 버전) — 그래서 데스크톱 앱만 써도 된다.
     - **안전장치**: 답에 모델을 부른 흔적(`num_turns`·비용 > 0)이 있으면 값을 쓰지 않고 다시는 묻지 않는다(`~/.cache/ai-usage/claude-usage-disabled` 를 남긴다 — 지우면 다시 묻는다).
