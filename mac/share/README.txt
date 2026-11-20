@@ -19,10 +19,14 @@ AI 사용량 — Claude·ChatGPT(Codex)의 남은 사용 한도를 화면 위에
 4. 화면 오른쪽 위에 창이 뜨면 끝입니다. Dock 에도 아이콘이 생깁니다.
 
 ━━ 쓰는 법 ━━
+• 「한도 알림」은 처음에 켜져 있습니다. 한도가 10% 이하로 남으면 알립니다. 초기화 시각을 알면 그 시각부터 60분 안에 확인한 초기화도 알립니다. 창 오른쪽 클릭 메뉴에서 켜고 끕니다.
+• 같은 메뉴의 「사용 추이…」에서 이번 주 사용 속도와 지난 4주 일별 사용량을 봅니다.
+  현재 계정의 주간 한도를 보여 주며 기록은 ~/.cache/ai-usage/history.jsonl 에 35일간 남습니다.
 • 창은 끌어서 옮기고, 두 번 클릭하면 새로고침합니다.
 • 안 쓰는 칸 숨기기: 창(또는 Dock 아이콘) 오른쪽 클릭 → 「Claude 보이기」·「ChatGPT 보이기」를 눌러 체크를 끕니다.
   다시 누르면 다시 보입니다. 둘 다 끌 수는 없습니다.
 • 언어 바꾸기: 창 오른쪽 클릭 → 「언어 (Language)」. 처음엔 맥의 언어를 따릅니다(한국어·영어·일본어·중국어 간체).
+• 창을 오른쪽 클릭하고 「모양」에서 배경 투명도, 창 크기, 글자 크기를 고릅니다. 다음에 열 때도 그대로 적용됩니다.
 • 칸 순서 바꾸기: 같은 메뉴의 「칸 순서」에서 고릅니다(세션·Claude·ChatGPT 를 놓는 순서).
 • 컴퓨터를 켤 때마다 자동으로 열기: 같은 메뉴의 「로그인할 때 자동으로 열기」.
 • 끄기: Dock 아이콘 오른쪽 클릭 → 종료.
@@ -69,11 +73,15 @@ ChatGPT (Codex) usage limits on screen.
    An icon also appears in the Dock.
 
 ━━ How to use ━━
+• Right-click the window to toggle “Limit Alerts” (on by default). Each limit alerts once at 10% remaining or less. You also get a reset alert if the app detects a known reset within one hour.
+• Open “Usage Trends…” to see your current account’s weekly pace and the past four weeks of daily usage.
+  The app keeps 35 days of weekly-limit history in ~/.cache/ai-usage/history.jsonl.
 • Drag the window to move it; double-click to refresh.
 • Language: right-click the window → "Language". It follows the macOS
   language at first (Korean, English, Japanese, Simplified Chinese).
 • Hide a section: right-click the window (or the Dock icon) → uncheck
   "Show Claude" or "Show ChatGPT". You can't hide both.
+• Right-click the window and choose "Appearance" to set background transparency, window size, and text size. Your choices are saved.
 • Section order: "Section Order" in the same menu.
 • Open at every login: "Open at Login" in the same menu.
 • Quit: right-click the Dock icon → Quit.

@@ -19,6 +19,7 @@ import AppKit
 import CryptoKit
 import ServiceManagement
 import SwiftUI
+import UserNotifications
 
 /// 홈 폴더. 시험할 때는 AIUSAGE_HOME 으로 바꾼다(윈도우 판과 같다)
 let homeDir: String = {
@@ -111,6 +112,7 @@ struct LimitWindow: Identifiable {
 }
 
 struct ProviderSnapshot {
+    fileprivate var observations: [UsageEvent] = []
     var windows: [LimitWindow] = []
     var observedAt: Date?
     var plan: String?
@@ -194,10 +196,28 @@ final class ClaudeReader {
             return !tagged && entry.mtime >= since
         }
 
+        var sourceRows: [UsageEvent] = []
+        for entry in entries {
+            for (name, minutes) in [("five_hour", 300), ("seven_day", 10080)] {
+                guard let w = entry.limits[name] as? [String: Any], let used = number(w["used_percentage"]) else { continue }
+                let window = LimitWindow(id: name, minutes: minutes, usedPercent: used,
+                                         resetsAt: number(w["resets_at"]).map(Date.init(timeIntervalSince1970:)))
+                sourceRows += UsageEvent.windows([window], at: entry.mtime, provider: "claude", id: me, source: "claude-session")
+            }
+        }
         // Claude Code 를 안 쓰는 동안에는 데스크톱 앱 기록이 더 새것일 수 있다(같은 계정일 때만)
         let statusAt = entries.map { $0.mtime }.max()
         let desktop = ClaudeDesktopUsage.latest(org: ClaudeCodeAccount.organization(), now: now)
         var snap = ProviderSnapshot()
+        if let d = desktop, let org = d.org, org == ClaudeCodeAccount.organization(), d.at >= since {
+            for (name, minutes) in [("five_hour", 300), ("seven_day", 10080)] {
+                if let used = d.used[name] {
+                    let w = LimitWindow(id: name, minutes: minutes, usedPercent: used, resetsAt: nil)
+                    sourceRows += UsageEvent.windows([w], at: d.at, provider: "claude", id: me, source: "claude-desktop")
+                }
+            }
+        }
+        snap.observations = sourceRows
         var usedStatus = false, usedDesktop = false
         for (key, minutes) in [("five_hour", 300), ("seven_day", 10_080)] {
             let found = entries.compactMap { entry -> (used: Double, reset: Double)? in
@@ -207,7 +227,7 @@ final class ClaudeReader {
             var used: Double?
             var reset: Double = 0
             if let latest = found.map({ $0.reset }).max() {
-                used = found.filter { $0.reset >= latest - 600 }.map { $0.used }.max() ?? 0
+                used = found.filter { $0.reset >= latest - Double(resetTolerance)/1000 }.map { $0.used }.max() ?? 0
                 reset = latest
             }
             var fromDesktop = false
@@ -240,6 +260,7 @@ enum ClaudeDesktopUsage {
     static let path = homeDir + "/Library/Application Support/Claude/plan-usage-history.json"
 
     struct Sample {
+        let org: String?
         let at: Date
         let used: [String: Double]  // five_hour·seven_day 사용률
     }
@@ -259,7 +280,7 @@ enum ClaudeDesktopUsage {
             var used: [String: Double] = [:]
             if let v = number(u["fh"]) { used["five_hour"] = v }
             if let v = number(u["sd"]) { used["seven_day"] = v }
-            if !used.isEmpty { best = Sample(at: at, used: used) }
+            if !used.isEmpty { best = Sample(org: sample["org"] as? String, at: at, used: used) }
         }
         return best
     }
@@ -438,16 +459,16 @@ final class CodexReader {
     /// 지금 로그인한 계정(~/.codex/auth.json 의 account_id)이 만든 기록만 쓴다. 계정이 바뀌었으면 true —
     /// 앞 계정 값은 버렸으니 부른 쪽이 서버에 바로 다시 묻는다.
     @discardableResult
-    func readLog() -> Bool {
+    func readLog(now: Date = Date()) -> Bool {
         let me = Self.currentAccount()
         var switched = false
         if me != account {
             switched = account != nil  // 다른 계정으로 바꿨거나 로그아웃: 앞 계정 값을 버린다
-            if switched { fromLog = nil; fromServer = nil; serverError = nil }
+            fromLog = nil; fromServer = nil; serverError = nil
             account = me
         }
-        let since = AccountSwitch.since("codex", id: me)
-        let files = Self.recentRolloutFiles()
+        let since = AccountSwitch.since("codex", id: me, now: now)
+        let files = Self.recentRolloutFiles(now: now)
         guard let newest = files.first else { return switched }
         let key = "\(newest.path)|\(newest.mtime.timeIntervalSince1970)|\(me ?? "")"
         guard key != lastLogKey else { return switched }
@@ -460,7 +481,7 @@ final class CodexReader {
             } else if file.mtime < since {
                 continue  // 계정이 안 적힌 기록은 계정을 바꾼 뒤 것만
             }
-            if let snap = Self.lastLimits(inLog: file.path, mtime: file.mtime) {
+            if let snap = Self.lastLimits(inLog: file.path, mtime: file.mtime, owner: logAccounts[file.path] ?? nil) {
                 fromLog = snap
                 return switched
             }
@@ -476,47 +497,63 @@ final class CodexReader {
         return (root["tokens"] as? [String: Any])?["account_id"] as? String
     }
 
-    /// 기록 첫 줄(session_meta)의 creator_account_id — 그 기록을 만든 계정. 첫 줄은 길 수 있어 앞 1MB 에서 찾는다
+    /// Only the session metadata payload identifies the account that produced this log.
     static func creatorAccount(inLog path: String) -> String? {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
-        defer { try? handle.close() }
-        guard let head = try? handle.read(upToCount: 1_000_000) else { return nil }
-        let firstLine = head.split(separator: 0x0A, maxSplits: 1, omittingEmptySubsequences: false).first ?? Data()
-        guard let text = String(data: firstLine, encoding: .utf8),
-              let match = text.range(of: #""creator_account_id"\s*:\s*"[^"]+""#, options: .regularExpression) else { return nil }
-        let pair = text[match]
-        guard let colon = pair.firstIndex(of: ":") else { return nil }
-        return pair[pair.index(after: colon)...].trimmingCharacters(in: CharacterSet(charactersIn: " \""))
+        guard let file = fopen(path, "r") else { return nil }
+        var buffer: UnsafeMutablePointer<CChar>?
+        var capacity = 0
+        defer { free(buffer); fclose(file) }
+        let count = getline(&buffer, &capacity, file)
+        guard count > 0, let buffer, buffer[count - 1] == 10,
+              let meta = (try? JSONSerialization.jsonObject(with: Data(bytes: buffer, count: count))) as? [String: Any],
+              meta["type"] as? String == "session_meta" else { return nil }
+        return (meta["payload"] as? [String: Any])?["creator_account_id"] as? String
     }
 
-    func refreshServer(done: @escaping () -> Void) {
+    func refreshServer(retry: Bool = true, done: @escaping () -> Void) {
         guard !fetching else { return }
         fetching = true
+        let owner = Self.currentAccount()
         DispatchQueue.global(qos: .utility).async {
             let result = Self.fetchServerSync()
             DispatchQueue.main.async {
                 self.fetching = false
-                self.applyServer(result)
+                let applied = self.applyServer(result, owner: owner)
                 done()
+                if !applied && retry { self.refreshServer(retry: false, done: done) }
             }
         }
     }
 
-    func applyServer(_ result: (snapshot: ProviderSnapshot?, error: String?)) {
+    func readServerSync() {
+        for _ in 0..<2 {
+            let owner = Self.currentAccount()
+            if applyServer(Self.fetchServerSync(), owner: owner) { break }
+        }
+    }
+
+    private func applyServer(_ result: (snapshot: ProviderSnapshot?, error: String?), owner: String?) -> Bool {
+        guard owner == Self.currentAccount() else { readLog(); return false }
         serverCheckedAt = Date()
-        if let snap = result.snapshot {
+        if var snap = result.snapshot {
+            if let at = snap.observedAt {
+                snap.observations = UsageEvent.windows(snap.windows, at: at, provider: "codex", id: owner, source: "codex-server")
+            }
             fromServer = snap
             serverError = nil
         } else {
             serverError = result.error
         }
+        return true
     }
 
     static func windows(from limits: [String: Any]) -> [LimitWindow] {
         var out: [LimitWindow] = []
         for key in ["primary", "secondary"] {
             guard let w = limits[key] as? [String: Any], let used = number(w["usedPercent"] ?? w["used_percent"]) else { continue }
-            let minutes = Int(number(w["windowDurationMins"] ?? w["window_minutes"]) ?? 0)
+            let rawMinutes = number(w["windowDurationMins"] ?? w["window_minutes"]) ?? 0
+            guard used.isFinite, (0...Double(Int32.max)).contains(rawMinutes) else { continue }
+            let minutes = Int(rawMinutes)
             let reset = number(w["resetsAt"] ?? w["resets_at"]).map { Date(timeIntervalSince1970: $0) }
             out.append(LimitWindow(id: key, minutes: minutes, usedPercent: used, resetsAt: reset))
         }
@@ -542,7 +579,7 @@ final class CodexReader {
         return files.sorted { $0.mtime > $1.mtime }
     }
 
-    static func lastLimits(inLog path: String, mtime: Date) -> ProviderSnapshot? {
+    static func lastLimits(inLog path: String, mtime: Date, owner: String?) -> ProviderSnapshot? {
         guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
         defer { try? handle.close() }
         let size = (try? handle.seekToEnd()) ?? 0
@@ -556,7 +593,9 @@ final class CodexReader {
             if let id = limits["limit_id"] as? String, id != "codex" { continue }
             let windows = windows(from: limits)
             if windows.isEmpty { continue }
-            return ProviderSnapshot(windows: windows,
+            let eventAt = (event["timestamp"] as? String).flatMap(parseDate)
+            let rows = eventAt.map { UsageEvent.windows(windows, at: $0, provider: "codex", id: owner, source: "codex-rollout") } ?? []
+            return ProviderSnapshot(observations: rows, windows: windows,
                                     observedAt: (event["timestamp"] as? String).flatMap(parseDate) ?? mtime,
                                     plan: planName(limits["plan_type"] as? String))
         }
@@ -1002,7 +1041,7 @@ func resetText(_ date: Date?, now: Date) -> String {
     guard let date else { return "" }
     if date <= now { return T("초기화됨") }
     if Calendar.current.isDate(date, inSameDayAs: now) { return clock(date) }
-    return formatter(date.timeIntervalSince(now) < 6 * 86_400 ? "E HH:mm" : "M/d HH:mm").string(from: date)
+    return formatter(date.timeIntervalSince(now) < 6 * 86_400 ? "E HH:mm" : "M/d").string(from: date)
 }
 
 func ageText(_ date: Date?, now: Date) -> String {
@@ -1097,7 +1136,92 @@ enum Pane: String {
     }
 }
 
+enum PetSetting: String, CaseIterable {
+    case background = "petBackgroundLevel", window = "petWindowPercent", text = "petTextPercent"
+
+    var values: [Int] {
+        switch self {
+        case .background: return [0, 1, 2, 3]
+        case .window: return [85, 100, 115, 130]
+        case .text: return [90, 100, 115, 130]
+        }
+    }
+    var title: String {
+        switch self {
+        case .background: return T("배경 투명도")
+        case .window: return T("창 크기")
+        case .text: return T("글자 크기")
+        }
+    }
+    var labels: [String] {
+        self == .background ? [T("없음"), T("조금"), T("중간"), T("많이")] :
+            [T("작게"), T("보통"), T("크게"), T("아주 크게")]
+    }
+}
+
+struct PetAppearance {
+    var background = 0
+    var window = 100
+    var text = 100
+
+    subscript(setting: PetSetting) -> Int {
+        get {
+            switch setting {
+            case .background: return background
+            case .window: return window
+            case .text: return text
+            }
+        }
+        set {
+            switch setting {
+            case .background: background = newValue
+            case .window: window = newValue
+            case .text: text = newValue
+            }
+        }
+    }
+
+    static func load() -> Self {
+        var result = Self()
+        for setting in PetSetting.allCases {
+            guard let n = UserDefaults.standard.object(forKey: setting.rawValue) as? NSNumber,
+                  CFGetTypeID(n) != CFBooleanGetTypeID(), !CFNumberIsFloatType(n),
+                  setting.values.contains(n.intValue) else { continue }
+            result[setting] = n.intValue
+        }
+        return result
+    }
+
+    var opacity: Double { [1, 0.70, 0.48, 0.26][background] }
+    func length(_ points: CGFloat) -> CGFloat { points * CGFloat(window) / 100 }
+    func typeSize(_ points: CGFloat) -> CGFloat { length(points) * CGFloat(text) / 100 }
+    var labelWidth: CGFloat { L10n.current == "en" ? 40 : 30 }
+    var width: CGFloat { length(290 + (labelWidth + 62 + 70) * CGFloat(text - 100) / 100) }
+
+    @ViewBuilder func shaded(_ text: Text) -> some View {
+        if background == 3 {
+            text.background {
+                text.foregroundStyle(.black)
+                    .shadow(color: .black, radius: length(2))
+                    .compositingGroup()
+                    .opacity(0.55)
+                    .offset(y: length(1))
+                    .accessibilityHidden(true)
+            }
+        } else { text }
+    }
+}
+
+private struct PetAppearanceKey: EnvironmentKey { static let defaultValue = PetAppearance() }
+extension EnvironmentValues {
+    var petAppearance: PetAppearance {
+        get { self[PetAppearanceKey.self] }
+        set { self[PetAppearanceKey.self] = newValue }
+    }
+}
+
 final class UsageModel: ObservableObject {
+    @Published var appearance = PetAppearance.load()
     @Published var order = Pane.loadOrder()
     @Published var claude = ProviderSnapshot()
     @Published var codex = ProviderSnapshot()
@@ -1115,19 +1239,21 @@ struct PetView: View {
     @ObservedObject var model: UsageModel
 
     var body: some View {
+        let look = model.appearance
         // 고른 순서대로, 켜 둔 칸만. 칸 사이에만 구분선을 넣는다.
         let panes = model.order.filter(isShown)
-        VStack(alignment: .leading, spacing: 9) {
+        VStack(alignment: .leading, spacing: look.length(9)) {
             ForEach(Array(panes.enumerated()), id: \.element) { index, pane in
                 if index > 0 {
-                    Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
+                    Rectangle().fill(Color.white.opacity(0.08)).frame(height: look.length(1))
                 }
                 paneView(pane)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .frame(width: 290)
+        .padding(.horizontal, look.length(12))
+        .padding(.vertical, look.length(10))
+        .frame(width: look.width)
+        .environment(\.petAppearance, look)
     }
 
     private func isShown(_ pane: Pane) -> Bool {
@@ -1152,6 +1278,8 @@ struct PetView: View {
 }
 
 struct ProviderSection: View {
+    @Environment(\.petAppearance) private var look
+
     let name: String
     let detail: String?
     let color: Color
@@ -1159,18 +1287,18 @@ struct ProviderSection: View {
     let now: Date
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 6) {
-                Circle().fill(color).frame(width: 7, height: 7)
-                Text(name).font(.system(size: 12, weight: .semibold))
+        VStack(alignment: .leading, spacing: look.length(5)) {
+            HStack(spacing: look.length(6)) {
+                Circle().fill(color).frame(width: look.length(7), height: look.length(7))
+                look.shaded(Text(name)).font(.system(size: look.typeSize(12), weight: .semibold))
                 if let detail, !detail.isEmpty {
-                    Text(detail).font(.system(size: 10)).foregroundStyle(.secondary)
+                    look.shaded(Text(detail)).font(.system(size: look.typeSize(10))).foregroundStyle(.secondary)
                 }
-                Spacer(minLength: 4)
-                Text(ageText(snap.observedAt, now: now)).font(.system(size: 10)).foregroundStyle(.tertiary)
+                Spacer(minLength: look.length(4))
+                look.shaded(Text(ageText(snap.observedAt, now: now))).font(.system(size: look.typeSize(10))).foregroundStyle(.tertiary)
             }
             if snap.windows.isEmpty {
-                Text(snap.message ?? T("값이 없습니다")).font(.system(size: 11)).foregroundStyle(.secondary)
+                look.shaded(Text(snap.message ?? T("값이 없습니다"))).font(.system(size: look.typeSize(11))).foregroundStyle(.secondary)
             }
             ForEach(snap.windows) { window in
                 WindowRow(window: window, now: now)
@@ -1180,6 +1308,8 @@ struct ProviderSection: View {
 }
 
 struct WindowRow: View {
+    @Environment(\.petAppearance) private var look
+
     let window: LimitWindow
     let now: Date
 
@@ -1187,26 +1317,28 @@ struct WindowRow: View {
         let left = window.leftPercent(now: now)
         let tint = statusColor(left)
         let reset = resetText(window.resetsAt, now: now)
-        HStack(spacing: 8) {
-            Text(window.label).font(.system(size: 11)).foregroundStyle(.secondary).frame(width: L10n.current == "en" ? 40 : 30, alignment: .leading)
+        HStack(spacing: look.length(8)) {
+            look.shaded(Text(window.label)).font(.system(size: look.typeSize(11))).foregroundStyle(.secondary).frame(width: look.typeSize(look.labelWidth), alignment: .leading)
             Bar(fraction: Double(left) / 100, color: tint)
-            Text(T("{0}% 남음", left)).font(.system(size: 11, weight: .semibold).monospacedDigit())
-                .foregroundStyle(tint).frame(width: 62, alignment: .trailing)
+            look.shaded(Text(T("{0}% 남음", left))).font(.system(size: look.typeSize(11), weight: .semibold).monospacedDigit())
+                .foregroundStyle(tint).frame(width: look.typeSize(62), alignment: .trailing)
             Group {
                 if reset.isEmpty || reset == T("초기화됨") {
-                    Text(reset)
+                    look.shaded(Text(reset))
                 } else {
-                    Text("\(Image(systemName: "arrow.counterclockwise")) \(reset)")
+                    look.shaded(Text("\(Image(systemName: "arrow.counterclockwise")) \(reset)"))
                 }
             }
-            .font(.system(size: 10).monospacedDigit())
+            .font(.system(size: look.typeSize(10)).monospacedDigit())
             .foregroundStyle(.secondary)
-            .frame(width: 70, alignment: .trailing)
+            .frame(width: look.typeSize(70), alignment: .trailing)
         }
     }
 }
 
 struct Bar: View {
+    @Environment(\.petAppearance) private var look
+
     let fraction: Double
     let color: Color
 
@@ -1214,48 +1346,52 @@ struct Bar: View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
                 Capsule().fill(Color.white.opacity(0.12))
-                Capsule().fill(color).frame(width: max(3, geo.size.width * min(1, max(0, fraction))))
+                Capsule().fill(color).frame(width: max(look.length(3), geo.size.width * min(1, max(0, fraction))))
             }
         }
-        .frame(height: 5)
+        .frame(height: look.length(5))
     }
 }
 
 /// 세션 목록 — 한 줄에 「상태 표시 · 도구 점 · 이름 · 상태 글자」
 struct SessionSection: View {
+    @Environment(\.petAppearance) private var look
+
     let sessions: [AgentSession]
     let now: Date
     static let maxRows = 8
 
     var body: some View {
         let count = { (state: SessionState) in sessions.filter { $0.state == state }.count }
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 6) {
-                Image(systemName: "list.bullet").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary).frame(width: 7)
-                Text(T("세션")).font(.system(size: 12, weight: .semibold))
-                Spacer(minLength: 4)
-                Text(T("진행 {0} · 답 {1} · 확인 {2}", count(.working), count(.answered), count(.waiting)))
-                    .font(.system(size: 10).monospacedDigit()).foregroundStyle(.tertiary)
+        VStack(alignment: .leading, spacing: look.length(5)) {
+            HStack(spacing: look.length(6)) {
+                Image(systemName: "list.bullet").font(.system(size: look.length(10), weight: .semibold)).foregroundStyle(.secondary).frame(width: look.length(7))
+                look.shaded(Text(T("세션"))).font(.system(size: look.typeSize(12), weight: .semibold))
+                Spacer(minLength: look.length(4))
+                look.shaded(Text(T("진행 {0} · 답 {1} · 확인 {2}", count(.working), count(.answered), count(.waiting))))
+                    .font(.system(size: look.typeSize(10)).monospacedDigit()).foregroundStyle(.tertiary)
             }
             if sessions.isEmpty {
-                Text(T("켜져 있는 세션이 없습니다")).font(.system(size: 11)).foregroundStyle(.secondary)
+                look.shaded(Text(T("켜져 있는 세션이 없습니다"))).font(.system(size: look.typeSize(11))).foregroundStyle(.secondary)
             }
             ForEach(sessions.prefix(Self.maxRows)) { SessionRow(session: $0, now: now) }
             if sessions.count > Self.maxRows {
-                Text(T("외 {0}개", sessions.count - Self.maxRows)).font(.system(size: 10)).foregroundStyle(.tertiary).padding(.leading, 30)
+                look.shaded(Text(T("외 {0}개", sessions.count - Self.maxRows))).font(.system(size: look.typeSize(10))).foregroundStyle(.tertiary).padding(.leading, look.length(30))
             }
         }
     }
 }
 
 struct SessionRow: View {
+    @Environment(\.petAppearance) private var look
+
     let session: AgentSession
     let now: Date
 
     var body: some View {
         let style = Self.style(session.state)
         let dim = session.state == .stopped || session.state == .unknown
-        HStack(spacing: 6) {
+        HStack(spacing: look.length(6)) {
             Group {
                 if session.state == .working {
                     SpinningSymbol(name: style.icon, color: .systemBlue)
@@ -1263,13 +1399,13 @@ struct SessionRow: View {
                     Image(systemName: style.icon)
                 }
             }
-            .font(.system(size: 11, weight: .semibold)).foregroundStyle(style.tint).frame(width: 13)
-            Circle().fill(session.tool == .claude ? claudeTint : codexTint).frame(width: 5, height: 5)
-            Text(session.name).font(.system(size: 11)).lineLimit(1).truncationMode(.middle)
+            .font(.system(size: look.length(11), weight: .semibold)).foregroundStyle(style.tint).frame(width: look.length(13))
+            Circle().fill(session.tool == .claude ? claudeTint : codexTint).frame(width: look.length(5), height: look.length(5))
+            look.shaded(Text(session.name)).font(.system(size: look.typeSize(11))).lineLimit(1).truncationMode(.middle)
                 .foregroundStyle(dim ? Color.secondary : Color.primary)
-            Spacer(minLength: 6)
-            Text(sessionStatusText(session, now: now))
-                .font(.system(size: 10, weight: dim ? .regular : .medium).monospacedDigit())
+            Spacer(minLength: look.length(6))
+            look.shaded(Text(sessionStatusText(session, now: now)))
+                .font(.system(size: look.typeSize(10), weight: dim ? .regular : .medium).monospacedDigit())
                 .foregroundStyle(dim ? Color.secondary : style.tint)
                 .fixedSize()
         }
@@ -1292,6 +1428,8 @@ var renderingStill = false
 /// 진행 중 표시 — 2초에 한 바퀴 돈다. 회전은 Core Animation 에 맡겨 화면 합성기가 돌리므로 앱 CPU 를 거의 안 쓴다
 /// (SwiftUI 애니메이션·기호 효과는 앱이 매 프레임 다시 그려 3~5% 를 썼다). 「동작 줄이기」를 켜 두면 멈춰 있다.
 struct SpinningSymbol: View {
+    @Environment(\.petAppearance) private var look
+
     let name: String
     let color: NSColor
 
@@ -1299,7 +1437,7 @@ struct SpinningSymbol: View {
         if renderingStill || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
             Image(systemName: name)
         } else {
-            SpinningLayer(name: name, color: color).frame(width: 13, height: 13)
+            SpinningLayer(name: name, color: color, pointSize: look.length(11)).frame(width: look.length(13), height: look.length(13))
         }
     }
 }
@@ -1307,22 +1445,32 @@ struct SpinningSymbol: View {
 struct SpinningLayer: NSViewRepresentable {
     let name: String
     let color: NSColor
-    func makeNSView(context: Context) -> SpinnerView { SpinnerView(name: name, color: color) }
-    func updateNSView(_ view: SpinnerView, context: Context) {}
+    let pointSize: CGFloat
+    func makeNSView(context: Context) -> SpinnerView { SpinnerView(frame: .zero) }
+    func updateNSView(_ view: SpinnerView, context: Context) {
+        view.configure(name: name, color: color, pointSize: pointSize)
+    }
 }
 
 final class SpinnerView: NSView {
     private let symbol = CALayer()
-    private let image: NSImage?
+    private var image: NSImage?
+    private var pointSize: CGFloat = 0
 
-    init(name: String, color: NSColor) {
-        let config = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
-            .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
-        image = NSImage(systemSymbolName: name, accessibilityDescription: T("진행 중"))?.withSymbolConfiguration(config)
-        super.init(frame: NSRect(x: 0, y: 0, width: 13, height: 13))
+    override init(frame: NSRect) {
+        super.init(frame: frame)
         wantsLayer = true
         symbol.contentsGravity = .center
         layer?.addSublayer(symbol)
+    }
+
+    func configure(name: String, color: NSColor, pointSize: CGFloat) {
+        guard self.pointSize != pointSize else { return }
+        self.pointSize = pointSize
+        let config = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .semibold)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
+        image = NSImage(systemSymbolName: name, accessibilityDescription: T("진행 중"))?.withSymbolConfiguration(config)
+        symbol.contents = image?.layerContents(forContentsScale: symbol.contentsScale)
     }
 
     required init?(coder: NSCoder) { nil }
@@ -1357,17 +1505,34 @@ final class SpinnerView: NSView {
 
 /// 글자 위를 눌러도 창이 끌리도록 클릭은 모두 이 뷰가 받는다
 final class ContainerView: NSVisualEffectView {
-    var onDoubleClick: (() -> Void)?
-    var onRightClick: ((NSEvent) -> Void)?
+    let input = PanelInput()
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         bounds.contains(convert(point, from: superview)) ? self : nil
     }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseDown(with event: NSEvent) {
+    override func mouseDown(with event: NSEvent) { input.mouseDown(event, in: window) }
+    override func rightMouseDown(with event: NSEvent) { input.onRightClick?(event) }
+}
+
+final class TranslucentRoot: NSView {
+    let input = PanelInput()
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        bounds.contains(convert(point, from: superview)) ? self : nil
+    }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) { input.mouseDown(event, in: window) }
+    override func rightMouseDown(with event: NSEvent) { input.onRightClick?(event) }
+}
+
+final class PanelInput {
+    var onDoubleClick: (() -> Void)?
+    var onRightClick: ((NSEvent) -> Void)?
+
+    func mouseDown(_ event: NSEvent, in window: NSWindow?) {
         if event.clickCount == 2 { onDoubleClick?() } else { window?.performDrag(with: event) }
     }
-    override func rightMouseDown(with event: NSEvent) { onRightClick?(event) }
 }
 
 func roundedMask(radius: CGFloat) -> NSImage {
@@ -1382,7 +1547,136 @@ func roundedMask(radius: CGFloat) -> NSImage {
     return image
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, UNUserNotificationCenterDelegate {
+    private lazy var history = UsageHistory()
+    private lazy var alerts = LimitAlerts()
+    private let trends = TrendModel()
+    private var trendWindow: NSWindow?
+    private var scanned = SourceScan()
+    private var readOnlyRows: [UsageEvent] = []
+    private var scanning = false
+    private var activeUser: UsageAccount?
+    private var permission: Bool?
+    private var requestedPermission = false
+    private var sending = false
+    private var enabled: Bool { UserDefaults.standard.object(forKey: "limitAlerts") as? Bool ?? true }
+    private var liveRows: [UsageEvent] { UsageEvent.liveRows(claude: model.claude, codex: codex) }
+    private var trendOpen: Bool { trendWindow?.isVisible == true || trendWindow?.isMiniaturized == true }
+
+    @objc private func openTrend() {
+        if trendWindow == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 630, height: 490),
+                             styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            w.minSize = NSSize(width: 560, height: 470)
+            w.appearance = NSAppearance(named: .darkAqua)
+            w.isReleasedWhenClosed = false
+            w.contentView = NSHostingView(rootView: TrendScreen(data: trends, model: model))
+            w.center()
+            trendWindow = w
+        }
+        if !trendOpen { trends.month = false }
+        trendWindow?.title = T("사용 추이")
+        trendWindow?.deminiaturize(nil); trendWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        syncUsage()
+        scanHistory()
+    }
+
+    private func scanHistory() {
+        guard !scanning else { return }
+        scanning = true
+        let n = millis(Date()), user = UsageAccount(now: n), previous = scanned
+        DispatchQueue.global(qos: .utility).async {
+            var scanner = previous
+            let rows = scanner.read(user, now: n)
+            let updated = scanner
+            DispatchQueue.main.async {
+                self.scanning = false
+                let current = millis(Date())
+                let live = UsageAccount(now: current)
+                guard live == user else {
+                    if self.trendOpen {
+                        self.showResults(live, now: current)
+                        if live.since != current { self.scanHistory() }
+                    }
+                    return
+                }
+                if historyWriter && self.history.merge(rows, now: current) { self.scanned = updated }
+                if !historyWriter { self.readOnlyRows = rows }
+                self.showResults(user, now: current)
+            }
+        }
+    }
+    private func showResults(_ user: UsageAccount, now: Int64) {
+        trends.now = now
+        trends.results = TrendResult.calculate(history.visibleRows + readOnlyRows, user: user, now: now)
+        trendWindow?.title = T("사용 추이")
+    }
+    private func syncUsage() {
+        let n = millis(Date()), user = UsageAccount(now: n)
+        let changed = activeUser != user
+        activeUser = user
+        if historyWriter {
+            if !enabled { alerts.cancel() }
+            else {
+                if !model.showClaude { alerts.cancel("claude") }
+                if !model.showCodex { alerts.cancel("codex") }
+            }
+            history.recordLive(liveRows, user: user, now: n)
+        }
+        if trendOpen {
+            showResults(user, now: n)
+            if changed { scanHistory() }
+        }
+        sendNextAlert()
+    }
+
+    private func sendNextAlert() {
+        guard historyWriter, !sending, enabled, Bundle.main.bundleURL.pathExtension == "app",
+              !(Bundle.main.bundleIdentifier ?? "").isEmpty else { return }
+        let n = millis(Date()), keys = UsageAccount(now: n).keys.filter { $0.key == "claude" ? model.showClaude : model.showCodex }
+        guard let c = alerts.next(liveRows, keys: keys, now: n, skipped: permission == false) else { return }
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        if permission == nil {
+            guard !requestedPermission else { return }
+            requestedPermission = true
+            sending = true
+            center.requestAuthorization(options: [.alert, .sound]) { granted, error in
+                DispatchQueue.main.async {
+                    self.sending = false
+                    guard error == nil else { return }
+                    self.permission = granted
+                    self.sendNextAlert()
+                }
+            }
+            return
+        }
+        let previous = alerts.state
+        guard alerts.save(c.state) else { return }
+        if permission == false { sendNextAlert(); return }
+        let content = UNMutableNotificationContent()
+        content.title = c.notice.title; content.body = c.notice.body ?? ""; content.sound = .default
+        sending = true
+        center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) { error in
+            DispatchQueue.main.async {
+                self.sending = false
+                if error != nil {
+                    if self.alerts.state == c.state { _ = self.alerts.save(previous) }
+                } else { self.sendNextAlert() }
+            }
+        }
+    }
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .list, .sound])
+    }
+    @objc private func toggleAlerts() {
+        UserDefaults.standard.set(!enabled, forKey: "limitAlerts")
+        if !enabled && historyWriter { alerts.cancel() }
+        sendNextAlert()
+    }
+
     private let model = UsageModel()
     private let claude = ClaudeReader()
     private let codex = CodexReader()
@@ -1391,9 +1685,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var panel: NSPanel!
     /// 사람이 둔 창의 왼쪽 아래 모서리. 창 높이가 바뀌어도 이 자리를 지키고 위로 늘거나 준다.
     private var anchor = NSPoint.zero
+    private var applyingFrame = false
     private var appliedOrigin: NSPoint?
     private var anchorFromOldTop = false  // 예전 판이 기억한 위 모서리로 처음 띄웠으면, 값이 다 찬 높이로 한 번 다시 잰다
     private var container: ContainerView!
+    private let translucentRoot = TranslucentRoot()
+    private let background = NSView()
     private var hosting: NSHostingView<PetView>!
     private var updating = false
 
@@ -1424,17 +1721,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         container.material = .hudWindow
         container.blendingMode = .behindWindow
         container.state = .active
-        container.maskImage = roundedMask(radius: 14)
-        container.onDoubleClick = { [weak self] in self?.refreshAll() }
-        container.onRightClick = { [weak self] event in self?.showMenu(event) }
-        hosting.frame = container.bounds
+        for input in [container.input, translucentRoot.input] {
+            input.onDoubleClick = { [weak self] in self?.refreshAll() }
+            input.onRightClick = { [weak self] event in self?.showMenu(event) }
+        }
+        background.wantsLayer = true
+        background.autoresizingMask = [.width, .height]
+        translucentRoot.addSubview(background)
         hosting.autoresizingMask = [.width, .height]
-        container.addSubview(hosting)
 
         // Codex 펫처럼: 다른 창 위, 모든 데스크톱·전체 화면 앱 위에 뜨고, 눌러도 지금 쓰는 앱의 초점을 뺏지 않는다
         panel = NSPanel(contentRect: NSRect(origin: .zero, size: size),
                         styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        panel.contentView = container
+        applyAppearance()
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
@@ -1448,11 +1747,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         panel.orderFrontRegardless()
     }
 
+    private func applyAppearance() {
+        let look = model.appearance
+        let root: NSView = look.background == 0 ? container : translucentRoot
+        if panel.contentView !== root || hosting.superview !== root {
+            hosting.removeFromSuperview()
+            panel.contentView = root
+            hosting.frame = root.bounds
+            root.addSubview(hosting)
+        }
+        if look.background == 0 {
+            container.maskImage = roundedMask(radius: look.length(14))
+        } else {
+            background.frame = root.bounds
+            background.layer?.cornerRadius = look.length(14)
+            background.layer?.backgroundColor = NSColor(srgbRed: 0.12, green: 0.12, blue: 0.13, alpha: look.opacity).cgColor
+        }
+        if ProcessInfo.processInfo.environment["AIUSAGE_DEBUG_VIEWS"] == "1" {
+            func dumpView(_ view: NSView, _ indent: String) {
+                fputs("\(indent)\(type(of: view))\n", stderr)
+                for child in view.subviews { dumpView(child, indent + "  ") }
+            }
+            dumpView(root, "")
+        }
+    }
+
     @objc private func refreshLocal() {
         model.now = Date()
         model.claude = claude.read(now: model.now)
-        let codexSwitched = codex.readLog()
+        let codexSwitched = codex.readLog(now: model.now)
         model.codex = codex.current
+        syncUsage()
         refreshSessions()
         afterUpdate()
         if codexSwitched { refreshServer() }  // ChatGPT 계정이 바뀌었다: 5분 기다리지 않고 새 계정 값을 묻는다
@@ -1477,6 +1802,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         codex.refreshServer { [weak self] in
             guard let self else { return }
             self.model.codex = self.codex.current
+            self.syncUsage()
             self.afterUpdate()
         }
     }
@@ -1487,7 +1813,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     private func afterUpdate() {
-        container.toolTip = detailLines().joined(separator: "\n")
+        panel.contentView?.toolTip = detailLines().joined(separator: "\n")
         DispatchQueue.main.async { self.fitPanel() }  // SwiftUI 가 새 값으로 다시 그린 뒤 크기를 맞춘다
     }
 
@@ -1497,7 +1823,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         guard size.width > 0, size.height > 0 else { return }
         if anchorFromOldTop {
             anchorFromOldTop = false
-            anchor = NSPoint(x: panel.frame.minX, y: panel.frame.maxY - size.height)
+            anchor.y = panel.frame.maxY - size.height
             saveAnchor()
         }
         guard size != panel.frame.size else { return }
@@ -1508,12 +1834,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private func applyFrame(size: NSSize) {
         var origin = anchor
         let probe = NSPoint(x: anchor.x + 10, y: anchor.y + 10)
-        if let screen = NSScreen.screens.first(where: { $0.frame.contains(probe) }) ?? panel.screen,
-           origin.y + size.height > screen.visibleFrame.maxY {
-            origin.y = screen.visibleFrame.maxY - size.height
+        if let screen = NSScreen.screens.first(where: { $0.frame.contains(probe) }) ?? panel.screen {
+            let visible = screen.visibleFrame
+            origin.x = max(visible.minX, min(anchor.x, visible.maxX - size.width))
+            origin.y = min(anchor.y, visible.maxY - size.height)
         }
+        applyingFrame = true
         appliedOrigin = origin
         panel.setFrame(NSRect(origin: origin, size: size), display: true)
+        appliedOrigin = panel.frame.origin // AppKit may round fractional scaled coordinates.
+        applyingFrame = false
         panel.invalidateShadow()
     }
 
@@ -1546,7 +1876,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     /// 창을 끌어 옮겼을 때만 새 자리로 기억한다(높이 맞추기·화면 위 끝에 밀린 이동은 빼고)
     @objc private func savePosition() {
-        guard panel.frame.origin != appliedOrigin else { return }
+        guard !applyingFrame, panel.frame.origin != appliedOrigin else { return }
         anchor = panel.frame.origin
         appliedOrigin = anchor
         saveAnchor()
@@ -1595,6 +1925,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
         menu.addItem(.separator())
         menu.addItem(menuItem(T("지금 새로고침"), #selector(refreshAll)))
+        menu.addItem(menuItem(T("사용 추이…"), #selector(openTrend)))
         menu.addItem(menuItem(T("위치 초기화"), #selector(resetPosition)))
         addShownItems(to: menu)
         menu.addItem(menuItem(T("로그인할 때 자동으로 열기"), #selector(toggleLoginItem)))
@@ -1602,7 +1933,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         menu.addItem(updateMenuItem())
         menu.addItem(.separator())
         menu.addItem(menuItem(T("종료"), #selector(quit)))
-        NSMenu.popUpContextMenu(menu, with: event, for: container)
+        NSMenu.popUpContextMenu(menu, with: event, for: panel.contentView!)
     }
 
     // MARK: 자동 업데이트
@@ -1684,8 +2015,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         menu.addItem(menuItem(T("ChatGPT 보이기"), #selector(toggleCodex)))
         menu.addItem(menuItem(T("세션 보이기"), #selector(toggleSessions)))
         menu.addItem(orderMenuItem())
+        menu.addItem(appearanceMenuItem())
         menu.addItem(languageMenuItem())
         menu.addItem(.separator())
+        menu.addItem(menuItem(T("한도 알림"), #selector(toggleAlerts)))
     }
 
     /// 「칸 순서」 — 고를 수 있는 순서를 다 늘어놓고 지금 것에 체크(체크는 validateMenuItem 이 붙인다)
@@ -1699,6 +2032,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let item = NSMenuItem(title: T("칸 순서"), action: nil, keyEquivalent: "")
         item.submenu = submenu
         return item
+    }
+
+    private func appearanceMenuItem() -> NSMenuItem {
+        let submenu = NSMenu()
+        for setting in PetSetting.allCases {
+            if !submenu.items.isEmpty { submenu.addItem(.separator()) }
+            let header = NSMenuItem(title: setting.title, action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            submenu.addItem(header)
+            for (label, value) in zip(setting.labels, setting.values) {
+                let item = menuItem(label, #selector(chooseAppearance(_:)))
+                item.representedObject = setting.rawValue
+                item.tag = value
+                submenu.addItem(item)
+            }
+        }
+        let item = NSMenuItem(title: T("모양"), action: nil, keyEquivalent: "")
+        item.submenu = submenu
+        return item
+    }
+
+    @objc private func chooseAppearance(_ item: NSMenuItem) {
+        guard let key = item.representedObject as? String, let setting = PetSetting(rawValue: key),
+              setting.values.contains(item.tag), model.appearance[setting] != item.tag else { return }
+        model.appearance[setting] = item.tag
+        UserDefaults.standard.set(item.tag, forKey: key)
+        applyAppearance()
+        afterUpdate()
     }
 
     /// 「언어」 — 자동(시스템 언어)과 언어 이름(각 언어로 적은 이름). 체크는 validateMenuItem 이 붙인다.
@@ -1753,6 +2114,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         model.showCodex = codex
         UserDefaults.standard.set(claude, forKey: Shown.claudeKey)
         UserDefaults.standard.set(codex, forKey: Shown.codexKey)
+        if historyWriter && !claude { alerts.cancel("claude") }
+        if historyWriter && !codex { alerts.cancel("codex") }
+        syncUsage()
         if codexTurnedOn { refreshServer() }
         afterUpdate()
     }
@@ -1763,6 +2127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private func buildMainMenu() {
         let appMenu = NSMenu()
         appMenu.addItem(menuItem(T("지금 새로고침"), #selector(refreshAll), key: "r"))
+        appMenu.addItem(menuItem(T("사용 추이…"), #selector(openTrend)))
         appMenu.addItem(menuItem(T("위치 초기화"), #selector(resetPosition)))
         addShownItems(to: appMenu)
         appMenu.addItem(menuItem(T("로그인할 때 자동으로 열기"), #selector(toggleLoginItem)))
@@ -1786,6 +2151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
         let menu = NSMenu()
         menu.addItem(menuItem(T("지금 새로고침"), #selector(refreshAll)))
+        menu.addItem(menuItem(T("사용 추이…"), #selector(openTrend)))
         menu.addItem(menuItem(T("위치 초기화"), #selector(resetPosition)))
         addShownItems(to: menu)
         menu.addItem(menuItem(T("로그인할 때 자동으로 열기"), #selector(toggleLoginItem)))
@@ -1818,6 +2184,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
+        case #selector(toggleAlerts):
+            menuItem.state = enabled ? .on : .off
         case #selector(toggleLoginItem):
             menuItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
         case #selector(toggleClaude):
@@ -1828,6 +2196,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return model.showClaude
         case #selector(toggleSessions):
             menuItem.state = model.showSessions ? .on : .off
+        case #selector(chooseAppearance(_:)):
+            guard let key = menuItem.representedObject as? String, let setting = PetSetting(rawValue: key) else { return false }
+            menuItem.state = model.appearance[setting] == menuItem.tag ? .on : .off
         case #selector(chooseOrder(_:)):
             menuItem.state = (menuItem.representedObject as? [String]) == model.order.map(\.rawValue) ? .on : .off
         case #selector(chooseLanguage(_:)):
@@ -2236,6 +2607,7 @@ enum Updater {
 
 /// 이미 떠 있으면 false (로그인 자동 실행과 직접 실행이 겹쳐도 하나만 뜨게).
 /// 다시 띄울 때는 앞의 것이 꺼지는 중일 수 있어 3초까지 기다린다.
+private var historyWriter = false
 func takeSingleInstanceLock() -> Bool {
     let dir = homeDir + "/.cache/ai-usage"
     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -2243,7 +2615,7 @@ func takeSingleInstanceLock() -> Bool {
     let fd = open(dir + "/pet.lock", O_CREAT | O_RDWR | O_CLOEXEC, 0o644)
     if fd < 0 { return true }
     for _ in 0..<30 {
-        if flock(fd, LOCK_EX | LOCK_NB) == 0 { return true }  // fd 는 닫지 않는다(프로세스가 끝나면 풀린다)
+        if flock(fd, LOCK_EX | LOCK_NB) == 0 { historyWriter = true; return true }  // fd 는 닫지 않는다(프로세스가 끝나면 풀린다)
         usleep(100_000)
     }
     close(fd)
@@ -2254,8 +2626,8 @@ func takeSingleInstanceLock() -> Bool {
     let now = Date()
     let codex = CodexReader()
     codex.readLog()
+    codex.readServerSync()
     let fromLog = codex.fromLog
-    codex.applyServer(CodexReader.fetchServerSync())
     let claude = ClaudeReader().read(now: now)
     print(describe("Claude", claude, now: now))
     let link: String
@@ -2320,32 +2692,56 @@ func updateOnce() {
     }
 }
 
-@MainActor func saveSnapshot(to path: String) {
+private func fillSnapshotSample(_ model: UsageModel) {
+    let now = Date(timeIntervalSince1970: 1_793_920_000)
+    model.now = now
+    model.order = Pane.standard
+    model.showClaude = true
+    model.showCodex = true
+    model.showSessions = true
+    let weekly = LimitWindow(id: "weekly", minutes: 10_080, usedPercent: 0, resetsAt: now.addingTimeInterval(3 * 86_400))
+    model.claude = ProviderSnapshot(windows: [
+        LimitWindow(id: "5h", minutes: 300, usedPercent: 18, resetsAt: now.addingTimeInterval(3600)), weekly
+    ], observedAt: now)
+    model.codex = ProviderSnapshot(windows: [weekly], observedAt: now, plan: "Pro Lite")
+    model.sessions = [
+        AgentSession(id: "working", tool: .codex, name: "ai-usage-pet-v17", cwd: "", state: .working, since: now.addingTimeInterval(-720)),
+        AgentSession(id: "answered", tool: .claude, name: "Local LLM", cwd: "", state: .answered, since: now.addingTimeInterval(-60))
+    ]
+}
+
+@MainActor func saveSnapshot(to path: String, sample: Bool, appearance: PetAppearance?) {
     _ = NSApplication.shared
     renderingStill = true
     let model = UsageModel()
-    model.claude = ClaudeReader().read(now: model.now)
-    let codex = CodexReader()
-    codex.readLog()
-    codex.applyServer(CodexReader.fetchServerSync())
-    model.codex = codex.current
-    model.sessions = sortSessions(ClaudeSessionReader().read(now: model.now) + CodexSessionReader().read(now: model.now))
+    if let appearance { model.appearance = appearance }
+    if sample {
+        fillSnapshotSample(model)
+    } else {
+        model.claude = ClaudeReader().read(now: model.now)
+        let codex = CodexReader()
+        codex.readLog()
+        codex.readServerSync()
+        model.codex = codex.current
+        model.sessions = sortSessions(ClaudeSessionReader().read(now: model.now) + CodexSessionReader().read(now: model.now))
+    }
     let view = PetView(model: model)
-        .background(Color(red: 0.12, green: 0.12, blue: 0.13))
-        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .background(Color(red: 0.12, green: 0.12, blue: 0.13, opacity: model.appearance.opacity))
+        .clipShape(RoundedRectangle(cornerRadius: model.appearance.length(14)))
         .environment(\.colorScheme, .dark)
     let renderer = ImageRenderer(content: view)
     renderer.scale = 2
     guard let image = renderer.nsImage, let tiff = image.tiffRepresentation,
           let rep = NSBitmapImageRep(data: tiff), let png = rep.representation(using: .png, properties: [:]) else {
-        print("그림을 만들지 못했습니다")
-        return
+        fputs("그림을 만들지 못했습니다\n", stderr)
+        exit(1)
     }
     do {
         try png.write(to: URL(fileURLWithPath: path))
         print(path)
     } catch {
-        print("저장 실패: \(error)")
+        fputs("저장 실패: \(error)\n", stderr)
+        exit(1)
     }
 }
 
@@ -2354,6 +2750,31 @@ enum Main {
     @MainActor static func main() {
         signal(SIGPIPE, SIG_IGN)
         let args = CommandLine.arguments
+        if args.contains("--trend-json") || args.contains("--test-alerts") || args.contains("--trend-snapshot") || args.contains("--record-once") {
+            do {
+                if let i = args.firstIndex(of: "--test-alerts") {
+                    guard args.indices.contains(i+1) else { throw CocoaError(.coderInvalidValue) }
+                    try testAlerts(args[i+1]); return
+                }
+                var now = millis(Date())
+                if let i = args.firstIndex(of: "--now") {
+                    guard args.indices.contains(i+1), let d = parseDate(args[i+1]) else { throw CocoaError(.coderInvalidValue) }
+                    now = millis(d)
+                }
+                if args.contains("--record-once") { print(try recordOnce(now: now)); return }
+                let user = UsageAccount(now: now)
+                var scan = SourceScan()
+                let result = TrendResult.calculate(UsageHistory().rows + scan.read(user, now: now), user: user, now: now)
+                if let i = args.firstIndex(of: "--trend-snapshot") {
+                    guard args.indices.contains(i+2), ["week","four-weeks"].contains(args[i+1]) else { throw CocoaError(.coderInvalidValue) }
+                    try trendPNG(result, now: now, month: args[i+1] == "four-weeks", path: args[i+2])
+                } else {
+                    let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+                    print(String(decoding: try encoder.encode(result), as: UTF8.self))
+                }
+            } catch { fputs("\(error)\n", stderr); exit(2) }
+            return
+        }
         if args.contains("--version") {  // 자동 업데이트가 받은 새 판이 이 맥에서 도는지 볼 때도 쓴다
             print(Updater.current)
             return
@@ -2372,8 +2793,24 @@ enum Main {
             print(ClaudeCodeLink.connect())
             return
         }
-        if let i = args.firstIndex(of: "--snapshot"), args.indices.contains(i + 1) {
-            saveSnapshot(to: args[i + 1])
+        if let i = args.firstIndex(of: "--snapshot") {
+            guard args.indices.contains(i + 1), !args[i + 1].hasPrefix("--") else {
+                fputs("--snapshot <png> [--sample] [--appearance 0,100,100]\n", stderr)
+                exit(2)
+            }
+            var appearance: PetAppearance?
+            if let j = args.firstIndex(of: "--appearance") {
+                let parts = args.dropFirst(j + 1).first?.components(separatedBy: ",") ?? []
+                let settings = PetSetting.allCases
+                var look = PetAppearance()
+                guard parts.count == settings.count else { fputs("Invalid --appearance\n", stderr); exit(2) }
+                for (part, setting) in zip(parts, settings) {
+                    guard let n = Int(part), setting.values.contains(n) else { fputs("Invalid --appearance\n", stderr); exit(2) }
+                    look[setting] = n
+                }
+                appearance = look
+            }
+            saveSnapshot(to: args[i + 1], sample: args.contains("--sample"), appearance: appearance)
             return
         }
         if args.contains("--check-update") {
@@ -2391,4 +2828,799 @@ enum Main {
         app.setActivationPolicy(.regular)  // Dock 에 아이콘이 나오고, Dock 에서 열고 끈다
         withExtendedLifetime(delegate) { app.run() }
     }
+}
+
+// MARK: - Source observations and weekly history
+
+private let dayMs: Int64 = 86_400_000
+private let weekMs = 7 * dayMs
+private let resetTolerance: Int64 = 600_000
+private let usageDirectory = URL(fileURLWithPath: homeDir).appendingPathComponent(".cache/ai-usage")
+private func millis(_ date: Date) -> Int64 { Int64((date.timeIntervalSince1970 * 1000).rounded(.down)) }
+private let lastTimestamp: Int64 = 253_402_300_799_999  // Last millisecond representable by both platforms.
+private func validMillis(_ value: Double?) -> Int64? {
+    guard let value, value >= 1, value <= Double(lastTimestamp) else { return nil }
+    return Int64(value)
+}
+private func instant(_ ms: Int64) -> Date { Date(timeIntervalSince1970: Double(ms) / 1000) }
+
+private struct UsageAccount: Equatable {
+    let claude: String?
+    let org: String?
+    let codex: String?
+    let since: Int64
+    init(now: Int64) {
+        claude = ClaudeCodeAccount.identity()
+        org = ClaudeCodeAccount.organization()
+        codex = CodexReader.currentAccount()
+        let saved = readJSONObject(AccountSwitch.path)?["claude"] as? [String: Any]
+        since = saved == nil ? 0 : saved?["id"] as? String == claude
+            ? (validMillis(number(saved?["since"]).map { $0 * 1000 }) ?? 0) : now
+    }
+    static func hash(_ provider: String, _ id: String?) -> String? {
+        guard let id, !id.isEmpty else { return nil }
+        return SHA256.hash(data: Data((provider + "\0" + id).utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+    var keys: [String: String] {
+        ["claude": Self.hash("claude", claude), "codex": Self.hash("codex", codex)].compactMapValues { $0 }
+    }
+}
+
+private struct UsageEvent: Codable, Hashable {
+    var v = 1
+    let provider: String
+    let account: String
+    let minutes: Int
+    let atMs: Int64
+    let resetMs: Int64?
+    let used: Double
+    let source: String
+    var quality: String
+    var slot: String?
+    var valid: Bool {
+        v == 1 && ["claude", "codex"].contains(provider) && account.utf8.count == 64 &&
+        (0...Int(Int32.max)).contains(minutes) && (minutes > 0 || resetMs != nil) && (0...100).contains(used) &&
+        (1...lastTimestamp).contains(atMs) && (1...lastTimestamp).contains(resetMs ?? 1) &&
+        ["observed","rough"].contains(quality)
+    }
+    enum CodingKeys: CodingKey { case v, provider, account, minutes, atMs, resetMs, used, source, quality, slot }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(v, forKey: .v)
+        try c.encode(provider, forKey: .provider); try c.encode(account, forKey: .account)
+        try c.encode(minutes, forKey: .minutes); try c.encode(atMs, forKey: .atMs)
+        try c.encode(resetMs, forKey: .resetMs); try c.encode(used, forKey: .used)
+        try c.encode(source, forKey: .source); try c.encode(quality, forKey: .quality)
+        try c.encodeIfPresent(slot, forKey: .slot)
+    }
+    static func liveRows(claude: ProviderSnapshot, codex: CodexReader) -> [UsageEvent] {
+        claude.observations + (codex.fromLog?.observations ?? []) + (codex.fromServer?.observations ?? [])
+    }
+    var eventKey: UsageEvent { var copy = self; copy.slot = nil; copy.quality = ""; return copy }
+    static func ordered(_ a: Self, _ b: Self) -> Bool {
+        if a.atMs != b.atMs { return a.atMs < b.atMs }
+        if a.used != b.used { return a.used < b.used }
+        if a.resetMs != b.resetMs { return (a.resetMs ?? .max) < (b.resetMs ?? .max) }
+        if a.quality != b.quality { return a.quality == "observed" }
+        return a.source < b.source
+    }
+
+    static func windows(_ windows: [LimitWindow], at: Date, provider: String, id: String?, source: String) -> [Self] {
+        guard let key = UsageAccount.hash(provider, id) else { return [] }
+        return windows.compactMap { w in
+            let reset = validMillis(w.resetsAt.map { $0.timeIntervalSince1970 * 1000 })
+            let event = Self(provider: provider, account: key, minutes: w.minutes, atMs: millis(at),
+                             resetMs: reset, used: w.usedPercent, source: source,
+                             quality: provider == "claude" && reset == nil ? "rough" : "observed", slot: w.id)
+            return event.valid ? event : nil
+        }
+    }
+}
+
+private struct SourceScan {
+    struct Stamp: Equatable { let size: Int; let modified: Date }
+    var stamps: [String: Stamp] = [:]
+    var account: UsageAccount?
+    mutating func read(_ user: UsageAccount, now: Int64) -> [UsageEvent] {
+        if account != user { stamps.removeAll(); account = user }
+        let fm = FileManager.default
+        var rows: [UsageEvent] = []
+        func stamp(_ path: String) -> Stamp? {
+            guard let attrs = try? fm.attributesOfItem(atPath: path), let date = attrs[.modificationDate] as? Date,
+                  let size = attrs[.size] as? NSNumber else { return nil }
+            return Stamp(size: size.intValue, modified: date)
+        }
+        func scan(_ path: String, _ body: (Stamp) -> Bool) {
+            guard let before = stamp(path), before != stamps[path] else { return }
+            let start = rows.count
+            let complete = body(before)
+            if before != stamp(path) { rows.removeSubrange(start...) }
+            else if complete { stamps[path] = before }
+        }
+        if let key = user.keys["claude"] {
+            let dir = usageDirectory.appendingPathComponent("claude").path
+            for name in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] where name.hasSuffix(".json") && !name.hasPrefix(".") {
+                let path = dir + "/" + name
+                scan(path) { file in
+                    let at = millis(file.modified)
+                    guard at >= now - 8 * dayMs else { return true }
+                    guard at <= now, let obj = readJSONObject(path) else { return false }
+                    if let owner = obj["account"] as? String { guard owner == user.claude else { return true } }
+                    else if at < user.since { return true }
+                    if let w = obj["seven_day"] as? [String: Any], let used = number(w["used_percentage"]) {
+                        let reset = validMillis(number(w["resets_at"]).map { $0 * 1000 })
+                        rows.append(UsageEvent(provider: "claude", account: key, minutes: 10080, atMs: at,
+                                               resetMs: reset, used: used, source: "claude-session",
+                                               quality: reset == nil ? "rough" : "observed", slot: "seven_day"))
+                    }
+                    return true
+                }
+            }
+            scan(ClaudeDesktopUsage.path) { _ in
+                guard let samples = readJSONObject(ClaudeDesktopUsage.path)?["samples"] as? [[String: Any]] else { return false }
+                for s in samples {
+                    guard let org = user.org, s["org"] as? String == org, let t = validMillis(number(s["t"])),
+                          t >= user.since, let used = number((s["u"] as? [String: Any] ?? s)["sd"]) else { continue }
+                    rows.append(UsageEvent(provider: "claude", account: key, minutes: 10080, atMs: t,
+                                           resetMs: nil, used: used, source: "claude-desktop", quality: "rough", slot: "seven_day"))
+                }
+                return true
+            }
+        }
+        let root = homeDir + "/.codex/sessions"
+        if let id = user.codex, !id.isEmpty, let files = fm.enumerator(atPath: root) {
+            for case let name as String in files where name.hasSuffix(".jsonl") && (name as NSString).lastPathComponent.hasPrefix("rollout-") {
+                let path = root + "/" + name
+                scan(path) { _ in
+                    guard let file = fopen(path, "r") else { return false }
+                    var buf: UnsafeMutablePointer<CChar>?
+                    var cap = 0
+                    defer { free(buf); fclose(file) }
+                    let n = getline(&buf, &cap, file)
+                    guard n > 0, let head = buf, head[n-1] == 10,
+                          let meta = (try? JSONSerialization.jsonObject(with: Data(bytes: head, count: n))) as? [String: Any],
+                          meta["type"] as? String == "session_meta" else { return false }
+                    guard (meta["payload"] as? [String: Any])?["creator_account_id"] as? String == id else { return true }
+                    while true {
+                        let length = getline(&buf, &cap, file)
+                        guard length > 0, let line = buf else { return feof(file) != 0 }
+                        guard line[length-1] == 10 else { return false }
+                        guard strstr(line, "\"rate_limits\"") != nil,
+                              let event = (try? JSONSerialization.jsonObject(with: Data(bytes: line, count: length))) as? [String: Any],
+                              let at = (event["timestamp"] as? String).flatMap(parseDate),
+                              millis(at) >= now - 35 * dayMs, millis(at) <= now,
+                              let limits = (event["payload"] as? [String: Any])?["rate_limits"] as? [String: Any],
+                              (limits["limit_id"] as? String ?? "codex") == "codex" else { continue }
+                        rows += UsageEvent.windows(CodexReader.windows(from: limits).filter { $0.minutes == 10080 },
+                                                   at: at, provider: "codex", id: id, source: "codex-rollout")
+                    }
+                }
+            }
+        }
+        return rows.filter { $0.valid && $0.atMs >= now - 35 * dayMs && $0.atMs <= now }
+    }
+}
+
+private func nearest(_ value: Int64, in choices: [Int64]) -> Int64? {
+    choices.min { (abs($0-value), $0) < (abs($1-value), $1) }
+}
+
+// Input is in event order. A correction never moves an established anchor.
+private func resetAnchors(_ events: [UsageEvent], seed: Int64? = nil) -> [Int64: Int64] {
+    var anchors = seed.map { [$0] } ?? []
+    var mapping: [Int64: Int64] = [:]
+    for r in events.compactMap(\.resetMs) where mapping[r] == nil {
+        if let a = nearest(r, in: anchors), abs(a-r) <= resetTolerance { mapping[r] = a }
+        else { mapping[r] = r; anchors.append(r) }
+    }
+    return mapping
+}
+
+// Each positive key is a fixed reset anchor. Unknown generations use non-positive keys.
+private struct Generations {
+    var groups: [Int64: [UsageEvent]] = [:]
+    init(_ input: [UsageEvent]) {
+        let events = input.sorted(by: UsageEvent.ordered)
+        let mapping = resetAnchors(events)
+        let anchors = Set(mapping.values)
+        let resets = Array(mapping.keys)
+        var unknown: Int64 = 0, previousDesktop: Double?
+        for row in events {
+            var key = unknown
+            if let r = row.resetMs { key = mapping[r]! }
+            else if row.provider == "claude", let r = nearest(row.atMs, in: resets) {
+                let end = r + (Int64(floor(Double(row.atMs - r) / Double(weekMs))) + 1) * weekMs
+                if let r = nearest(end, in: resets), abs(r-end) <= resetTolerance { key = mapping[r]! }
+                else { key = end }
+            } else if row.provider == "claude", row.source == "claude-desktop" {
+                if let last = previousDesktop, last - row.used >= 20 { unknown -= 1 }
+                previousDesktop = row.used
+                key = unknown
+            } else if row.provider == "codex" {
+                let possible = anchors.filter { $0-weekMs <= row.atMs && row.atMs < $0 }
+                if possible.count == 1, let only = possible.first { key = only }
+            }
+            groups[key, default: []].append(row)
+        }
+    }
+}
+
+private struct TrendDay: Codable {
+    var date: String
+    var used: Double?
+    var rough = false
+    var reset = false
+    enum CodingKeys: CodingKey { case date, used, rough, reset }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(date, forKey: .date); try c.encode(used, forKey: .used)
+        try c.encode(rough, forKey: .rough); try c.encode(reset, forKey: .reset)
+    }
+}
+private struct TrendPoint: Codable { let atMs: Int64; let used: Double }
+private struct TrendWeek: Codable {
+    let startMs: Int64, resetMs: Int64
+    let used: Double
+    let points: [TrendPoint]
+    let endMs: Int64?
+    let endUsed: Double?
+}
+private struct TrendResult: Encodable {
+    let week: TrendWeek?
+    let days: [TrendDay]
+    let averageDays: Int
+    let average: Double?
+    let best: TrendDay?
+    enum CodingKeys: CodingKey { case week, days, averageDays, average, best }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(week, forKey: .week); try c.encode(days, forKey: .days)
+        try c.encode(averageDays, forKey: .averageDays); try c.encode(average, forKey: .average)
+        try c.encode(best, forKey: .best)
+    }
+    init(_ rows: [UsageEvent], now: Int64) {
+        let calendar = Calendar(identifier: .gregorian)
+        let dateFmt = DateFormatter()
+        dateFmt.locale = Locale(identifier: "en_US_POSIX"); dateFmt.dateFormat = "yyyy-MM-dd"
+        func day(_ ms: Int64) -> String { dateFmt.string(from: instant(ms)) }
+        let groups = Generations(rows).groups
+        let first = rows.map(\.atMs).min().map(day)
+        var days = (0..<28).map { i -> TrendDay in
+            let d = dateFmt.string(from: calendar.date(byAdding: .day, value: i-27, to: instant(now))!)
+            return TrendDay(date: d, used: first.map { d >= $0 } == true ? 0 : nil)
+        }
+        let indices = Dictionary(uniqueKeysWithValues: days.indices.map { (days[$0].date, $0) })
+        var boundaries: [(key: Int64, end: Int64?, first: Int64)] = []
+        for (key, events) in groups {
+            let reset = events.compactMap(\.resetMs).last
+            boundaries.append((key, reset ?? (key > 0 ? key : nil), events[0].atMs))
+            var high = 0.0
+            // A suffix maximum per local day confirms only strictly earlier rough samples.
+            var confirmed: [String: Double] = [:], rough = Set<Int>()
+            for batch in Dictionary(grouping: events.indices, by: { events[$0].atMs }).sorted(by: { $0.key > $1.key }) {
+                let d = day(batch.key)
+                let observed = batch.value.filter { events[$0].quality == "observed" }.map { events[$0].used }
+                for i in batch.value where events[i].quality == "rough" && events[i].used > (confirmed[d] ?? -1) && !observed.contains(events[i].used) {
+                    rough.insert(i)
+                }
+                if let maxObserved = observed.max() { confirmed[d] = max(confirmed[d] ?? 0, maxObserved) }
+            }
+            for (i, row) in events.enumerated() where row.used > high {
+                if let idx = indices[day(row.atMs)] {
+                    days[idx].used = (days[idx].used ?? 0) + (row.used-high)
+                    if rough.contains(i) { days[idx].rough = true }
+                }
+                high = row.used
+            }
+        }
+        boundaries.sort { ($0.key > 0 ? $0.key-weekMs : $0.first, $0.key) < ($1.key > 0 ? $1.key-weekMs : $1.first, $1.key) }
+        for (old, next) in zip(boundaries, boundaries.dropFirst()) {
+            guard let end = next.end else { continue }
+            if rows.first?.provider == "claude", let prev = old.end, abs(end-prev-weekMs) > resetTolerance { continue }
+            if let i = indices[day(min(old.end ?? end, end-weekMs))] { days[i].reset = true }
+        }
+        self.days = days
+        let recent = days.suffix(7).compactMap(\.used)
+        averageDays = recent.count
+        average = recent.isEmpty ? nil : recent.reduce(0,+) / Double(recent.count)
+        best = days.filter { !$0.rough && ($0.used ?? 0) > 0 }.reduce(nil as TrendDay?) { best, d in
+            (best?.used ?? 0) >= d.used! ? best : d
+        }
+        // Only a measured reset can establish the current week.
+        if let b = boundaries.last(where: { groups[$0.key]!.contains { $0.resetMs != nil } }),
+           let r = b.end, r > now, r-weekMs <= now {
+            let s = r-weekMs
+            var points: [TrendPoint] = []
+            for e in groups[b.key]! where e.atMs >= s {
+                if points.isEmpty || e.used > points.last!.used { points.append(TrendPoint(atMs: e.atMs, used: e.used)) }
+            }
+            if let u = points.last?.used {
+                let projected = now > s ? u * Double(weekMs) / Double(now-s) : nil
+                let end = (projected ?? 0) > 100 ? s + Int64(Double(now-s)*100/u) : r
+                week = TrendWeek(startMs: s, resetMs: r, used: u, points: points,
+                                 endMs: projected == nil ? nil : end, endUsed: projected.map { min(100,$0) })
+                return
+            }
+        }
+        week = nil
+    }
+    static func calculate(_ rows: [UsageEvent], user: UsageAccount, now: Int64) -> [String: Self] {
+        let keys = user.keys
+        return Dictionary(uniqueKeysWithValues: ["claude","codex"].map { p in
+            (p, Self(rows.filter { $0.provider == p && $0.account == keys[p] && $0.minutes == 10080 &&
+                $0.atMs <= now && $0.atMs >= now - 35 * dayMs }, now: now))
+        })
+    }
+}
+
+private final class UsageHistory {
+    static let url = usageDirectory.appendingPathComponent("history.jsonl")
+    private(set) var rows: [UsageEvent] = []
+    private var keys = Set<UsageEvent>()
+    private var lastCleanup: Int64?
+    private var readable = true
+    private var retryRows: [UsageEvent] = []
+    var visibleRows: [UsageEvent] { rows + retryRows }
+    init() { load() }
+    private func load() {
+        do {
+            let data = try Data(contentsOf: Self.url)
+            rows = data.split(separator: 10).compactMap { try? JSONDecoder().decode(UsageEvent.self, from: $0) }
+                .filter { $0.valid && $0.minutes == 10080 }
+            keys = Set(rows.map(\.eventKey))
+            readable = true
+        } catch let e as NSError { readable = e.domain == NSCocoaErrorDomain && e.code == NSFileReadNoSuchFileError }
+    }
+    @discardableResult func recordLive(_ events: [UsageEvent], user: UsageAccount, now: Int64) -> Bool {
+        let keys = user.keys
+        return merge(events.filter { keys[$0.provider] == $0.account }, now: now)
+    }
+    @discardableResult func merge(_ input: [UsageEvent], now: Int64) -> Bool {
+        if !readable { load() }
+        let pending = retryRows + input
+        if readable && persist(pending, now: now) { retryRows.removeAll(); return true }
+        var seen = Set<UsageEvent>()
+        retryRows = pending.filter { $0.valid && $0.minutes == 10080 && $0.atMs >= now-35*dayMs && seen.insert($0.eventKey).inserted }
+        return false
+    }
+    private func persist(_ input: [UsageEvent], now: Int64) -> Bool {
+        let fresh = input.filter { $0.valid && $0.minutes == 10080 && $0.atMs <= now && $0.atMs >= now-35*dayMs && !keys.contains($0.eventKey) }
+        let cleanup = lastCleanup.map { now-$0 >= dayMs } ?? true
+        if fresh.isEmpty && !cleanup { return true }
+        var added: [UsageEvent] = []
+        let old = cleanup ? rows.filter { $0.atMs >= now-35*dayMs } : rows
+        for (_, incoming) in Dictionary(grouping: fresh, by: { $0.provider + "/" + $0.account }) {
+            let head = incoming[0]
+            let existing = old.filter { $0.provider == head.provider && $0.account == head.account }
+            for events in Generations(existing + incoming).groups.values {
+                var previous: UsageEvent?
+                var seen = Set<UsageEvent>()
+                for e in events where seen.insert(e.eventKey).inserted {
+                    if keys.contains(e.eventKey) { previous = e; continue }
+                    if let p = previous, p.used == e.used, (e.resetMs == nil || p.resetMs == e.resetMs),
+                       !(p.quality == "rough" && e.quality == "observed") { continue }
+                    previous = e; added.append(e)
+                }
+            }
+        }
+        if added.isEmpty && !cleanup { return true }
+        do {
+            try FileManager.default.createDirectory(at: usageDirectory, withIntermediateDirectories: true)
+            let list = (cleanup ? old + added : added).sorted(by: UsageEvent.ordered)
+            var data = Data()
+            for e in list { data.append(try JSONEncoder().encode(e)); data.append(10) }
+            if cleanup {
+                try writePrivate(data, to: Self.url)
+            } else {
+                let file = try FileHandle(forWritingTo: Self.url)
+                defer { try? file.close() }
+                _ = try file.seekToEnd(); try file.write(contentsOf: data)
+            }
+            rows = old + added; keys = Set(rows.map(\.eventKey))
+            if cleanup { lastCleanup = now }
+            return true
+        } catch { lastCleanup = nil; return false }
+    }
+}
+
+private struct AlertWindow: Codable, Equatable {
+    var anchor: Int64?
+    var resetMs: Int64?
+    var atMs: Int64
+    var low = ""
+    var lowAtMs: Int64?
+    var pending = false
+    var reset: String?
+}
+private struct AlertNotice: Equatable, Encodable {
+    let kind: String, provider: String, account: String, minutes: Int
+    let title: String, body: String?
+}
+private struct AlertFile: Codable, Equatable {
+    var v = 1
+    var windows: [String: AlertWindow] = [:]
+}
+private final class LimitAlerts {
+    private static let resetNoticeGraceMs: Int64 = 60 * 60_000
+    static let url = usageDirectory.appendingPathComponent("alerts.json")
+    var state = AlertFile()
+    private var cancellations = Set<String>()
+    var healthy = true
+    init() {
+        do {
+            state = try JSONDecoder().decode(AlertFile.self, from: Data(contentsOf: Self.url))
+            healthy = state.v == 1
+        } catch let e as NSError { healthy = e.domain == NSCocoaErrorDomain && e.code == NSFileReadNoSuchFileError }
+    }
+    func save(_ value: AlertFile) -> Bool {
+        guard healthy else { return false }
+        if value == state { return true }
+        do {
+            try FileManager.default.createDirectory(at: usageDirectory, withIntermediateDirectories: true)
+            let data = try JSONEncoder().encode(value)
+            try writePrivate(data, to: Self.url)
+            state = value
+            return true
+        } catch { return false }
+    }
+    func cancel(_ provider: String? = nil) {
+        if let provider { cancellations.insert(provider) } else { cancellations.formUnion(["claude", "codex"]) }
+        _ = applyCancellations()
+    }
+    private func applyCancellations() -> Bool {
+        guard !cancellations.isEmpty else { return true }
+        var next = state
+        for k in next.windows.keys where next.windows[k]?.pending == true && cancellations.contains(where: { k.hasPrefix($0 + "/") }) {
+            next.windows[k]?.pending = false
+            next.windows[k]?.reset = "cancelled"
+        }
+        guard save(next) else { return false }
+        cancellations.removeAll()
+        return true
+    }
+
+    // Return a single transition. Adapters request permission / wait for the balloon, then
+    // re-evaluate against the current account and clock before reserving this transition.
+    func next(_ rows: [UsageEvent], keys: [String: String], now: Int64, skipped: Bool = false)
+        -> (notice: AlertNotice, state: AlertFile)? {
+        guard healthy, applyCancellations() else { return nil }
+        var next = state
+        for p in keys.keys.sorted() {
+            let account = keys[p]!
+            let prefix = p + "/" + account + "/"
+            let live = rows.filter { $0.provider == p && $0.account == account && $0.valid && $0.atMs <= now }
+            let lengths = Set(live.map(\.minutes) + next.windows.keys.filter { $0.hasPrefix(prefix) }.compactMap { Int($0.dropFirst(prefix.count)) })
+            for m in lengths.sorted() {
+                let k = prefix + String(m), duration = Int64(m)*60_000
+                let title = Pane(rawValue: p)!.title, label = windowLabel(minutes: m)
+                let window = live.filter { $0.minutes == m }
+                let resets = window.compactMap(\.resetMs)
+                let eligible = window.filter { e in
+                    if let reset = e.resetMs { return reset > now }
+                    guard now-e.atMs <= duration else { return false }
+                    let measured = resets.filter { $0-duration <= e.atMs && e.atMs < $0 }
+                    return measured.isEmpty || measured.contains { $0 > now }
+                }
+                var w = next.windows[k]
+                let anchors = resetAnchors(eligible.sorted(by: UsageEvent.ordered), seed: w?.anchor)
+                let generation = anchors.values.max()
+                let currentRows = eligible.filter { e in
+                    if let r = e.resetMs { return anchors[r] == generation }
+                    return generation.map { e.atMs >= $0-duration-resetTolerance } ?? true
+                }
+                let row = currentRows.max(by: UsageEvent.ordered)
+                let sourceReset = currentRows.filter { $0.resetMs != nil }.max(by: UsageEvent.ordered)?.resetMs
+                let newReset = row?.resetMs ?? sourceReset
+                // Older state files only have the last observation time. Freeze it before updating atMs.
+                if let old = w, !old.low.isEmpty, old.lowAtMs == nil { w?.lowAtMs = old.atMs }
+                if let old = w, old.resetMs == nil, let lowAt = old.lowAtMs, let e = row,
+                   e.atMs >= old.atMs && e.atMs - lowAt >= duration {
+                    w = nil
+                }
+                if let e = row, let r = newReset, let old = w, old.anchor == generation,
+                   e.atMs >= old.atMs { w?.resetMs = r }
+                let newer = w.flatMap { old in newReset.map { r in
+                    (row?.atMs ?? 0) >= old.atMs &&
+                        (old.anchor.map { (generation ?? r) > $0 } ?? (r-duration > (old.lowAtMs ?? old.atMs)))
+                } } ?? false
+                if var old = w, old.pending && ((old.resetMs ?? .max) <= now || newer) {
+                    let start = newer && duration > 0 ? newReset.map { $0-duration } : nil
+                    let boundary = min(old.resetMs ?? .max, start ?? .max)
+                    let timely = boundary <= now && boundary >= now - Self.resetNoticeGraceMs
+                    old.pending = false
+                    old.reset = timely && !skipped ? "sent" : "skipped"
+                    next.windows[k] = old
+                    if timely {
+                        return (AlertNotice(kind: "reset", provider: p, account: account, minutes: m,
+                                            title: T("{0} {1} 한도가 초기화됐습니다", title, label), body: T("다시 100% 남았습니다.")), next)
+                    }
+                    w = old
+                }
+                guard let e = row else { continue }
+                if let old = w {
+                    if e.atMs < old.atMs { continue }
+                    if let generation, let anchor = old.anchor, generation < anchor { continue }
+                    if newer || (newReset == nil && (old.resetMs ?? .max) <= e.atMs) { w = nil }
+                    else if (old.resetMs ?? .max) <= now { continue }
+                }
+                var current = w ?? AlertWindow(atMs: e.atMs)
+                if let r = newReset { current.anchor = current.anchor ?? generation ?? r; current.resetMs = r }
+                current.atMs = e.atMs
+                // The Claude panel combines the maximum seen in the active measured window.
+                let measured = currentRows.filter { $0.resetMs != nil }.map(\.used).max() ?? e.used
+                let used = p == "claude" && newReset != nil ? max(e.used, measured) : e.used
+                let left = 100-Int(floor(used))
+                if left <= 10 && current.low.isEmpty {
+                    current.lowAtMs = e.atMs
+                    current.low = skipped ? "skipped" : "sent"; current.pending = !skipped
+                    current.reset = skipped ? "skipped" : "pending"
+                    next.windows[k] = current
+                    let body = current.resetMs.map { r -> String in
+                        let d = instant(r)
+                        let when = Calendar.current.isDate(d, inSameDayAs: instant(now)) ? clock(d) : formatter("M/d(E) HH:mm").string(from: d)
+                        return T("{0}에 초기화됩니다.", when)
+                    }
+                    return (AlertNotice(kind: "low", provider: p, account: account, minutes: m,
+                                        title: T("{0} {1} 한도 {2}% 남음", title, label, left), body: body), next)
+                }
+                next.windows[k] = current
+            }
+        }
+        _ = save(next)
+        return nil
+    }
+}
+
+private func writePrivate(_ data: Data, to url: URL) throws {
+    let temp = url.deletingLastPathComponent().appendingPathComponent(UUID().uuidString)
+    let fd = open(temp.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+    guard fd >= 0 else { throw POSIXError(.EIO) }
+    defer { try? FileManager.default.removeItem(at: temp) }
+    let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+    try file.write(contentsOf: data); try file.synchronize(); try file.close()
+    guard rename(temp.path, url.path) == 0 else { throw POSIXError(.EIO) }
+}
+
+private func fixtureTime(_ value: Any?) -> Int64? {
+    if let s = value as? String { return parseDate(s).map(millis) }
+    return (value as? NSNumber)?.int64Value
+}
+
+private func requireTestHome(writing names: [String]) throws {
+    func canonical(_ path: String) -> String {
+        // Resolve existing parents even if the file at the end does not exist yet.
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        if FileManager.default.fileExists(atPath: url.path) { return url.resolvingSymlinksInPath().path }
+        return (canonical(url.deletingLastPathComponent().path) as NSString).appendingPathComponent(url.lastPathComponent)
+    }
+    guard let home = ProcessInfo.processInfo.environment["AIUSAGE_HOME"], !home.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty else {
+        throw CocoaError(.fileReadInvalidFileName)
+    }
+    let root = canonical(home), real = canonical(NSHomeDirectory())
+    guard root.caseInsensitiveCompare(real) != .orderedSame else { throw CocoaError(.fileReadInvalidFileName) }
+    for name in names {
+        let destination = canonical(usageDirectory.appendingPathComponent(name).path)
+        guard destination.hasPrefix(root + "/"),
+              destination.caseInsensitiveCompare(canonical(real + "/.cache/ai-usage/" + name)) != .orderedSame
+        else { throw CocoaError(.fileReadInvalidFileName) }
+    }
+}
+
+private func recordOnce(now: Int64) throws -> Int {
+    try requireTestHome(writing: ["pet.lock", "accounts.json", "claude", "history.jsonl"])
+    guard takeSingleInstanceLock(), historyWriter else { throw CocoaError(.fileWriteNoPermission) }
+    let date = instant(now), codex = CodexReader()
+    let claude = ClaudeReader().read(now: date)
+    codex.readLog(now: date)
+    let history = UsageHistory()
+    let retained = history.rows.filter { $0.atMs >= now - 35 * dayMs }.count
+    guard history.recordLive(UsageEvent.liveRows(claude: claude, codex: codex), user: UsageAccount(now: now), now: now)
+    else { throw CocoaError(.fileWriteUnknown) }
+    return history.rows.count - retained
+}
+
+private func testAlerts(_ path: String) throws {
+    try requireTestHome(writing: ["alerts.json"])
+    guard let steps = readJSONObject(path)?["steps"] as? [[String: Any]] else { throw CocoaError(.fileReadInvalidFileName) }
+    let alerts = LimitAlerts()
+    var events: [[String: Any]] = [], candidates: [[String: Any]] = []
+    var keys: [String: String] = [:], hidden = Set<String>()
+    func report(_ n: AlertNotice, _ outcome: String) -> [String: Any] {
+        ["kind": n.kind, "title": n.title, "body": n.body as Any, "result": outcome]
+    }
+    var enabled = true, requests = 0, permission: Bool?
+    for s in steps {
+        guard let now = fixtureTime(s["now"]) else { throw CocoaError(.coderInvalidValue) }
+        let p = s["provider"] as? String ?? "codex"
+        if let id = s["account"] as? String { keys[p] = UsageAccount.hash(p,id) }
+        else if keys[p] == nil { keys[p] = UsageAccount.hash(p,"test") }
+        for (provider, id) in s["accounts"] as? [String: String] ?? [:] { keys[provider] = UsageAccount.hash(provider, id) }
+        if let on = s["enabled"] as? Bool { enabled = on; if !on { alerts.cancel() } }
+        if let hide = s["hidden"] as? Bool {
+            if hide { hidden.insert(p); alerts.cancel(p) } else { hidden.remove(p) }
+        }
+        var rows: [UsageEvent] = []
+        for o in s["observations"] as? [[String: Any]] ?? [s] {
+            guard let used = number(o["used"]) else { continue }
+            let provider = o["provider"] as? String ?? p
+            if keys[provider] == nil, provider != p { keys[provider] = UsageAccount.hash(provider, o["account"] as? String ?? "test") }
+            let id = (o["account"] as? String).flatMap { UsageAccount.hash(provider,$0) } ?? keys[provider]
+            guard let id else { continue }
+            rows.append(UsageEvent(provider: provider, account: id, minutes: o["minutes"] as? Int ?? 10080,
+                                   atMs: fixtureTime(o["atMs"]) ?? now, resetMs: fixtureTime(o["resetMs"]),
+                                   used: used, source: "codex-server", quality: "observed", slot: o["slot"] as? String))
+        }
+        guard enabled else { continue }
+        let active = keys.filter { !hidden.contains($0.key) }
+        let outcome = s["outcome"] as? String ?? "sent"
+        guard let first = alerts.next(rows, keys: active, now: now) else { continue }
+        if permission == nil { requests += 1; permission = outcome != "denied" }
+        if outcome == "hideWhileWaiting" || outcome == "switchWhileWaiting" {
+            candidates.append(report(first.notice, outcome))
+            if outcome == "hideWhileWaiting" { hidden.insert(p); alerts.cancel(p) }
+            else { keys[p] = UsageAccount.hash(p,"switched") }
+            continue
+        }
+        while let candidate = alerts.next(rows, keys: active, now: now, skipped: permission == false) {
+            let before = alerts.state
+            guard outcome != "saveFailure", alerts.save(candidate.state) else {
+                candidates.append(report(candidate.notice, "saveFailure")); break
+            }
+            let event = report(candidate.notice, permission == false ? "skipped" : outcome)
+            candidates.append(event); events.append(event)
+            if outcome == "failed" { _ = alerts.save(before); break }
+            if outcome == "unknown" { break }
+        }
+    }
+    let data = try JSONSerialization.data(withJSONObject: ["events":events,"candidates":candidates,"permissionRequests":requests], options:.sortedKeys)
+    print(String(decoding:data, as:UTF8.self))
+}
+
+private final class TrendModel: ObservableObject {
+    @Published var results: [String: TrendResult] = [:]
+    @Published var month = false
+    var now = millis(Date())
+}
+private func roundedPercent(_ n: Double) -> Int { Int(floor(n + 0.5)) }
+private struct TrendScreen: View {
+    @ObservedObject var data: TrendModel
+    @ObservedObject var model: UsageModel
+    private func tab(_ label: String, month: Bool) -> some View {
+        Button { data.month = month } label: {
+            Text(label).font(.system(size: 12, weight: .medium)).padding(.horizontal, 12).padding(.vertical, 4)
+                .background(.white.opacity(data.month == month ? 0.16 : 0), in: RoundedRectangle(cornerRadius: 5))
+                .contentShape(Rectangle())
+        }.buttonStyle(.plain).accessibilityAddTraits(data.month == month ? .isSelected : [])
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 13) {
+            HStack(spacing: 0) {
+                tab(T("이번 주"), month: false)
+                tab(T("지난 4주"), month: true)
+            }.padding(2).background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 7))
+            ForEach(model.order.filter { ($0 == .claude && model.showClaude) || ($0 == .codex && model.showCodex) }, id: \.rawValue) { pane in
+                if let r = data.results[pane.rawValue] {
+                    Divider()
+                    TrendCard(pane: pane, result: r, now: data.now, month: data.month)
+                }
+            }
+            Spacer(minLength: 0)
+        }.padding(18).frame(maxWidth:.infinity, maxHeight:.infinity, alignment:.topLeading)
+            .background(Color(red:0.137, green:0.137, blue:0.149)).environment(\.colorScheme, .dark)
+    }
+}
+
+private struct TrendCard: View {
+    let pane: Pane, result: TrendResult, now: Int64, month: Bool
+    var tint: Color { pane == .claude ? claudeTint : codexTint }
+    func date(_ key: String) -> Date {
+        let f = DateFormatter(); f.locale = Locale(identifier:"en_US_POSIX"); f.dateFormat = "yyyy-MM-dd"
+        return f.date(from:key) ?? instant(now)
+    }
+    var summary: String {
+        if month {
+            guard let average = result.average else { return "" }
+            return T("최근 {0}일 하루 평균 {1}%", result.averageDays, roundedPercent(average))
+        }
+        guard let w = result.week else { return "" }
+        return T("{0}% 씀 · ↺ {1}", roundedPercent(w.used), formatter("M/d(E) HH:mm").string(from: instant(w.resetMs)))
+    }
+    var footer: String {
+        if month {
+            guard let b = result.best, let used = b.used else { return "" }
+            return T("가장 많이 쓴 날 {0} {1}%", formatter("M/d(E)").string(from: date(b.date)), roundedPercent(used))
+        }
+        guard let w = result.week else { return T("아직 이번 주 기록이 없습니다") }
+        guard let end = w.endMs, let projected = w.endUsed else { return "" }
+        if end < w.resetMs {
+            return T("이 속도면 {0} {1}시쯤 다 씁니다 — 초기화 {2}시간 전", formatter("M/d(E)").string(from: instant(end)),
+                     formatter("H").string(from: instant(end)), roundedPercent(Double(w.resetMs-end)/3600000))
+        }
+        return T("이 속도면 초기화 때 약 {0}% 씁니다 — 넉넉합니다", roundedPercent(projected))
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Circle().fill(tint).frame(width:8,height:8)
+                Text(pane.title).fontWeight(.semibold)
+                Text(month ? T("하루에 쓴 주간 한도") : T("주간 한도")).foregroundStyle(.secondary)
+                Spacer()
+                Text(summary).monospacedDigit().foregroundStyle(.secondary)
+            }.font(.system(size:13))
+            Canvas { ctx, size in draw(ctx, size) }.frame(height:125)
+            Text(footer).font(.system(size:12))
+                .foregroundStyle(!month && (result.week?.endMs ?? .max) < (result.week?.resetMs ?? 0) ? Color.orange : Color.secondary)
+        }
+    }
+    func draw(_ ctx: GraphicsContext, _ size: CGSize) {
+        let left = 36.0, right = size.width-8, top = 13.0, bottom = size.height-20
+        let grid = Color.white.opacity(0.13)
+        func line(_ a: CGPoint, _ b: CGPoint, _ color: Color, _ width: Double = 1, _ dash: [CGFloat] = []) {
+            var p = Path(); p.move(to:a); p.addLine(to:b)
+            ctx.stroke(p, with:.color(color), style:StrokeStyle(lineWidth:width,dash:dash))
+        }
+        func label(_ s: String, _ x: Double, _ y: Double, _ anchor: UnitPoint = .center) {
+            ctx.draw(Text(verbatim:s).font(.system(size:10)).foregroundColor(.secondary), at:CGPoint(x:x,y:y),anchor:anchor)
+        }
+        let scale = month ? max(60,ceil((result.days.compactMap(\.used).max() ?? 0)/30)*30) : 100
+        func y(_ v: Double) -> Double { bottom - (bottom-top)*v/scale }
+        for v in stride(from:0.0, through:scale, by:month ? 30 : 50) {
+            line(CGPoint(x:left,y:y(v)),CGPoint(x:right,y:y(v)),grid)
+            label("\(Int(v))%",left-5,y(v),.trailing)
+        }
+        if month {
+            let cw = (right-left)/28
+            let missing = result.days.prefix { $0.used == nil }.count
+            if missing > 0 {
+                ctx.fill(Path(CGRect(x:left,y:top,width:Double(missing)*cw,height:bottom-top)),with:.color(.white.opacity(0.04)))
+                label(T("기록 없음"),left+Double(missing)*cw/2,y(scale/2))
+            }
+            for (i,d) in result.days.enumerated() {
+                let x = left + Double(i)*cw, day = date(d.date)
+                if Calendar.current.component(.weekday, from:day) == 2 { label(formatter("M/d").string(from:day),x+cw/2,bottom+11) }
+                if d.reset { line(CGPoint(x:x,y:top),CGPoint(x:x,y:bottom),.secondary,1,[2,3]); label("↺",x+4,top-5) }
+                if let u = d.used, u > 0 {
+                    ctx.fill(Path(roundedRect: CGRect(x:x+2,y:y(u),width:max(1,cw-4),height:bottom-y(u)),cornerRadius:2),
+                             with:.color(tint.opacity(d.rough ? 0.35 : 0.9)))
+                    if d.date == result.best?.date { label("\(roundedPercent(u))%",x+cw/2,y(u)-7) }
+                }
+            }
+            return
+        }
+        guard let w = result.week else { return }
+        func pt(_ t: Int64, _ v: Double) -> CGPoint { CGPoint(x:left+(right-left)*Double(t-w.startMs)/Double(weekMs),y:y(v)) }
+        let cal = Calendar.current
+        var d = cal.startOfDay(for: instant(w.startMs))
+        while let next = cal.date(byAdding:.day,value:1,to:d), millis(next) < w.resetMs {
+            d = next; let t = millis(d)
+            line(pt(t,0),pt(t,100),grid)
+            let middle = t + dayMs/2
+            if middle < w.resetMs { label(formatter("E").string(from:d),pt(middle,0).x,bottom+11) }
+        }
+        line(pt(w.startMs,0),pt(w.resetMs,100),.secondary,1,[3,4])
+        if let end = w.endMs, let u = w.endUsed {
+            let tip = pt(end,u)
+            line(pt(now,w.used),tip,tint.opacity(0.5),1.5,[2,3])
+            if end < w.resetMs { ctx.fill(Path(ellipseIn:CGRect(x:tip.x-3,y:tip.y-3,width:6,height:6)),with:.color(.orange)) }
+        }
+        guard let first = w.points.first else { return }
+        var path = Path(); path.move(to:pt(first.atMs,first.used))
+        var last = first.used
+        for p in w.points.dropFirst() { path.addLine(to:pt(p.atMs,last)); path.addLine(to:pt(p.atMs,p.used)); last = p.used }
+        let current = pt(now,w.used)
+        path.addLine(to:current)
+        var area = path; area.addLine(to:pt(now,0)); area.addLine(to:pt(first.atMs,0)); area.closeSubpath()
+        ctx.fill(area,with:.color(tint.opacity(0.16))); ctx.stroke(path,with:.color(tint),lineWidth:2)
+        ctx.fill(Path(ellipseIn:CGRect(x:current.x-3,y:current.y-3,width:6,height:6)),with:.color(tint))
+        label(T("지금"),min(current.x+6,right-24),current.y-7,.leading)
+    }
+}
+@MainActor private func trendPNG(_ result: [String:TrendResult], now: Int64, month: Bool, path: String) throws {
+    _ = NSApplication.shared
+    let data = TrendModel(); data.results = result; data.now = now; data.month = month
+    let content = TrendScreen(data:data,model:UsageModel()).frame(width:630,height:490)
+    let renderer = ImageRenderer(content:content); renderer.scale = 2
+    guard let cg = renderer.cgImage, let png = NSBitmapImageRep(cgImage:cg).representation(using:.png,properties:[:])
+    else { throw CocoaError(.fileWriteUnknown) }
+    try png.write(to:URL(fileURLWithPath:path))
 }
