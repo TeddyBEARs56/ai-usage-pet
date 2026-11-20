@@ -70,8 +70,9 @@ try {
     $head = Invoke-Checked git @('rev-parse', 'HEAD')
     Invoke-Checked gh @('release', 'create', $tag, $asset, '-R', $repo, '--target', $head,
                         '--title', "AI 사용량 Windows $version", '--notes-file', $notesFile) | Out-Null
-    $assets = Invoke-Checked gh @('release', 'view', $tag, '-R', $repo, '--json', 'assets',
-                                  '-q', '.assets[] | "\(.name) \(.size)바이트 \(.digest // "digest 없음")"')
+    # PowerShell 5.1 은 바깥 프로그램에 넘기는 인자 속 큰따옴표를 깨뜨리므로 jq 식 대신 JSON 을 받아 여기서 읽는다
+    $view = (Invoke-Checked gh @('release', 'view', $tag, '-R', $repo, '--json', 'assets')) -join "`n" | ConvertFrom-Json
+    $assets = ($view.assets | ForEach-Object { "$($_.name) $($_.size)바이트 $(if ($_.digest) { $_.digest } else { 'digest 없음' })" }) -join ', '
     Write-Host "올림: $tag — $assets"
 }
 finally {
