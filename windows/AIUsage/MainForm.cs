@@ -166,6 +166,32 @@ sealed class MainForm : Form
     Point? anchor;
     int labelWidth, percentWidth, resetWidth;
 
+    // 표시 방식 「작업 표시줄 (간단 모드)」: 알림 영역 왼쪽의 동그란 게이지. 붙일 수 없으면 떠 있는 창을 대신 보인다
+    int displayMode = Settings.Read(Settings.DisplayMode);
+    int taskbarSize = Settings.Read(Settings.TaskbarSize);
+    TaskbarGauge? gauge;
+    string? taskbarProblem, taskbarLogged;
+    int taskbarFailures;
+    readonly System.Windows.Forms.Timer taskbarTimer = new() { Interval = 1_000 };
+    readonly NativeWindow menuAnchor = new();
+
+    // 세션(떠 있는 창 맨 위 칸·작업 표시줄 위 패널): 3초마다 읽고, 작업 중인 게 보이면 고리를 돌린다
+    readonly SessionReader sessionReader = new();
+    List<AgentSession> sessions = [];
+    readonly System.Windows.Forms.Timer sessionTimer = new() { Interval = 3_000 };
+    readonly System.Windows.Forms.Timer spinTimer = new() { Interval = 120 };
+    float spin;
+    bool showSessions = Settings.Read(Settings.ShowSessions) == 1;
+    // 칸 접기(머리줄을 누르면 접고 펴고, 기억한다): 세션은 머리줄에 개수만, Claude·ChatGPT 는 주간 게이지와 % 한 줄
+    bool sessionsFolded = Settings.Read(Settings.FoldSessions) == 1;
+    bool claudeFolded = Settings.Read(Settings.FoldClaude) == 1;
+    bool codexFolded = Settings.Read(Settings.FoldCodex) == 1;
+    readonly List<(Rectangle Row, string Pane)> headerHits = [];
+    SessionPopup? popup;
+    readonly List<(Rectangle Row, AgentSession Session)> sessionHits = [];
+    readonly System.Windows.Forms.Timer rightTimer = new() { Interval = SystemInformation.DoubleClickTime };
+    Point rightAt;
+
     public MainForm(Mutex mutex, bool afterInstall)
     {
         savedBackground = backgroundLevel;
@@ -186,13 +212,37 @@ sealed class MainForm : Form
             notice => notification.ShowBalloonTip(10_000,notice.Title,notice.Body ?? " ",ToolTipIcon.Info));
         notification.BalloonTipClosed += (_,_) => EndBalloon();
         balloonTimer.Tick += (_,_) => EndBalloon();
-        ContextMenuStrip = menu;
         menu.Opening += OnMenuOpening;
         MouseDown += OnMouseDownDrag;
-        MouseDoubleClick += (_, e) => { if (e.Button == MouseButtons.Left) RefreshAll(); };
+        // 오른쪽 클릭: 한 번이면(두 번째가 안 오면) 메뉴, 두 번이면 작업 표시줄로
+        MouseUp += (_, e) =>
+        {
+            if (e.Button != MouseButtons.Right) return;
+            if (rightTimer.Enabled)
+            {
+                rightTimer.Stop();
+                BeginInvoke(new Action(() => ChooseAppearance(Settings.DisplayMode, 1)));
+            }
+            else
+            {
+                rightAt = Cursor.Position;
+                rightTimer.Start();
+            }
+        };
+        rightTimer.Tick += (_, _) =>
+        {
+            rightTimer.Stop();
+            ShowMenuAt(rightAt);
+        };
+        // 세션 줄 위에서는 손가락 커서(누르면 그 대화를 연다)
+        MouseMove += (_, e) => HoverSession(e.Location);
+        MouseLeave += (_, _) => HoverSession(null);
         localTimer.Tick += (_, _) => RefreshLocal();
         serverTimer.Tick += (_, _) => RefreshServer();
         usageTimer.Tick += (_, _) => CheckClaudeUsage();
+        taskbarTimer.Tick += (_, _) => SyncTaskbar();
+        sessionTimer.Tick += (_, _) => ReadSessions();
+        spinTimer.Tick += (_, _) => Spin();
         updateTimer.Tick += (_, _) =>
         {
             updateTimer.Interval = (int)Updater.Interval.TotalMilliseconds;  // 처음은 켠 뒤 1분, 그 뒤 6시간마다
@@ -229,6 +279,10 @@ sealed class MainForm : Form
         serverTimer.Start();
         updateTimer.Start();
         usageTimer.Start();
+        taskbarTimer.Start();
+        ReadSessions();
+        sessionTimer.Start();
+        BeginInvoke(new Action(SyncTaskbar));
         RefreshServer();
         CheckClaudeUsage();
         if (afterInstall) BeginInvoke(new Action(() => ClaudeLink.Ask(fromMenu: false)));
@@ -242,6 +296,13 @@ sealed class MainForm : Form
         serverTimer.Dispose();
         updateTimer.Dispose();
         usageTimer.Dispose();
+        taskbarTimer.Dispose();
+        DropGauge();
+        menuAnchor.DestroyHandle();
+        sessionTimer.Dispose();
+        spinTimer.Dispose();
+        popup?.Dispose();
+        rightTimer.Dispose();
         activity.Dispose();
         balloonTimer.Dispose(); notification.Dispose(); trend?.Close();
         foreach (var font in new[] { fontName, fontSmall, fontRow, fontPercent }) font?.Dispose();
@@ -392,7 +453,12 @@ sealed class MainForm : Form
         int count = snap.VisibleWindows(showModels).Count();
         return count == 0 ? 2 : count;
     }
-    int SectionHeight(ProviderSnapshot snap) => HeaderHeight + Rows(snap) * (Content(Gap) + RowHeight);
+    bool Folded(ProviderSnapshot snap) => snap == claudeSnap ? claudeFolded : codexFolded;
+    int SectionHeight(ProviderSnapshot snap) => Folded(snap) ? HeaderHeight : HeaderHeight + Rows(snap) * (Content(Gap) + RowHeight);
+    /// 세션 칸 줄 수(끄거나 세션이 없으면 0 — 칸이 없어진다). 8개가 넘으면 7줄 + 「외 N개」
+    int SessionRows => !showSessions ? 0 : Math.Min(sessions.Count, SessionRow.MaxRows);
+    int SessionsHeight => SessionRows == 0 ? 0
+        : HeaderHeight + (sessionsFolded ? 0 : SessionRows * (Content(Gap) + RowHeight)) + Content(SectionGap) * 2 + DividerHeight;
 
     void FitSize()
     {
@@ -401,7 +467,7 @@ sealed class MainForm : Form
         int width = Content(BaseWidth) + labelWidth - Content(LabelW)
             + percentWidth - Content(PercentW) + resetWidth - Content(ResetW);
         var size = new Size(width, Content(PadY) * 2 + SectionHeight(claudeSnap)
-            + Content(SectionGap) * 2 + DividerHeight + SectionHeight(codexSnap));
+            + Content(SectionGap) * 2 + DividerHeight + SectionHeight(codexSnap) + SessionsHeight);
         bool resized = size != Size;
         var location = Location;
         if (!dragging && anchor is Point point)
@@ -488,6 +554,10 @@ sealed class MainForm : Form
             anchor = Location;
             Settings.SavePosition(Location);
         }
+        else if (HeaderAt(PointToClient(Cursor.Position)) is { } pane)
+            ToggleFold(pane);  // 머리줄: 접고 편다
+        else if (SessionAt(PointToClient(Cursor.Position)) is { } session)
+            SessionOpener.Open(session);  // 끌지 않고 눌렀다 뗐으면: 세션 줄이면 그 대화를 연다
         FitSize();
     }
 
@@ -544,7 +614,8 @@ sealed class MainForm : Form
     {
         using var template = StringFormat.GenericTypographic;
         var format = (StringFormat)template.Clone();
-        format.Alignment = flags.HasFlag(TextFormatFlags.Right) ? StringAlignment.Far : StringAlignment.Near;
+        format.Alignment = flags.HasFlag(TextFormatFlags.Right) ? StringAlignment.Far
+            : flags.HasFlag(TextFormatFlags.HorizontalCenter) ? StringAlignment.Center : StringAlignment.Near;
         format.LineAlignment = flags.HasFlag(TextFormatFlags.VerticalCenter) ? StringAlignment.Center : StringAlignment.Near;
         format.FormatFlags &= ~(StringFormatFlags.NoClip | StringFormatFlags.NoWrap);
         if (flags.HasFlag(TextFormatFlags.SingleLine)) format.FormatFlags |= StringFormatFlags.NoWrap;
@@ -607,8 +678,10 @@ sealed class MainForm : Form
         g.DrawString(text, font, brush, rect, format);
     }
 
-    void Redraw()
+    /// gauge: 작업 표시줄 게이지에도 새 값을 넘긴다(고리만 돌릴 때는 넘기지 않는다)
+    void Redraw(bool gauge = true)
     {
+        if (gauge) PushGauge();
         if (!IsHandleCreated || IsDisposed || anchor == null || fontName == null || WindowState == FormWindowState.Minimized) return;
         if (backgroundLevel != 0)
         {
@@ -646,6 +719,14 @@ sealed class MainForm : Form
     {
         g.SmoothingMode = SmoothingMode.AntiAlias;
         var y = Content(PadY);
+        sessionHits.Clear();
+        headerHits.Clear();
+        if (SessionRows > 0)  // 맨 위에 세션 칸, 그 아래 구분선
+        {
+            y = DrawSessions(g, y) + Content(SectionGap);
+            using (var pen = new Pen(Palette.Divider, DividerHeight)) g.DrawLine(pen, Content(PadX), y, Width - Content(PadX), y);
+            y += DividerHeight + Content(SectionGap);
+        }
         for (var i = 0; i < order.Length; i++)  // 고른 순서대로(「칸 순서」 메뉴), 칸 사이에 구분선
         {
             if (i > 0)
@@ -669,18 +750,45 @@ sealed class MainForm : Form
     int DrawSection(Graphics g, string name, string? detail, Color dot, ProviderSnapshot snap, int top)
     {
         int left = Content(PadX), right = Width - Content(PadX), header = HeaderHeight;
+        // 머리줄 오른쪽 끝 ▲/▼ — 머리줄을 누르면 접고 편다
+        var folded = Folded(snap);
+        headerHits.Add((new Rectangle(0, top, Width, header), snap == claudeSnap ? "claude" : "codex"));
+        int headRight = right - Content(Caret) - Content(6);
+        DrawCaret(g, right - Content(Caret), top, header, folded);
         using (var brush = new SolidBrush(dot))
             g.FillEllipse(brush, left, top + (header - Content(DotSize)) / 2f, Content(DotSize), Content(DotSize));
         var x = left + Content(DotSize) + Content(6);
         var nameWidth = MeasureText(g, name, fontName!);
         DrawText(g, name, fontName!, new Rectangle(x, top, nameWidth, header), Palette.Text, TextFlags);
+
+        if (folded)  // 「● Claude ▬▬── 26%」: 주간 한도만(없으면 첫 한도)
+        {
+            // 두 칸의 막대가 같은 자리에서 시작하게 이름 칸은 긴 쪽 너비로
+            int barX = left + Content(DotSize) + Content(6) + Math.Max(MeasureText(g, "Claude", fontName!), MeasureText(g, "ChatGPT", fontName!)) + Content(10);
+            var weekly = snap.Windows.FirstOrDefault(w => w.Name == null && w.Minutes == 10_080) ?? snap.Windows.FirstOrDefault(w => w.Name == null);
+            if (weekly == null)
+            {
+                DrawText(g, snap.Message ?? T("값이 없습니다"), fontSmall!, new Rectangle(barX, top, Math.Max(0, headRight - barX), header),
+                         Palette.Secondary, TextFlags | TextFormatFlags.EndEllipsis);
+                return top + header;
+            }
+            var leftPercent = weekly.LeftPercent(now);
+            var tint = Palette.Status(leftPercent);
+            int percentWidth = MeasureText(g, "100%", fontPercent!);
+            DrawText(g, $"{leftPercent}%", fontPercent!, new Rectangle(headRight - percentWidth, top, percentWidth, header), tint, TextFlags | TextFormatFlags.Right);
+            int barWidth = Math.Max(Content(10), headRight - percentWidth - Content(8) - barX);
+            float barY = top + (header - Content(BarH)) / 2f;
+            using (var track = new SolidBrush(Palette.Track)) FillCapsule(g, track, barX, barY, barWidth, Content(BarH));
+            using (var fill = new SolidBrush(tint)) FillCapsule(g, fill, barX, barY, Math.Max(Content(3), barWidth * leftPercent / 100f), Content(BarH));
+            return top + header;
+        }
         x += nameWidth + Content(6);
 
         var age = Fmt.AgeText(snap.ObservedAt, now);
         var ageWidth = MeasureText(g, age, fontSmall!);
-        DrawText(g, age, fontSmall!, new Rectangle(right - ageWidth, top, ageWidth, header), Palette.Tertiary, TextFlags | TextFormatFlags.Right);
+        DrawText(g, age, fontSmall!, new Rectangle(headRight - ageWidth, top, ageWidth, header), Palette.Tertiary, TextFlags | TextFormatFlags.Right);
         if (!string.IsNullOrEmpty(detail))
-            DrawText(g, detail, fontSmall!, new Rectangle(x, top, Math.Max(0, right - ageWidth - Content(6) - x), header),
+            DrawText(g, detail, fontSmall!, new Rectangle(x, top, Math.Max(0, headRight - ageWidth - Content(6) - x), header),
                                   Palette.Secondary, TextFlags | TextFormatFlags.EndEllipsis);
 
         var y = top + header;
@@ -701,6 +809,36 @@ sealed class MainForm : Form
             y += RowHeight;
         }
         return y;
+    }
+
+    const int Caret = 8;
+
+    /// 접힘 ▼ / 펼침 ▲
+    void DrawCaret(Graphics g, int x, int top, int height, bool folded)
+    {
+        float w = Content(Caret), h = Content(Caret) * 0.55f, y = top + (height - h) / 2f;
+        PointF[] points = folded
+            ? [new(x, y), new(x + w, y), new(x + w / 2, y + h)]
+            : [new(x, y + h), new(x + w, y + h), new(x + w / 2, y)];
+        var old = g.SmoothingMode;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (var brush = new SolidBrush(Palette.Tertiary)) g.FillPolygon(brush, points);
+        g.SmoothingMode = old;
+    }
+
+    string? HeaderAt(Point client) => headerHits.FirstOrDefault(h => h.Row.Contains(client)).Pane;
+
+    void ToggleFold(string pane)
+    {
+        switch (pane)
+        {
+            case "sessions": sessionsFolded = Settings.Save(Settings.FoldSessions, sessionsFolded ? 0 : 1, sessionsFolded ? 1 : 0) == 1; break;
+            case "claude": claudeFolded = Settings.Save(Settings.FoldClaude, claudeFolded ? 0 : 1, claudeFolded ? 1 : 0) == 1; break;
+            default: codexFolded = Settings.Save(Settings.FoldCodex, codexFolded ? 0 : 1, codexFolded ? 1 : 0) == 1; break;
+        }
+        UpdateSpin();
+        FitSize();
+        Redraw(gauge: false);
     }
 
     /// 「5시간 ▬▬▬── 41% 남음 ↺ 20:20」
@@ -735,6 +873,215 @@ sealed class MainForm : Form
         g.FillPath(brush, path);
     }
 
+    // MARK: 작업 표시줄 간단 모드
+
+    /// 1초마다: 표시 방식이 작업 표시줄이면 게이지를 붙이고(탐색기가 다시 켜지면 새로 붙인다) 떠 있는 창은 숨긴다.
+    /// 붙일 수 없으면 떠 있는 창을 대신 보인다 — 탐색기 재시작처럼 잠깐인 경우를 위해 3초 기다린다
+    void SyncTaskbar()
+    {
+        if (IsDisposed) return;
+        string? problem = null;
+        if (displayMode == 1)
+        {
+            var bar = TaskbarGauge.FindTaskbar();
+            if (gauge != null && !gauge.Attached(bar)) DropGauge();
+            if (bar == IntPtr.Zero) problem = T("작업 표시줄을 찾지 못했습니다");
+            else
+            {
+                if (gauge == null)
+                {
+                    gauge = new TaskbarGauge(bar);
+                    gauge.FloatRequested += () => BeginInvoke(new Action(() => ChooseAppearance(Settings.DisplayMode, 0)));  // 두 번 클릭: 떠 있는 창으로(게이지를 없애므로 그 클릭 처리가 끝난 뒤에)
+                    gauge.MenuRequested += ShowMenuAt;
+                    gauge.SessionsRequested += ToggleSessionPopup;
+                    try
+                    {
+                        gauge.Show();
+                        problem = PushGauge();
+                    }
+                    catch (Exception e) when (e is Win32Exception or InvalidOperationException)
+                    {
+                        problem = e.Message;
+                        DropGauge();
+                    }
+                }
+                if (gauge != null) problem ??= gauge.Tick();
+            }
+        }
+        else DropGauge();
+
+        taskbarFailures = problem == null ? 0 : taskbarFailures + 1;
+        if (displayMode == 1 && (problem ?? "붙음") is var state && state != taskbarLogged) LogTaskbar(taskbarLogged = state);
+        taskbarProblem = problem;
+        bool floating = displayMode == 0 || (problem != null && (Visible || taskbarFailures >= 3));
+        if (floating && !Visible)
+        {
+            Show();
+            FitSize();
+            Redraw();
+        }
+        else if (!floating && Visible) Hide();
+    }
+
+    /// 작업 표시줄에 붙었다·못 붙였다가 바뀔 때만 한 줄(~/.cache/ai-usage/taskbar.log, 64KB 넘으면 새로)
+    static void LogTaskbar(string line)
+    {
+        try
+        {
+            var path = Path.Combine(Paths.Home, ".cache", "ai-usage", "taskbar.log");
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            if (File.Exists(path) && new FileInfo(path).Length > 65_536) File.Delete(path);
+            File.AppendAllText(path, $"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss} {line}{System.Environment.NewLine}");
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+    }
+
+    void DropGauge()
+    {
+        popup?.Close();
+        gauge?.Dispose();
+        gauge = null;
+    }
+
+    /// 지금 값을 게이지에 넘긴다. 그리지 못했으면 이유
+    string? PushGauge() => gauge is { IsHandleCreated: true } g ? g.SetData(GaugeGroups(), taskbarSize, showSessions ? sessions.Count(s => s.State == SessionState.Waiting) : 0) : null;
+
+    /// 「칸 순서」대로 회사마다 색 점 하나와 원들(5시간·주간·모델별)
+    List<TaskbarGauge.Group> GaugeGroups() => order.Select(pane =>
+    {
+        var (name, snap, dot) = pane == Pane.Codex ? ("ChatGPT", codexSnap, Palette.ChatGPT) : ("Claude", claudeSnap, Palette.Claude);
+        var rings = snap.VisibleWindows(showModels).Select(w => new TaskbarGauge.Ring(
+            $"{name} · " + T("{0} {1}% 남음 · 초기화 {2}", w.Label, w.LeftPercent(now), w.ResetsAt is { } r ? Fmt.FullTime(r) : "-"),
+            w.LeftPercent(now))).ToList();
+        if (rings.Count == 0) rings.Add(new TaskbarGauge.Ring($"{name} · {snap.Message ?? T("값이 없습니다")}", null));
+        return new TaskbarGauge.Group(dot, rings);
+    }).ToList();
+
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hwnd);
+
+    /// 게이지를 오른쪽 클릭하면 떠 있는 창과 같은 메뉴
+    void ShowMenuAt(Point at)
+    {
+        if (menuAnchor.Handle == IntPtr.Zero) menuAnchor.CreateHandle(new CreateParams());
+        SetForegroundWindow(menuAnchor.Handle);  // 알림 영역 아이콘 메뉴처럼: 다른 곳을 누르면 메뉴가 닫히게
+        menu.Show(at);
+    }
+
+    // MARK: 세션
+
+    void ReadSessions()
+    {
+        if (IsDisposed) return;
+        sessions = sessionReader.Read(DateTimeOffset.Now);
+        if (popup is { Visible: true }) popup.SetSessions(sessions, DateTimeOffset.Now, spin);
+        UpdateSpin();
+        FitSize();
+        Redraw();
+    }
+
+    /// 세션 칸(맨 위): 「세션」 머리 아래 한 줄씩
+    int DrawSessions(Graphics g, int top)
+    {
+        int left = Content(PadX), right = Width - Content(PadX);
+        headerHits.Add((new Rectangle(0, top, Width, HeaderHeight), "sessions"));
+        DrawCaret(g, right - Content(Caret), top, HeaderHeight, sessionsFolded);
+        DrawText(g, T("세션"), fontName!, new Rectangle(left, top, right - left, HeaderHeight), Palette.Text, TextFlags);
+        if (sessionsFolded)  // 「세션 · 입력 1 · 진행 1 · 완료 2 ▼」 — 0개는 빼고, 입력 필요는 주황
+        {
+            int waiting = sessions.Count(s => s.State == SessionState.Waiting);
+            int working = sessions.Count(s => s.State == SessionState.Working);
+            int done = sessions.Count(s => s.State == SessionState.Done);
+            var parts = new (int Count, string Text, Color Color)[]
+            {
+                (waiting, T("입력 {0}", waiting), Palette.Waiting),
+                (working, T("진행 {0}", working), Palette.Working),
+                (done, T("완료 {0}", done), Palette.Secondary),
+            }.Where(p => p.Count > 0).ToList();
+            int x = right - Content(Caret) - Content(6);
+            for (int i = parts.Count - 1; i >= 0; i--)
+            {
+                int w = MeasureText(g, parts[i].Text, fontSmall!);
+                DrawText(g, parts[i].Text, fontSmall!, new Rectangle(x - w, top, w, HeaderHeight), parts[i].Color, TextFlags | TextFormatFlags.Right);
+                x -= w;
+                if (i == 0) break;
+                int dw = MeasureText(g, " · ", fontSmall!);
+                DrawText(g, " · ", fontSmall!, new Rectangle(x - dw, top, dw, HeaderHeight), Palette.Tertiary, TextFlags | TextFormatFlags.Right);
+                x -= dw;
+            }
+            return top + HeaderHeight;
+        }
+        var y = top + HeaderHeight;
+        var (shown, hidden) = SessionRow.Visible(sessions);
+        var at = DateTimeOffset.Now;
+        foreach (var s in shown)
+        {
+            y += Content(Gap);
+            sessionHits.Add((new Rectangle(left, y - Content(Gap) / 2, right - left, RowHeight + Content(Gap)), s));
+            if (s.Id == hoverSession)
+                SessionRow.Highlight(g, new Rectangle(left - Content(5), y - Content(Gap) / 2, right - left + Content(10), RowHeight + Content(Gap)), Content(5));
+            SessionRow.Draw(g, s, new Rectangle(left, y, right - left, RowHeight), at, spin, fontRow!, fontSmall!,
+                (text, font, rect, color, flags) => DrawText(g, text, font, rect, color, flags), (text, font) => MeasureText(g, text, font));
+            y += RowHeight;
+        }
+        if (hidden > 0)
+        {
+            y += Content(Gap);
+            DrawText(g, T("외 {0}개", hidden), fontSmall!, new Rectangle(left, y, right - left, RowHeight), Palette.Tertiary, TextFlags);
+            y += RowHeight;
+        }
+        return y;
+    }
+
+    AgentSession? SessionAt(Point client) => sessionHits.FirstOrDefault(h => h.Row.Contains(client)).Session;
+    string? hoverSession;  // 마우스가 올라간 세션 줄(밝은 바탕)
+
+    void HoverSession(Point? at)
+    {
+        var id = at is { } p ? SessionAt(p)?.Id : null;
+        Cursor = id != null || (at is { } q && HeaderAt(q) != null) ? Cursors.Hand : Cursors.Default;
+        if (id == hoverSession) return;
+        hoverSession = id;
+        Redraw(gauge: false);
+    }
+
+    /// 작업 중인 세션이 보이는 동안만 고리를 돌린다
+    bool Spinning => sessions.Any(s => s.State == SessionState.Working) && ((Visible && SessionRows > 0 && !sessionsFolded) || popup is { Visible: true });
+
+    void UpdateSpin()
+    {
+        if (Spinning) spinTimer.Start();
+        else spinTimer.Stop();
+    }
+
+    void Spin()
+    {
+        spin = (spin + 30) % 360;
+        if (Visible && SessionRows > 0) Redraw(gauge: false);
+        popup?.Spin(spin);
+        if (!Spinning) spinTimer.Stop();
+    }
+
+    void ToggleSessionDisplay()
+    {
+        showSessions = Settings.Save(Settings.ShowSessions, showSessions ? 0 : 1, showSessions ? 1 : 0) == 1;
+        UpdateSpin();
+        FitSize();
+        Redraw();
+    }
+
+    /// 간단 모드에서 게이지를 한 번 누르면 세션 패널을 열고, 열려 있으면 닫는다
+    void ToggleSessionPopup(Rectangle gaugeBounds, int taskbarTop, int dpi)
+    {
+        popup ??= new SessionPopup();
+        if (popup.Visible || popup.JustClosed)  // 열린 채로 게이지를 누르면 그 클릭에 먼저 닫힌다
+        {
+            popup.Close();
+            return;
+        }
+        popup.ShowAbove(gaugeBounds, taskbarTop, dpi, sessions, DateTimeOffset.Now);
+        UpdateSpin();
+    }
+
     // MARK: 메뉴(창 오른쪽 클릭)
 
     void OnMenuOpening(object? sender, CancelEventArgs e)
@@ -753,6 +1100,7 @@ sealed class MainForm : Form
             });
         menu.Items.Add(orderMenu);
         menu.Items.Add(new ToolStripMenuItem(T("모델별 한도 보이기 (Fable 등)"), null, (_, _) => ToggleModelDisplay()) { Checked = showModels });
+        menu.Items.Add(new ToolStripMenuItem(T("세션 보이기"), null, (_, _) => ToggleSessionDisplay()) { Checked = showSessions });
         menu.Items.Add(AppearanceMenu());
         menu.Items.Add(LanguageMenu());
         menu.Items.Add(new ToolStripMenuItem(T("한도 알림"), null, (_, _) => ToggleAlerts()) { Checked = Settings.LimitAlerts });
@@ -789,6 +1137,8 @@ sealed class MainForm : Form
             }
         }
         string[] sizes = [T("작게"), T("보통"), T("크게"), T("아주 크게")];
+        AddGroup(Settings.DisplayMode, T("표시 방식"), [T("떠 있는 창"), T("작업 표시줄 (간단 모드)")], displayMode);
+        AddGroup(Settings.TaskbarSize, T("작업 표시줄 크기"), [T("작게"), T("크게")], taskbarSize);
         AddGroup(Settings.Background, T("배경 투명도"), [T("없음"), T("조금"), T("중간"), T("많이")], backgroundLevel);
         AddGroup(Settings.WindowSize, T("창 크기"), sizes, windowPercent);
         AddGroup(Settings.TextSize, T("글자 크기"), sizes, textPercent);
@@ -797,6 +1147,22 @@ sealed class MainForm : Form
 
     void ChooseAppearance(Settings.PetSetting setting, int value)
     {
+        if (setting == Settings.DisplayMode)
+        {
+            if (value == displayMode) return;
+            displayMode = Settings.Save(setting, value, displayMode);
+            taskbarFailures = 0;
+            SyncTaskbar();
+            return;
+        }
+        if (setting == Settings.TaskbarSize)
+        {
+            if (value == taskbarSize) return;
+            taskbarSize = Settings.Save(setting, value, taskbarSize);
+            PushGauge();
+            SyncTaskbar();  // 폭이 바뀌었으니 바로 자리를 다시 잡는다
+            return;
+        }
         if (setting == Settings.Background)
         {
             if ((layeredFailed && value != 0) || (value == backgroundLevel && value == savedBackground)) return;
@@ -869,6 +1235,12 @@ sealed class MainForm : Form
 
     IEnumerable<string> DetailLines()
     {
+        if (taskbarProblem != null) yield return T("작업 표시줄 대신 떠 있는 창 — {0}", taskbarProblem);
+        if (sessions.Count > 0)
+        {
+            yield return T("세션");
+            foreach (var s in sessions) yield return "    " + s.Describe(DateTimeOffset.Now);
+        }
         foreach (var (title, snap) in order.Select(p => p == Pane.Codex
                      ? (T("ChatGPT (Codex 한도)"), codexSnap)
                      : ($"Claude ({claudeSnap.Source ?? T("Claude Code 상태 표시줄")})", claudeSnap)))
@@ -898,6 +1270,10 @@ static class Palette
     public static readonly Color Divider = Color.FromArgb(0x2E, 0x2E, 0x31);
     public static readonly Color Claude = Color.FromArgb(0xD9, 0x77, 0x57);
     public static readonly Color ChatGPT = Color.FromArgb(0x10, 0xA3, 0x7F);
+    // 세션 상태: 입력 필요 주황, 작업 중 파랑, 작업 완료 초록
+    public static readonly Color Waiting = Color.FromArgb(0xFF, 0x9F, 0x0A);
+    public static readonly Color Working = Color.FromArgb(0x0A, 0x84, 0xFF);
+    public static readonly Color Done = Color.FromArgb(0x30, 0xD1, 0x58);
 
     /// 맥판과 같은 기준: 50% 이상 초록, 20% 이상 노랑, 그 아래 빨강
     public static Color Status(int left) => left >= 50 ? Color.FromArgb(0x30, 0xD1, 0x58)

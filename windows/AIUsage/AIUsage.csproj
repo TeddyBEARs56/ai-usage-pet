@@ -11,10 +11,11 @@
     <RootNamespace>AIUsage</RootNamespace>
     <AssemblyName>AIUsage</AssemblyName>
     <ApplicationIcon>AIUsage.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
     <Product>AI 사용량</Product>
     <AssemblyTitle>AI 사용량</AssemblyTitle>
     <Description>Claude·ChatGPT(Codex) 사용 한도를 화면 위에 띄워 둔다</Description>
-    <Version>1.4.0</Version>
+    <Version>1.4.1</Version>
     <InvariantGlobalization>false</InvariantGlobalization>
     <SatelliteResourceLanguages>ko</SatelliteResourceLanguages>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
@@ -27,6 +28,7 @@
 
   <ItemGroup>
     <Compile Include="../Shared/Usage.cs" />
+    <Compile Include="../Shared/Sessions.cs" />
     <!-- 화면 글자 번역(맥 판과 같은 파일) -->
     <EmbeddedResource Include="../../i18n/strings.json" LogicalName="strings.json" />
     <EmbeddedResource Include="AIUsage.ico" LogicalName="AIUsage.ico" />

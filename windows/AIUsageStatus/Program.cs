@@ -26,6 +26,12 @@ if (args.Contains("--trend-json") || args.Contains("--test-alerts") || args.Cont
     catch (Exception e) { Console.Error.WriteLine(e.Message); return 2; }
 }
 
+if (args.Contains("--sessions"))  // 세션 목록만(값은 묻지 않는다)
+{
+    Write(Report.DescribeSessions(new SessionReader().Read(DateTimeOffset.Now), DateTimeOffset.Now) + "\n");
+    return 0;
+}
+
 if (args.Contains("--print"))
 {
     Write(await Report.PrintAsync() + "\n");

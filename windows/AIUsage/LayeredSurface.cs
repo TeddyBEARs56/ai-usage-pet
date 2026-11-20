@@ -48,8 +48,17 @@ static class LayeredSurface
     [DllImport("gdi32.dll", EntryPoint = "GetObjectW")] static extern int GetObjectInfo(IntPtr obj, int count, out DibSection dib);
     [DllImport("gdi32.dll")] static extern int GetDIBits(IntPtr dc, IntPtr bitmap, uint start, uint lines,
         [Out] byte[] bits, ref BitmapInfoHeader info, uint usage);
-    [DllImport("user32.dll")] static extern bool UpdateLayeredWindow(IntPtr window, IntPtr destinationDC,
+    [DllImport("user32.dll", SetLastError = true)] static extern bool UpdateLayeredWindow(IntPtr window, IntPtr destinationDC,
         IntPtr destination, ref Size size, IntPtr sourceDC, ref Point source, uint colorKey, ref Blend blend, uint flags);
+
+    /// 마지막으로 실패한 단계(진단용: 작업 표시줄 간단 모드가 못 그린 이유)
+    public static string? LastFailure { get; private set; }
+
+    static bool Fail(string step)
+    {
+        LastFailure = step;
+        return false;
+    }
 
     static bool HasAlpha(IntPtr dc, IntPtr bitmap, Size size, Point sample, byte expected)
     {
@@ -86,16 +95,17 @@ static class LayeredSurface
             }
             bitmap = frame.GetHbitmap(Color.FromArgb(0));
             dc = CreateCompatibleDC(IntPtr.Zero);
-            if (dc == IntPtr.Zero || !HasAlpha(dc, bitmap, size, sample, alpha)) return false;
+            if (dc == IntPtr.Zero || !HasAlpha(dc, bitmap, size, sample, alpha)) return Fail("alpha");
             previous = SelectObject(dc, bitmap);
-            if (previous == IntPtr.Zero || previous == new IntPtr(-1)) return false;
+            if (previous == IntPtr.Zero || previous == new IntPtr(-1)) return Fail("select");
             var origin = Point.Empty;
             var blend = new Blend { ConstantAlpha = 255, AlphaFormat = 1 }; // AC_SRC_OVER, AC_SRC_ALPHA
-            return UpdateLayeredWindow(window, IntPtr.Zero, IntPtr.Zero, ref size, dc, ref origin, 0, ref blend, 2);
+            return UpdateLayeredWindow(window, IntPtr.Zero, IntPtr.Zero, ref size, dc, ref origin, 0, ref blend, 2)
+                || Fail($"UpdateLayeredWindow {Marshal.GetLastWin32Error()}");
         }
         catch (Exception e) when (e is ExternalException or ArgumentException or OutOfMemoryException)
         {
-            return false;
+            return Fail(e.GetType().Name);
         }
         finally
         {

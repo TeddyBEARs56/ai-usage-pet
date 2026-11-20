@@ -9,7 +9,7 @@
     <RootNamespace>AIUsage</RootNamespace>
     <AssemblyName>AIUsageStatus</AssemblyName>
     <Product>AI 사용량</Product>
-    <Version>1.4.0</Version>
+    <Version>1.4.1</Version>
     <InvariantGlobalization>false</InvariantGlobalization>
     <SatelliteResourceLanguages>ko</SatelliteResourceLanguages>
   </PropertyGroup>
@@ -25,6 +25,7 @@
 
   <ItemGroup>
     <Compile Include="../Shared/Usage.cs" />
+    <Compile Include="../Shared/Sessions.cs" />
     <!-- 화면 글자 번역(맥 판과 같은 파일) -->
     <EmbeddedResource Include="../../i18n/strings.json" LogicalName="strings.json" />
   </ItemGroup>

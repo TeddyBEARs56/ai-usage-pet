@@ -144,6 +144,16 @@ static class Settings
     public static readonly PetSetting TextSize = new("petTextPercent", 100, [90, 100, 115, 130]);
     public static readonly PetSetting ShowModelLimits = new("ShowModelLimits", 1, [0, 1]);
     public static readonly PetSetting ModelLimitAlerts = new("ModelLimitAlerts", 0, [0, 1]);
+    /// 0 떠 있는 창, 1 작업 표시줄(간단 모드)
+    public static readonly PetSetting DisplayMode = new("DisplayMode", 0, [0, 1]);
+    /// 작업 표시줄 간단 모드의 크기: 75 작게, 100 크게
+    public static readonly PetSetting TaskbarSize = new("TaskbarSize", 100, [75, 100]);
+    /// 떠 있는 창 맨 위 세션 칸과 작업 표시줄의 「!」(1 보임)
+    public static readonly PetSetting ShowSessions = new("ShowSessions", 1, [0, 1]);
+    /// 떠 있는 창의 칸 접기(1 접음): 머리줄을 누르면 바뀐다
+    public static readonly PetSetting FoldSessions = new("FoldSessions", 0, [0, 1]);
+    public static readonly PetSetting FoldClaude = new("FoldClaude", 0, [0, 1]);
+    public static readonly PetSetting FoldCodex = new("FoldCodex", 0, [0, 1]);
 
     public static bool TryRead(PetSetting setting, out int value)
     {

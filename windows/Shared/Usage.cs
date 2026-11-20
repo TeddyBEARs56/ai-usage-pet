@@ -303,6 +303,15 @@ public static class Fmt
         };
     }
 
+    /// 「12분」「1시간 5분」, 1분이 안 되면 null
+    public static string? Duration(DateTimeOffset since, DateTimeOffset now)
+    {
+        var minutes = (int)Math.Max(0, (now - since).TotalMinutes);
+        if (minutes < 1) return null;
+        if (minutes < 60) return T("{0}분", minutes);
+        return minutes % 60 == 0 ? T("{0}시간", minutes / 60) : T("{0}시간 {1}분", minutes / 60, minutes % 60);
+    }
+
     public static string Describe(string title, ProviderSnapshot snap, DateTimeOffset now)
     {
         var lines = new List<string>
@@ -1197,7 +1206,7 @@ public sealed class CodexReader
     }
 
     /// 오늘·어제 날짜 폴더의 rollout 기록, 최근 것부터
-    static List<(string Path, DateTime Mtime)> RecentRolloutFiles(DateTimeOffset now)
+    internal static List<(string Path, DateTime Mtime)> RecentRolloutFiles(DateTimeOffset now)
     {
         var files = new List<(string Path, DateTime Mtime)>();
         for (var back = 0; back <= 1; back++)
@@ -1639,7 +1648,15 @@ public static class Report
             Fmt.Describe(T("ChatGPT · 기록"), fromLog ?? new ProviderSnapshot { Message = T("최근 기록 없음") }, now),
             Fmt.Describe(T("ChatGPT · 서버"), codex.FromServer ?? new ProviderSnapshot { Message = codex.ServerError ?? T("실패") }, now),
             Fmt.Describe(T("ChatGPT · 표시"), codex.Current, now),
-        }));
+        }).Append(DescribeSessions(new SessionReader().Read(DateTimeOffset.Now), DateTimeOffset.Now)));
+    }
+
+    /// 「세션」 아래 한 줄씩(AIUsageStatus --print·--sessions)
+    public static string DescribeSessions(List<AgentSession> sessions, DateTimeOffset now)
+    {
+        var lines = new List<string> { T("세션") };
+        lines.AddRange(sessions.Count == 0 ? ["  " + T("열린 세션이 없습니다")] : sessions.Select(s => "  " + s.Describe(now)));
+        return string.Join("\n", lines);
     }
 }
 

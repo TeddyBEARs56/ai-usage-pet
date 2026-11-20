@@ -26,17 +26,19 @@ Claude 와 ChatGPT(Codex) 사용 한도를 화면 위에 계속 띄워 두는 �
 | Claude 5시간·주간 | 남은 비율과 초기화 시각(↺). 초록 50% 이상, 노랑 20% 이상, 빨강 20% 미만 — Claude Code 상태 표시줄과 같은 기준 |
 | ChatGPT 주간 | ChatGPT 플랜의 Codex 한도. 플랜에 5시간 한도가 있으면(Plus 등) 5시간 줄이 생긴다 |
 | 오른쪽 위 「방금·n분 전」 | 그 값을 마지막으로 받은 때 |
-| 세션(맥 판만) | 이 맥에서 연 Claude Code·Codex 세션이 진행 중인지, 답을 마쳤는지, 내 확인을 기다리는지. 자세한 것은 [mac/README.md](mac/README.md#세션-목록) |
+| 세션(맥 판, Windows 1.4.1 부터) | 이 컴퓨터에서 연 Claude Code·Codex 세션이 작업 중인지, 끝났는지, 내 입력을 기다리는지. 자세한 것은 [mac/README.md](mac/README.md#세션-목록)·[windows/README.md](windows/README.md#세션) |
 
 ChatGPT 대화(웹·앱) 자체의 한도는 밖에서 읽을 방법이 없어 Codex 한도만 보여 준다.
 
 창을 오른쪽 클릭해 「모양」에서 배경 투명도, 창 크기, 글자 크기를 각각 고른다. 선택은 다음 실행에도 유지된다(맥 1.7·Windows 1.4.0 부터).
 
+Windows 는 「모양 → 표시 방식」에서 「작업 표시줄 (간단 모드)」를 고르면 떠 있는 창 대신 작업 표시줄의 알림 영역(시계·트레이) 바로 왼쪽에 동그란 게이지만 한 줄로 보인다. 테두리 길이가 남은 비율, 가운데 숫자가 남은 %, 앞의 색 점이 회사(주황 Claude, 초록 ChatGPT)다. 마우스를 올리면 그 한도의 이름·남은 %·초기화 시각이 뜨고, 한 번 클릭하면 세션 패널이 열리고 닫히며, 오른쪽 클릭하면 같은 메뉴. 떠 있는 창과 작업 표시줄 사이는 오른쪽 두 번 클릭으로 오간다. 세션 줄을 누르면 그 대화(Claude·Codex 데스크톱 앱, 또는 터미널 창)가 열린다(Windows 1.4.1 부터). 자세한 것은 [Windows README](windows/README.md#작업-표시줄-간단-모드).
+
 ## 값의 출처(두 판 공통)
 
 - **Claude**: 세 곳(맥 판은 아래 두 곳)에서 읽고, 가장 나중에 받은 값을 쓴다. Claude Code 로그인 토큰은 읽지 않는다.
   - **`claude /usage`(Windows 1.3.2 부터)**: Codex 처럼 Claude Code 에게 직접 묻는다 — `claude -p "/usage" --output-format json --no-session-persistence` 를 창 없이 잠깐 띄운다(5초쯤). `/usage` 는 모델을 부르지 않는 Claude Code 안의 명령이라 한도를 쓰지 않고, 인증은 Claude Code 가 한다. 대화 기록도 남기지 않는다(`~/.cache/ai-usage/claude-usage` 폴더에서 띄우므로 `~/.claude.json` 에 그 폴더 항목 하나가 생긴다). 받은 값은 상태 표시줄 기록과 같은 모양으로 `~/.cache/ai-usage/claude/usage-command.json` 에 남겨 같은 규칙으로 합치고, 초기화 시각도 있다. 모델별 주간 한도(예: 「Current week (Fable)」)가 있으면 주간 아래에 그 모델 이름으로 한 줄 더 보인다(Windows 1.3.3 부터, 1시간 안에 받은 /usage 값일 때만).
-    - **언제 묻나**: 앱을 켤 때, 이 PC 에서 Claude Code 가 응답했을 때(CLI·데스크톱 앱 Code 탭 모두 — `~/.claude/projects` 의 대화 기록이 바뀌는 것을 지켜본다: 응답이 끝나고 5초 잠잠하면, 긴 작업이면 30초마다, 두 번 사이는 1분 이상), 그리고 5분마다(claude.ai 웹·모바일·데스크톱 앱 Chat 처럼 이 PC 에 흔적이 없는 사용 몫). 창을 두 번 누르거나 「지금 새로고침」 하면 바로.
+    - **언제 묻나**: 앱을 켤 때, 이 PC 에서 Claude Code 가 응답했을 때(CLI·데스크톱 앱 Code 탭 모두 — `~/.claude/projects` 의 대화 기록이 바뀌는 것을 지켜본다: 응답이 끝나고 5초 잠잠하면, 긴 작업이면 30초마다, 두 번 사이는 1분 이상), 그리고 5분마다(claude.ai 웹·모바일·데스크톱 앱 Chat 처럼 이 PC 에 흔적이 없는 사용 몫). 「지금 새로고침」 하면 바로.
     - **어느 claude 를 쓰나**: `~\.local\bin\claude.exe`·npm 의 `claude.cmd`·PATH, 없으면 Claude 데스크톱 앱이 품은 것(`Claude-Data\claude_<id>\claude-code\<버전>\…\claude.exe`, 가장 높은 버전) — 그래서 데스크톱 앱만 써도 된다.
     - **안전장치**: 답에 모델을 부른 흔적(`num_turns`·비용 > 0)이 있으면 값을 버리고 `~/.cache/ai-usage/claude-usage-disabled`를 남긴다. 이 파일을 지우면 다시 묻는다. 파일을 쓸 수 없으면 현재 프로세스에서 조회를 멈추고 진단에 저장 실패 이유를 표시한다.
     - **기록**: 값이 바뀌었거나 실패했을 때만 `~/.cache/ai-usage/claude-usage.log` 에 계기(시작·활동·5분·새로고침)와 함께 한 줄. 오른쪽 클릭 메뉴에 「Claude /usage 확인 <시각>」과 실패 이유, `AIUsageStatus.exe --print` 에 결과·걸린 시간·쓴 claude 경로가 나온다.
