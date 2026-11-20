@@ -138,6 +138,55 @@ static class Settings
 {
     const string Key = @"Software\AIUsage";
 
+    public sealed record PetSetting(string Key, int Default, int[] Values);
+    public static readonly PetSetting Background = new("petBackgroundLevel", 0, [0, 1, 2, 3]);
+    public static readonly PetSetting WindowSize = new("petWindowPercent", 100, [85, 100, 115, 130]);
+    public static readonly PetSetting TextSize = new("petTextPercent", 100, [90, 100, 115, 130]);
+    public static readonly PetSetting ShowModelLimits = new("ShowModelLimits", 1, [0, 1]);
+    public static readonly PetSetting ModelLimitAlerts = new("ModelLimitAlerts", 0, [0, 1]);
+
+    public static bool TryRead(PetSetting setting, out int value)
+    {
+        value = setting.Default;
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(Key);
+            if (key?.GetValue(setting.Key) is int n && setting.Values.Contains(n)) value = n;
+            return true;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            return false;
+        }
+    }
+
+    public static int Read(PetSetting setting)
+    {
+        TryRead(setting, out int value);
+        return value;
+    }
+
+    public static int Save(PetSetting setting, int value, int previous)
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.CreateSubKey(Key);
+            key.SetValue(setting.Key, value, RegistryValueKind.DWord);
+            return value;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            return TryRead(setting, out int stored) ? stored : previous;
+        }
+    }
+
+    public static void ClearPosition()
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(Key, writable: true);
+        key?.DeleteValue("Left", false);
+        key?.DeleteValue("Top", false);
+    }
+
     public static Point? LoadPosition()
     {
         using var key = Registry.CurrentUser.OpenSubKey(Key);
@@ -149,6 +198,20 @@ static class Settings
         using var key = Registry.CurrentUser.CreateSubKey(Key);
         key.SetValue("Left", point.X, RegistryValueKind.DWord);
         key.SetValue("Top", point.Y, RegistryValueKind.DWord);
+    }
+
+    public static bool LimitAlerts
+    {
+        get
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(Key);
+            return key?.GetValue("LimitAlerts") is not int v || v != 0;
+        }
+        set
+        {
+            using var key = Registry.CurrentUser.CreateSubKey(Key);
+            key.SetValue("LimitAlerts",value ? 1 : 0,RegistryValueKind.DWord);
+        }
     }
 
     public static bool InstallDeclined
@@ -172,16 +235,6 @@ static class Settings
         {
             using var key = Registry.CurrentUser.OpenSubKey(Key);
             return key?.GetValue("AutoUpdate") is not int v || v != 0;
-        }
-    }
-
-    /// `claude /usage` 로 Claude 한도를 묻기(값 ClaudeUsage). 값이 없으면 켬, 0 이면 끔.
-    public static bool ClaudeUsage
-    {
-        get
-        {
-            using var key = Registry.CurrentUser.OpenSubKey(Key);
-            return key?.GetValue("ClaudeUsage") is not int v || v != 0;
         }
     }
 

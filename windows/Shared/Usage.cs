@@ -3,7 +3,7 @@
 //
 // 값의 출처
 //   Claude  : Claude Code 상태 표시줄(AIUsageStatus --statusline)이 세션마다 남기는 ~/.cache/ai-usage/claude/<세션>.json
-//             + Claude 데스크톱 앱이 남기는 plan-usage-history.json(초기화 시각 없음). 둘 중 나중 값을 쓴다
+//             + claude /usage 직접 조회(usage-command.json) + 데스크톱 기록 plan-usage-history.json(초기화 시각 없음)
 //             (Claude Code 로그인 토큰은 읽지 않는다)
 //   ChatGPT : `codex app-server` 의 account/rateLimits/read(5분마다) + ~/.codex/sessions 기록에 찍히는 최신 한도
 
@@ -13,6 +13,7 @@ using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using static AIUsage.L10n;
 
@@ -150,7 +151,11 @@ public sealed record LimitWindow(string Id, int Minutes, double UsedPercent, Dat
 
 public sealed class ProviderSnapshot
 {
+    internal List<UsageEvent> Observations { get; } = new();
+    // Only the alert evaluator consumes these. History always receives the overall windows.
+    internal Dictionary<string, UsageEvent> ModelObservations { get; } = new(StringComparer.Ordinal);
     public List<LimitWindow> Windows { get; } = new();
+    public IEnumerable<LimitWindow> VisibleWindows(bool showModels) => Windows.Where(w => showModels || w.Name == null);
     public DateTimeOffset? ObservedAt { get; set; }
     public string? Plan { get; set; }
     public string? Message { get; set; }
@@ -250,7 +255,7 @@ static class J
             ? value.GetString() : null;
 
     public static DateTimeOffset? Epoch(double? seconds) =>
-        seconds is { } s && s > 0 ? DateTimeOffset.FromUnixTimeMilliseconds((long)(s * 1000)) : null;
+        seconds is { } s && s > 0 && s * 1000 <= DateTimeOffset.MaxValue.ToUnixTimeMilliseconds() ? DateTimeOffset.FromUnixTimeMilliseconds((long)(s * 1000)) : null;
 }
 
 public static class Fmt
@@ -282,7 +287,7 @@ public static class Fmt
         if (t <= now) return T("초기화됨");
         var local = t.ToLocalTime();
         if (local.Date == now.ToLocalTime().Date) return local.ToString("HH:mm", L10n.Culture);
-        return local.ToString((t - now).TotalDays < 6 ? "ddd HH:mm" : "M'/'d HH:mm", L10n.Culture);
+        return local.ToString((t - now).TotalDays < 6 ? "ddd HH:mm" : "M'/'d", L10n.Culture);
     }
 
     public static string AgeText(DateTimeOffset? at, DateTimeOffset now)
@@ -348,11 +353,12 @@ public sealed class ClaudeReader
                 try
                 {
                     using var doc = JsonDocument.Parse(File.ReadAllBytes(path));
+                    if (mtime != File.GetLastWriteTimeUtc(path)) continue; // replaced during the read
                     limits = FromRateLimits(doc.RootElement);
                     owner = J.Str(doc.RootElement, "account");
                 }
                 catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException) { continue; }
-                var command = Path.GetFileName(path) == ClaudeUsageCommand.FileName;
+                var command = ClaudeUsageCommand.IsResultFile(path);
                 cache[path] = (mtime, limits, owner, command);
                 entries.Add((mtime, limits, owner, command));
             }
@@ -365,12 +371,30 @@ public sealed class ClaudeReader
         var tagged = me is not null && entries.Any(e => e.Account == me);
         entries = entries.Where(e => e.Account is { } account
             ? account == me  // 로그아웃이면 어느 계정 것도 아니다
-            : !tagged && new DateTimeOffset(e.Mtime, TimeSpan.Zero) >= since).ToList();
+            : !e.Command && !tagged && new DateTimeOffset(e.Mtime, TimeSpan.Zero) >= since).ToList();
 
         // Claude Code 를 안 쓰는 동안에는 데스크톱 앱 기록이 더 새것일 수 있다(같은 계정일 때만)
         DateTimeOffset? statusAt = entries.Count > 0 ? new DateTimeOffset(entries.Max(e => e.Mtime), TimeSpan.Zero) : null;
         var desktop = ClaudeDesktopUsage.Latest(ClaudeCodeAccount.Organization(), now);
         var snap = new ProviderSnapshot();
+        foreach (var entry in entries)
+        {
+            foreach (var (key, minutes) in new[] { ("five_hour", 300), ("seven_day", 10080) })
+            {
+                if (!entry.Limits.TryGetValue(key, out var value)) continue;
+                var w = new LimitWindow(key,minutes,value.Used,J.Epoch(value.Reset));
+                snap.Observations.AddRange(UsageEvent.From([w], new DateTimeOffset(entry.Mtime), "claude", me,
+                    entry.Command ? ClaudeUsageCommand.HistorySource : "claude-session"));
+            }
+        }
+        if (desktop is { Org:not null } sample && sample.Org == ClaudeCodeAccount.Organization() && sample.At >= since)
+        {
+            foreach (var (key,used) in sample.Used)
+            {
+                var w = new LimitWindow(key,key == "five_hour" ? 300 : 10080,used,null);
+                snap.Observations.AddRange(UsageEvent.From(new[] { w },sample.At,"claude",me,"claude-desktop"));
+            }
+        }
         bool usedStatus = false, usedDesktop = false;
         foreach (var (key, minutes) in new[] { ("five_hour", 300), ("seven_day", 10_080) })
         {
@@ -381,7 +405,7 @@ public sealed class ClaudeReader
             {
                 reset = found.Max(f => f.Reset);
                 var latest = reset;
-                used = found.Where(f => f.Reset >= latest - 600).Max(f => f.Used);
+                used = found.Where(f => f.Reset >= latest - Generations.Tolerance / 1000.0).Max(f => f.Used);
             }
             var fromDesktop = false;
             if (desktop is { } d && d.Used.TryGetValue(key, out var value) && (used is null || d.At > (statusAt ?? DateTimeOffset.MinValue)))
@@ -405,10 +429,20 @@ public sealed class ClaudeReader
         if (usedDesktop && desktop is { } dd) seen.Add(dd.At);
         // 모델별 주간 한도(예: Fable)는 `claude /usage` 에만 있다: 1시간 안에 받은 가장 새 /usage 기록의 것을 주간 아래에 붙인다
         var latestCommand = entries.Where(e => e.Command).OrderByDescending(e => e.Mtime).FirstOrDefault();
-        if (latestCommand.Limits is { } commandLimits && now.UtcDateTime - latestCommand.Mtime <= TimeSpan.FromHours(1))
+        if (latestCommand.Limits is { } commandLimits && latestCommand.Mtime <= now.UtcDateTime)
+        {
+            var at = new DateTimeOffset(latestCommand.Mtime);
             foreach (var (key, (used, reset)) in commandLimits.Where(kv => kv.Key.StartsWith(ModelPrefix, StringComparison.Ordinal))
                                                               .OrderBy(kv => kv.Key, StringComparer.Ordinal))
-                snap.Windows.Add(new LimitWindow(key, 10_080, used, J.Epoch(reset), key[ModelPrefix.Length..]));
+            {
+                var name = key[ModelPrefix.Length..];
+                var window = new LimitWindow(key, 10080, used, J.Epoch(reset), name);
+                if (UsageEvent.From([window], at, "claude", me, ClaudeUsageCommand.HistorySource).FirstOrDefault() is { } observation)
+                    snap.ModelObservations[name] = observation;
+                if (now - at <= TimeSpan.FromHours(1)) snap.Windows.Add(window);
+            }
+            if (snap.Windows.Any(w => w.Name != null)) seen.Add(at);
+        }
         snap.ObservedAt = seen.Count > 0 ? seen.Max() : null;
         // 가장 새 기록이 `claude /usage` 로 받은 것이면 그렇게 적는다
         var statusName = entries.Count > 0 && entries.MaxBy(e => e.Mtime).Command ? T("Claude Code /usage") : T("Claude Code 상태 표시줄");
@@ -449,6 +483,9 @@ public sealed record ClaudeUsageResult(Dictionary<string, (double Used, double R
 public static class ClaudeUsageCommand
 {
     public const string FileName = "usage-command.json";
+    internal const string HistorySource = "claude-usage";
+    internal static bool IsResultFile(string path) => string.Equals(Path.GetFileName(path), FileName,
+        OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
     static string CacheDir => Path.Combine(Paths.Home, ".cache", "ai-usage");
     public static string ResultPath => Path.Combine(Paths.ClaudeCache, FileName);
     public static string LogPath => Path.Combine(CacheDir, "claude-usage.log");
@@ -462,6 +499,7 @@ public static class ClaudeUsageCommand
     static readonly TimeSpan Timeout = TimeSpan.FromSeconds(60);
 
     static readonly SemaphoreSlim gate = new(1, 1);
+    static volatile string? processStopReason;
     static string? lastLoggedError;
     static Dictionary<string, (double Used, double Reset)>? lastLoggedLimits;
     public static DateTimeOffset? LastCheckedAt { get; private set; }
@@ -470,7 +508,20 @@ public static class ClaudeUsageCommand
     /// 꺼져 있으면 그 이유. AIUSAGE_CLAUDE_USAGE=0 이거나, /usage 가 모델을 부른 적이 있어 스스로 껐을 때
     public static string? DisabledReason()
     {
+        if (processStopReason is { } reason) return reason;
         if (Environment.GetEnvironmentVariable("AIUSAGE_CLAUDE_USAGE") == "0") return T("꺼 둠(AIUSAGE_CLAUDE_USAGE=0)");
+        if (OperatingSystem.IsWindows())
+        {
+            try
+            {
+                using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\AIUsage");
+                if (key?.GetValue("ClaudeUsage") is 0) return T("꺼 둠(ClaudeUsage=0)");
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+            {
+                return T("/usage 설정을 읽지 못했습니다: {0}", e.Message);
+            }
+        }
         if (File.Exists(DisabledPath)) return T("꺼짐 — /usage 가 모델을 불러 멈췄습니다({0} 를 지우면 다시 켜짐)", DisabledPath);
         return null;
     }
@@ -537,6 +588,8 @@ public static class ClaudeUsageCommand
         if (!await gate.WaitAsync(0)) return null;
         try
         {
+            if (DisabledReason() is { } stopped) return LastError = stopped;
+            CleanOldTemps();
             var watch = Stopwatch.StartNew();
             var before = ClaudeCodeAccount.Identity();
             var result = await RunAsync();
@@ -549,7 +602,11 @@ public static class ClaudeUsageCommand
                     Directory.CreateDirectory(CacheDir);
                     File.WriteAllText(DisabledPath, $"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss} /usage 가 모델을 불렀다(num_turns·비용 > 0). 이 파일을 지우면 다시 묻는다.\n");
                 }
-                catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                    error = T("/usage 가 모델을 불러 이 실행에서 중지했습니다. 중지 파일을 저장하지 못했습니다: {0}", e.Message);
+                    processStopReason = error;
+                }
             }
             else if (error is null && result.Limits is { } limits)
             {
@@ -678,7 +735,8 @@ public static class ClaudeUsageCommand
                     key = ClaudeReader.ModelPrefix + scope;
                 }
             }
-            var used = double.Parse(match.Groups["used"].Value, CultureInfo.InvariantCulture);
+            if (!double.TryParse(match.Groups["used"].Value, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var used)
+                || !double.IsFinite(used)) continue;
             var reset = match.Groups["reset"].Success ? ParseReset(match.Groups["reset"].Value, now) ?? 0 : 0;
             result[key] = (used, reset);
         }
@@ -726,7 +784,7 @@ public static class ClaudeUsageCommand
 
         DateTimeOffset? At(int y, int mo, int d)
         {
-            if (mo is < 1 or > 12 || d < 1 || d > DateTime.DaysInMonth(y, mo)) return null;
+            if (y is < 1 or > 9999 || mo is < 1 or > 12 || d < 1 || d > DateTime.DaysInMonth(y, mo)) return null;
             var wall = new DateTime(y, mo, d, hour, minute, 0, DateTimeKind.Unspecified);
             return new DateTimeOffset(wall, zone.GetUtcOffset(wall));
         }
@@ -739,6 +797,7 @@ public static class ClaudeUsageCommand
     /// 상태 표시줄 기록과 같은 모양으로 남긴다(바꿔치기로 써서 읽는 쪽이 반쯤 쓴 파일을 보지 않게)
     static string? Save(Dictionary<string, (double Used, double Reset)> limits, string account)
     {
+        var temp = Path.Combine(Paths.ClaudeCache, $".usage-command.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp");
         try
         {
             Directory.CreateDirectory(Paths.ClaudeCache);
@@ -753,8 +812,8 @@ public static class ClaudeUsageCommand
             if (models.Count > 0) node["models"] = models;
             node["account"] = account;
             node["source"] = "usage";
-            var temp = Path.Combine(Paths.ClaudeCache, "." + FileName + ".tmp");
             File.WriteAllText(temp, node.ToJsonString());
+            if (ClaudeCodeAccount.Identity() != account) return T("묻는 동안 계정이 바뀌었습니다");
             File.Move(temp, ResultPath, overwrite: true);
             return null;
         }
@@ -762,6 +821,23 @@ public static class ClaudeUsageCommand
         {
             return T("결과를 남기지 못했습니다: {0}", e.Message);
         }
+        finally
+        {
+            try { File.Delete(temp); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        }
+    }
+
+    static void CleanOldTemps()
+    {
+        try
+        {
+            var cutoff = DateTime.UtcNow.AddDays(-1);
+            foreach (var path in Directory.EnumerateFiles(Paths.ClaudeCache, ".usage-command.*.tmp"))
+                if (Regex.IsMatch(Path.GetFileName(path), @"^\.usage-command\.[0-9]+\.[0-9a-f]{32}\.tmp$")
+                    && File.GetLastWriteTimeUtc(path) < cutoff) File.Delete(path);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
     }
 
     /// 두 결과가 같은 값인지. 서버가 주는 초기화 시각은 같은 창이어도 1분쯤 오가므로(15:09 ↔ 15:10) 2분 안의 차이는 같은 것으로 본다.
@@ -872,7 +948,7 @@ public sealed class ClaudeActivityWatcher : IDisposable
     public void Dispose() => watcher?.Dispose();
 }
 
-public sealed record DesktopUsageSample(DateTimeOffset At, Dictionary<string, double> Used);
+public sealed record DesktopUsageSample(DateTimeOffset At, Dictionary<string, double> Used, string? Org);
 
 /// Claude 데스크톱 앱이 사용량을 서버에서 받을 때마다 남기는 기록(로그인 정보 없이 읽는다).
 /// 앱을 쓰는 동안에만 쌓이고, 4.5분에 한 번까지만 남으며, 초기화 시각은 없다. 공식 문서에 없는 파일이라 바뀔 수 있다.
@@ -900,7 +976,7 @@ public static class ClaudeDesktopUsage
                     var used = new Dictionary<string, double>();
                     if (J.Number(u, "fh") is { } fh) used["five_hour"] = fh;
                     if (J.Number(u, "sd") is { } sd) used["seven_day"] = sd;
-                    if (used.Count > 0) best = new DesktopUsageSample(at, used);
+                    if (used.Count > 0) best = new DesktopUsageSample(at, used, J.Str(sample,"org"));
                 }
             }
             catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException) { }
@@ -1022,24 +1098,22 @@ public sealed class CodexReader
     /// Codex 를 쓰는 동안 기록 파일에 찍히는 최신 한도(파일이 바뀌었을 때만 다시 읽는다).
     /// 지금 로그인한 계정(~/.codex/auth.json 의 account_id)이 만든 기록만 쓴다. 계정이 바뀌었으면 true —
     /// 앞 계정 값은 버렸으니 부른 쪽이 서버에 바로 다시 묻는다(맥 판과 같다).
-    public bool ReadLog()
+    public bool ReadLog(DateTimeOffset? at = null)
     {
+        var now = at ?? DateTimeOffset.Now;
         var me = CurrentAccount();
         var switched = false;
         if (!accountKnown || me != account)
         {
             switched = accountKnown && account is not null;  // 다른 계정으로 바꿨거나 로그아웃
-            if (switched)
-            {
-                FromLog = null;
-                FromServer = null;
-                ServerError = null;
-            }
+            FromLog = null;
+            FromServer = null;
+            ServerError = null;
             account = me;
             accountKnown = true;
         }
-        var since = AccountSwitch.Since("codex", me, DateTimeOffset.Now);
-        var files = RecentRolloutFiles(DateTimeOffset.Now);
+        var since = AccountSwitch.Since("codex", me, now);
+        var files = RecentRolloutFiles(now);
         if (files.Count == 0) return switched;
         var key = $"{files[0].Path}|{files[0].Mtime.Ticks}|{me}";
         if (key == lastLogKey) return switched;
@@ -1056,7 +1130,7 @@ public sealed class CodexReader
             {
                 continue;  // 계정이 안 적힌 기록은 계정을 바꾼 뒤 것만
             }
-            if (LastLimits(file.Path, file.Mtime) is { } snap)
+            if (LastLimits(file.Path, file.Mtime, owner) is { } snap)
             {
                 FromLog = snap;
                 return switched;
@@ -1067,7 +1141,7 @@ public sealed class CodexReader
     }
 
     /// 지금 Codex 에 로그인한 ChatGPT 계정(auth.json 의 tokens.account_id 만 읽는다). API 키 로그인이면 null
-    static string? CurrentAccount()
+    internal static string? CurrentAccount()
     {
         try
         {
@@ -1079,28 +1153,27 @@ public sealed class CodexReader
         catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException) { return null; }
     }
 
-    static readonly Regex CreatorPattern = new("\"creator_account_id\"\\s*:\\s*\"([^\"]+)\"", RegexOptions.CultureInvariant);
-
-    /// 기록 첫 줄(session_meta)의 creator_account_id — 그 기록을 만든 계정. 첫 줄은 길 수 있어 앞 1MB 에서 찾는다
     static string? CreatorAccount(string path)
     {
         try
         {
-            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            var head = new byte[(int)Math.Min(stream.Length, 1_000_000)];
-            stream.ReadExactly(head);
-            var newline = Array.IndexOf(head, (byte)'\n');
-            var first = Encoding.UTF8.GetString(head, 0, newline >= 0 ? newline : head.Length);
-            return CreatorPattern.Match(first) is { Success: true } match ? match.Groups[1].Value : null;
+            using var stream = new FileStream(path,FileMode.Open,FileAccess.Read,FileShare.ReadWrite | FileShare.Delete);
+            using var reader = new StreamReader(stream);
+            using var header = JsonDocument.Parse(reader.ReadLine() ?? "");
+            return J.Str(header.RootElement,"type") == "session_meta" && J.Obj(header.RootElement,"payload") is { } meta
+                ? J.Str(meta,"creator_account_id") : null;
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return null; }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException) { return null; }
     }
 
-    public void ApplyServer((ProviderSnapshot? Snap, string? Error) result)
+    public bool ApplyServer((ProviderSnapshot? Snap, string? Error) result, string? owner)
     {
+        if (owner != CurrentAccount()) { ReadLog(); return false; }
         ServerCheckedAt = DateTimeOffset.Now;
         if (result.Snap is { } snap)
         {
+            if (snap.ObservedAt is { } at)
+                snap.Observations.AddRange(UsageEvent.From(snap.Windows,at,"codex",owner,"codex-server"));
             FromServer = snap;
             ServerError = null;
         }
@@ -1108,9 +1181,10 @@ public sealed class CodexReader
         {
             ServerError = result.Error;
         }
+        return true;
     }
 
-    static List<LimitWindow> WindowsFrom(JsonElement limits)
+    internal static List<LimitWindow> WindowsFrom(JsonElement limits)
     {
         var windows = new List<LimitWindow>();
         foreach (var key in new[] { "primary", "secondary" })
@@ -1142,7 +1216,7 @@ public sealed class CodexReader
 
     static readonly byte[] Marker = "\"rate_limits\""u8.ToArray();
 
-    static ProviderSnapshot? LastLimits(string path, DateTime mtime)
+    static ProviderSnapshot? LastLimits(string path, DateTime mtime, string? owner)
     {
         byte[] data;
         try
@@ -1177,6 +1251,8 @@ public sealed class CodexReader
                     Plan = Fmt.PlanName(J.Str(limits, "plan_type")),
                 };
                 snap.Windows.AddRange(windows);
+                if (J.Epoch(J.Number(doc.RootElement,"timestamp")) is { } eventAt)
+                    snap.Observations.AddRange(UsageEvent.From(windows,eventAt,"codex",owner,"codex-rollout"));
                 return snap;
             }
             catch (JsonException) { }
@@ -1524,8 +1600,12 @@ public static class Report
         var now = DateTimeOffset.Now;
         var codex = new CodexReader();
         codex.ReadLog();
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            var owner = CodexReader.CurrentAccount();
+            if (codex.ApplyServer(await CodexReader.FetchServerAsync(),owner)) break;
+        }
         var fromLog = codex.FromLog;
-        codex.ApplyServer(await CodexReader.FetchServerAsync());
         var usageWatch = Stopwatch.StartNew();
         var usageError = await ClaudeUsageCommand.FetchAsync("확인(--print)");
         var usageSeconds = usageWatch.Elapsed.TotalSeconds;
@@ -1560,5 +1640,779 @@ public static class Report
             Fmt.Describe(T("ChatGPT · 서버"), codex.FromServer ?? new ProviderSnapshot { Message = codex.ServerError ?? T("실패") }, now),
             Fmt.Describe(T("ChatGPT · 표시"), codex.Current, now),
         }));
+    }
+}
+
+// Weekly source history. All on-disk timestamps are UTC Unix milliseconds.
+internal sealed record UsageAccount(string? Claude, string? Org, string? Codex, long Since)
+{
+    internal static string? Hash(string provider, string? id) => string.IsNullOrEmpty(id) ? null
+        : Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(provider + "\0" + id)));
+    internal Dictionary<string, string> Keys()
+    {
+        var keys = new Dictionary<string, string>();
+        if (Hash("claude", Claude) is { } c) keys["claude"] = c;
+        if (Hash("codex", Codex) is { } x) keys["codex"] = x;
+        return keys;
+    }
+    internal static UsageAccount Read(long now)
+    {
+        var id = ClaudeCodeAccount.Identity();
+        long since = 0;
+        var root = UsageHistory.ReadObject(Path.Combine(UsageHistory.DirectoryPath, "accounts.json"));
+        if (root is { } obj && J.Obj(obj, "claude") is { } saved)
+            since = J.Str(saved, "id") == id ? (long)((J.Number(saved, "since") ?? 0) * 1000) : now;
+        return new(id, ClaudeCodeAccount.Organization(), CodexReader.CurrentAccount(), since);
+    }
+}
+
+internal sealed record UsageEvent(string Provider, string Account, int Minutes, long AtMs,
+                                  [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] long? ResetMs, double Used,
+                                  string Source, string Quality, string? Slot = null, int V = 1)
+{
+    internal bool Valid => V == 1 && Provider is "claude" or "codex" && Account?.Length == 64 && Minutes >= 0 && (Minutes > 0 || ResetMs.HasValue)
+        && AtMs is > 0 and <= 253402300799999 && ResetMs is not (<= 0 or > 253402300799999) && Used is >= 0 and <= 100 && Quality is "rough" or "observed";
+    internal static List<UsageEvent> LiveRows(ProviderSnapshot claude, CodexReader codex) =>
+        claude.Observations.Concat(codex.FromLog?.Observations ?? []).Concat(codex.FromServer?.Observations ?? []).ToList();
+    internal UsageEvent Key => this with { Slot = null, Quality = "" };
+    internal static IOrderedEnumerable<UsageEvent> Ordered(IEnumerable<UsageEvent> rows) =>
+        rows.OrderBy(e => e.AtMs).ThenBy(e => e.Used).ThenBy(e => e.ResetMs ?? long.MaxValue)
+            .ThenBy(e => e.Quality != "observed").ThenBy(e => e.Source, StringComparer.Ordinal);
+    internal static IEnumerable<UsageEvent> From(IEnumerable<LimitWindow> windows, DateTimeOffset at, string provider, string? id, string source)
+    {
+        if (UsageAccount.Hash(provider, id) is not { } key) yield break;
+        foreach (var w in windows)
+        {
+            var r = w.ResetsAt?.ToUnixTimeMilliseconds();
+            if (source == ClaudeUsageCommand.HistorySource && r > at.ToUnixTimeMilliseconds() + w.Minutes * 60_000L) r = null;
+            var e = new UsageEvent(provider, key, w.Minutes, at.ToUnixTimeMilliseconds(), r > 0 ? r : null, w.UsedPercent,
+                source, provider == "claude" && r is not > 0 ? "rough" : "observed", w.Id);
+            if (e.Valid) yield return e;
+        }
+    }
+}
+
+internal sealed class SourceScan
+{
+    Dictionary<string, (long Size, long Ticks)> stamps = new();
+    UsageAccount? account;
+    internal SourceScan Copy() => new() { stamps = new(stamps), account = account };
+    internal List<UsageEvent> Read(UsageAccount user, long now)
+    {
+        if (account != user) { stamps.Clear(); account = user; }
+        var rows = new List<UsageEvent>();
+        void Scan(string path, Func<FileInfo, bool> read)
+        {
+            var start = rows.Count;
+            var accepted = false;
+            try
+            {
+                var file = new FileInfo(path);
+                if (!file.Exists) return;
+                var before = (file.Length, file.LastWriteTimeUtc.Ticks);
+                if (stamps.TryGetValue(path, out var stamp) && stamp == before) return;
+                var complete = read(file);
+                file.Refresh();
+                accepted = file.Exists && before == (file.Length, file.LastWriteTimeUtc.Ticks);
+                if (accepted && complete) stamps[path] = before;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or ArgumentOutOfRangeException) { }
+            finally { if (!accepted) rows.RemoveRange(start,rows.Count-start); }
+        }
+        var options = new EnumerationOptions { IgnoreInaccessible = true, RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint };
+        var keys = user.Keys();
+        if (keys.TryGetValue("claude", out var key))
+        {
+            if (Directory.Exists(Paths.ClaudeCache))
+                foreach (var path in Directory.EnumerateFiles(Paths.ClaudeCache, "*.json").Where(p => !Path.GetFileName(p).StartsWith('.')))
+                    Scan(path, f =>
+                    {
+                        var at = new DateTimeOffset(f.LastWriteTimeUtc).ToUnixTimeMilliseconds();
+                        if (at < now - 8 * UsageHistory.Day) return true;
+                        if (at > now || UsageHistory.ReadObject(path) is not { } obj) return false;
+                        bool command = ClaudeUsageCommand.IsResultFile(path);
+                        if (J.Str(obj, "account") is { } id ? id != user.Claude : command || at < user.Since) return true;
+                        if (J.Obj(obj, "seven_day") is { } w && J.Number(w, "used_percentage") is { } used)
+                        {
+                            var window = new LimitWindow("seven_day", 10080, used, J.Epoch(J.Number(w, "resets_at")));
+                            rows.AddRange(UsageEvent.From([window], new DateTimeOffset(f.LastWriteTimeUtc), "claude", user.Claude,
+                                command ? ClaudeUsageCommand.HistorySource : "claude-session"));
+                        }
+                        return true;
+                    });
+            foreach (var path in Paths.ClaudeDesktopHistory())
+                Scan(path, _ =>
+                {
+                    if (UsageHistory.ReadObject(path) is not { } root || !root.TryGetProperty("samples", out var samples)
+                        || samples.ValueKind != JsonValueKind.Array) return false;
+                    foreach (var s in samples.EnumerateArray())
+                    {
+                        if (user.Org is null || J.Str(s, "org") != user.Org || J.Number(s, "t") is not { } at || at < user.Since
+                            || J.Number(J.Obj(s, "u") ?? s, "sd") is not { } used) continue;
+                        rows.Add(new("claude", key, 10080, (long)at, null, used, "claude-desktop", "rough", "seven_day"));
+                    }
+                    return true;
+                });
+        }
+        if (!string.IsNullOrEmpty(user.Codex) && Directory.Exists(Paths.CodexSessions))
+            foreach (var path in Directory.EnumerateFiles(Paths.CodexSessions, "rollout-*.jsonl", options))
+                Scan(path, _ =>
+                {
+                    using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                    if (stream.Length == 0) return false;
+                    stream.Seek(-1, SeekOrigin.End);
+                    var complete = stream.ReadByte() == '\n';
+                    stream.Position = 0;
+                    using var reader = new StreamReader(stream);
+                    using var header = JsonDocument.Parse(reader.ReadLine() ?? "");
+                    if (J.Str(header.RootElement, "type") != "session_meta") return false;
+                    if (J.Obj(header.RootElement, "payload") is not { } meta || J.Str(meta, "creator_account_id") != user.Codex) return true;
+                    while (reader.ReadLine() is { } line)
+                    {
+                        if (!line.Contains("\"rate_limits\"", StringComparison.Ordinal)) continue;
+                        if (!complete && reader.EndOfStream) break;
+                        try
+                        {
+                            using var doc = JsonDocument.Parse(line);
+                            var root = doc.RootElement;
+                            if (J.Epoch(J.Number(root, "timestamp")) is not { } t || t.ToUnixTimeMilliseconds() < now - 35 * UsageHistory.Day
+                                || J.Obj(root, "payload") is not { } payload || J.Obj(payload, "rate_limits") is not { } limits
+                                || J.Str(limits, "limit_id") is not (null or "codex")) continue;
+                            rows.AddRange(UsageEvent.From(CodexReader.WindowsFrom(limits).Where(w => w.Minutes == 10080), t, "codex", user.Codex, "codex-rollout"));
+                        }
+                        catch (JsonException) { }
+                    }
+                    return complete;
+                });
+        return rows.Where(e => e.Valid && e.AtMs <= now && e.AtMs >= now - 35 * UsageHistory.Day).ToList();
+    }
+}
+
+internal static class Generations
+{
+    internal const long Tolerance = 600_000;
+    static long? Nearest(IEnumerable<long> choices, long t) =>
+        choices.OrderBy(r => Math.Abs(r-t)).ThenBy(r => r).Cast<long?>().FirstOrDefault();
+
+    internal static Dictionary<long,long> Anchors(IEnumerable<UsageEvent> ordered, long? seed = null)
+    {
+        var anchors = new List<long>();
+        if (seed.HasValue) anchors.Add(seed.Value);
+        var mapping = new Dictionary<long,long>();
+        foreach (var r in ordered.Where(e => e.ResetMs.HasValue).Select(e => e.ResetMs!.Value).Distinct())
+        {
+            if (Nearest(anchors,r) is { } a && Math.Abs(a-r) <= Tolerance) mapping[r] = a;
+            else { anchors.Add(r); mapping[r] = r; }
+        }
+        return mapping;
+    }
+
+    internal static Dictionary<long, List<UsageEvent>> Group(IEnumerable<UsageEvent> input)
+    {
+        var events = UsageEvent.Ordered(input).ToList();
+        var mapping = Anchors(events);
+        var anchors = mapping.Values.Distinct().ToList();
+        var result = new Dictionary<long, List<UsageEvent>>();
+        long unknown = 0;
+        double? previousDesktop = null;
+        foreach (var row in events)
+        {
+            var key = unknown;
+            if (row.ResetMs is { } reset) key = mapping[reset];
+            else if (row.Provider == "claude" && Nearest(mapping.Keys, row.AtMs) is { } r)
+            {
+                var end = r + ((long)Math.Floor((double)(row.AtMs-r)/UsageHistory.Week)+1)*UsageHistory.Week;
+                key = Nearest(mapping.Keys, end) is { } measured && Math.Abs(measured-end) <= Tolerance ? mapping[measured] : end;
+            }
+            else if (row.Provider == "claude" && row.Source == "claude-desktop")
+            {
+                if (previousDesktop - row.Used >= 20) unknown--;
+                previousDesktop = row.Used;
+                key = unknown;
+            }
+            else if (row.Provider == "codex")
+            {
+                var possible = anchors.Where(a => a-UsageHistory.Week <= row.AtMs && row.AtMs < a).ToList();
+                if (possible.Count == 1) key = possible[0];
+            }
+            if (!result.TryGetValue(key, out var group)) result[key] = group = new();
+            group.Add(row);
+        }
+        return result;
+    }
+}
+
+internal sealed record TrendDay(string Date, [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] double? Used, bool Rough = false, bool Reset = false);
+internal sealed record TrendPoint(long AtMs, double Used);
+internal sealed record TrendWeek(long StartMs, long ResetMs, double Used, List<TrendPoint> Points, long? EndMs, double? EndUsed);
+internal sealed record TrendResult([property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] TrendWeek? Week, List<TrendDay> Days, int AverageDays, [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] double? Average, [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] TrendDay? Best)
+{
+    internal static Dictionary<string, TrendResult> Calculate(IEnumerable<UsageEvent> rows, UsageAccount user, long now)
+    {
+        var keys = user.Keys();
+        return new[] { "claude", "codex" }.ToDictionary(p => p, p => Build(rows.Where(e => e.Provider == p &&
+            e.Account == keys.GetValueOrDefault(p) && e.Minutes == 10080 && e.AtMs >= now-35*UsageHistory.Day && e.AtMs <= now).ToList(), now));
+    }
+    static TrendResult Build(List<UsageEvent> rows, long now)
+    {
+        static DateTime Local(long t) => DateTimeOffset.FromUnixTimeMilliseconds(t).LocalDateTime.Date;
+        static string Day(DateTime date) => date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        var groups = Generations.Group(rows);
+        var first = rows.Count == 0 ? DateTime.MaxValue : Local(rows.Min(r => r.AtMs));
+        var days = Enumerable.Range(-27,28).Select(i => Local(now).AddDays(i)).Select(d => new TrendDay(Day(d), d >= first ? 0 : null)).ToList();
+        var indices = days.Select((d,i) => (d.Date,i)).ToDictionary(t => t.Date,t => t.i);
+        var boundaries = new List<(long Key, long? End, long First, bool Known)>();
+        foreach (var (key, events) in groups)
+        {
+            var reset = events.LastOrDefault(e => e.ResetMs.HasValue)?.ResetMs;
+            boundaries.Add((key, reset ?? (key > 0 ? key : null), events[0].AtMs, reset.HasValue));
+            var confirmed = new Dictionary<DateTime,double>();
+            var rough = new HashSet<UsageEvent>();
+            foreach (var batch in events.GroupBy(e => e.AtMs).Reverse())
+            {
+                var d = Local(batch.Key);
+                var observed = batch.Where(e => e.Quality == "observed").Select(e => e.Used).ToHashSet();
+                foreach (var e in batch.Where(e => e.Quality == "rough" && e.Used > confirmed.GetValueOrDefault(d,-1) && !observed.Contains(e.Used)))
+                    rough.Add(e);
+                if (observed.Count > 0) confirmed[d] = Math.Max(confirmed.GetValueOrDefault(d),observed.Max());
+            }
+            double high = 0;
+            foreach (var e in events.Where(e => e.Used > high))
+            {
+                if (indices.TryGetValue(Day(Local(e.AtMs)), out var idx))
+                {
+                    var d = days[idx];
+                    days[idx] = d with { Used = (d.Used ?? 0) + (e.Used-high), Rough = d.Rough || rough.Contains(e) };
+                }
+                high = e.Used;
+            }
+        }
+        boundaries = boundaries.OrderBy(b => b.Key > 0 ? b.Key-UsageHistory.Week : b.First).ThenBy(b => b.Key).ToList();
+        for (var i = 1; i < boundaries.Count; i++)
+        {
+            var old = boundaries[i-1];
+            if (boundaries[i].End is not { } end) continue;
+            if (rows[0].Provider == "claude" && old.End is { } prev && Math.Abs(end-prev-UsageHistory.Week) > Generations.Tolerance) continue;
+            if (indices.TryGetValue(Day(Local(Math.Min(old.End ?? end,end-UsageHistory.Week))),out var idx))
+                days[idx] = days[idx] with { Reset = true };
+        }
+        var recent = days.TakeLast(7).Where(d => d.Used.HasValue).ToList();
+        var best = days.Where(d => !d.Rough && d.Used > 0).OrderByDescending(d => d.Used).FirstOrDefault();
+        TrendWeek? week = null;
+        var b = boundaries.LastOrDefault(b => b.Known);
+        if (b.End is { } r && r > now && r-UsageHistory.Week <= now)
+        {
+            var start = r-UsageHistory.Week;
+            var points = new List<TrendPoint>();
+            foreach (var e in groups[b.Key].Where(e => e.AtMs >= start))
+                if (points.Count == 0 || e.Used > points[^1].Used) points.Add(new(e.AtMs,e.Used));
+            if (points.Count > 0)
+            {
+                var used = points[^1].Used;
+                double? projected = now > start ? used*UsageHistory.Week/(now-start) : null;
+                long? end = projected is null ? null : projected > 100 ? start+(long)((double)(now-start)*100/used) : r;
+                week = new(start,r,used,points,end,projected is { } v ? Math.Min(100,v) : null);
+            }
+        }
+        return new(week,days,recent.Count,recent.Average(d => d.Used),best);
+    }
+}
+
+internal sealed class UsageHistory
+{
+    internal const long Day = 86_400_000, Week = Day*7;
+    internal static string DirectoryPath => Path.Combine(Paths.Home, ".cache","ai-usage");
+    static string FilePath => Path.Combine(DirectoryPath,"history.jsonl");
+    internal List<UsageEvent> Rows { get; private set; } = new();
+    HashSet<UsageEvent> keys = new();
+    long? lastCleanup;
+    bool readable = true;
+    internal static JsonElement? ReadObject(string path)
+    {
+        try { using var doc = JsonDocument.Parse(File.ReadAllBytes(path)); return doc.RootElement.ValueKind == JsonValueKind.Object ? doc.RootElement.Clone() : null; }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException) { return null; }
+    }
+    List<UsageEvent> retryRows = new();
+    internal IEnumerable<UsageEvent> VisibleRows => Rows.Concat(retryRows);
+    internal UsageHistory() => Load();
+    void Load()
+    {
+        Rows.Clear(); keys.Clear(); readable = true;
+        try
+        {
+            foreach (var line in File.ReadLines(FilePath))
+                try
+                {
+                    if (JsonSerializer.Deserialize(line, UsageJson.Default.UsageEvent) is { Valid:true, Minutes:10080 } row)
+                    { Rows.Add(row); keys.Add(row.Key); }
+                }
+                catch (JsonException) { }
+        }
+        catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException) { }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { readable = false; }
+    }
+    internal static void Atomic(string path, Action<Stream> write)
+    {
+        Directory.CreateDirectory(DirectoryPath);
+        var tmp = Path.Combine(DirectoryPath,Guid.NewGuid().ToString("N"));
+        try
+        {
+            using (var stream = new FileStream(tmp,FileMode.CreateNew,FileAccess.Write,FileShare.None)) { write(stream); stream.Flush(true); }
+            File.Move(tmp,path,true);
+        }
+        finally { File.Delete(tmp); }
+    }
+    internal bool RecordLive(IEnumerable<UsageEvent> events, UsageAccount user, long now)
+    {
+        var keys = user.Keys();
+        return Merge(events.Where(e => keys.GetValueOrDefault(e.Provider) == e.Account),now);
+    }
+    internal bool Merge(IEnumerable<UsageEvent> input,long now)
+    {
+        if (!readable) Load();
+        var pending = retryRows.Concat(input).ToList();
+        if (readable && Persist(pending,now)) { retryRows.Clear(); return true; }
+        retryRows = pending.Where(e => e.Valid && e.Minutes == 10080 && e.AtMs >= now-35*Day).DistinctBy(e => e.Key).ToList();
+        return false;
+    }
+    bool Persist(List<UsageEvent> input, long now)
+    {
+        var fresh = input.Where(e => e.Valid && e.Minutes == 10080 && e.AtMs <= now && e.AtMs >= now-35*Day && !keys.Contains(e.Key)).ToList();
+        var cleanup = lastCleanup is null || now-lastCleanup >= Day;
+        if (!cleanup && fresh.Count == 0) return true;
+        var old = cleanup ? Rows.Where(e => e.AtMs >= now-35*Day).ToList() : Rows;
+        var added = new List<UsageEvent>();
+        foreach (var incoming in fresh.GroupBy(e => (e.Provider,e.Account)))
+        {
+            foreach (var group in Generations.Group(old.Where(e => (e.Provider,e.Account) == incoming.Key).Concat(incoming)).Values)
+            {
+                UsageEvent? previous = null;
+                foreach (var e in group.DistinctBy(e => e.Key))
+                {
+                    if (keys.Contains(e.Key)) { previous = e; continue; }
+                    if (previous is { } p && p.Used == e.Used && (e.ResetMs == null || p.ResetMs == e.ResetMs) && !(p.Quality == "rough" && e.Quality == "observed")) continue;
+                    previous = e; added.Add(e);
+                }
+            }
+        }
+        if (!cleanup && added.Count == 0) return true;
+        void Write(Stream stream)
+        {
+            foreach (var e in UsageEvent.Ordered(cleanup ? old.Concat(added) : added))
+            {
+                JsonSerializer.Serialize(stream,e,UsageJson.Default.UsageEvent); stream.WriteByte((byte)'\n');
+            }
+        }
+        try
+        {
+            if (cleanup) Atomic(FilePath,Write);
+            else { using var stream = new FileStream(FilePath,FileMode.Append,FileAccess.Write,FileShare.Read); Write(stream); stream.Flush(true); }
+            old.AddRange(added); Rows = old;
+            keys = Rows.Select(e => e.Key).ToHashSet();
+            if (cleanup) lastCleanup = now;
+            return true;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { lastCleanup = null; return false; }
+    }
+}
+
+[JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase, DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
+[JsonSerializable(typeof(UsageEvent))]
+[JsonSerializable(typeof(Dictionary<string,TrendResult>))]
+[JsonSerializable(typeof(AlertFile))]
+internal partial class UsageJson : JsonSerializerContext { }
+
+internal sealed record AlertWindow(long? Anchor = null, long? ResetMs = null, long AtMs = 0, string Low = "", bool Pending = false, string? Reset = null, long? LowAtMs = null);
+internal sealed record AlertFile(int V, Dictionary<string,AlertWindow> Windows);
+internal sealed record AlertNotice(string Kind, string Provider, string Account, int Minutes, string Title, string? Body, string? Model = null);
+internal sealed record AlertCandidate(AlertNotice Notice, AlertFile State);
+internal sealed class LimitAlerts
+{
+    const long ResetNoticeGraceMs = 60 * 60_000L;
+    static string FilePath => Path.Combine(UsageHistory.DirectoryPath,"alerts.json");
+    internal AlertFile State { get; private set; } = new(1,new());
+    readonly HashSet<string> cancellations = new();
+    bool cancelModels;
+    bool healthy = true;
+    internal bool StorageOK { get; private set; } = true;
+    internal LimitAlerts()
+    {
+        try
+        {
+            var file = JsonSerializer.Deserialize(File.ReadAllBytes(FilePath),UsageJson.Default.AlertFile);
+            if (file is { V:1, Windows:not null }) State = file; else StorageOK = healthy = false;
+        }
+        catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException) { }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException) { StorageOK = healthy = false; }
+    }
+    internal bool Save(AlertFile next)
+    {
+        if (!healthy) return false;
+        StorageOK = true;
+        if (State.Windows.Count == next.Windows.Count && next.Windows.All(p => State.Windows.GetValueOrDefault(p.Key) == p.Value)) return true;
+        try
+        {
+            UsageHistory.Atomic(FilePath,stream => JsonSerializer.Serialize(stream,next,UsageJson.Default.AlertFile));
+            State = next; return true;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { StorageOK = false; return false; }
+    }
+    internal void Cancel(string? provider = null)
+    {
+        if (provider is null) cancellations.UnionWith(["claude","codex"]);
+        else cancellations.Add(provider);
+        ApplyCancellations();
+    }
+    internal void ApplyPreferences(bool enabled, bool models)
+    {
+        if (!enabled) Cancel();
+        else if (!models)
+        {
+            cancelModels = true;
+            ApplyCancellations();
+        }
+    }
+
+    readonly record struct Scope(int Minutes, string? Model)
+    {
+        public string Suffix
+        {
+            get
+            {
+                var length = Minutes.ToString(CultureInfo.InvariantCulture);
+                if (Model == null) return length;
+                var encoded = System.Buffers.Text.Base64Url.EncodeToString(Encoding.UTF8.GetBytes(Model));
+                return length + "/model/" + encoded;
+            }
+        }
+        internal static Scope? Parse(string suffix)
+        {
+            if (int.TryParse(suffix, NumberStyles.None, CultureInfo.InvariantCulture, out int minutes)) return new Scope(minutes, null);
+            const string prefix = "10080/model/";
+            if (!suffix.StartsWith(prefix, StringComparison.Ordinal) || suffix.Length == prefix.Length) return null;
+            try
+            {
+                var bytes = System.Buffers.Text.Base64Url.DecodeFromChars(suffix.AsSpan(prefix.Length));
+                var scope = new Scope(10080, Encoding.UTF8.GetString(bytes));
+                return scope.Suffix == suffix ? scope : null;
+            }
+            catch (FormatException) { return null; }
+        }
+    }
+
+    bool ApplyCancellations()
+    {
+        if (!cancelModels && cancellations.Count == 0) return true;
+        static bool IsModelKey(string key)
+        {
+            if (!key.StartsWith("claude/", StringComparison.Ordinal)) return false;
+            int separator = key.IndexOf('/', "claude/".Length);
+            return separator >= 0 && Scope.Parse(key[(separator + 1)..]) is { Model: not null };
+        }
+        var next = State.Windows.ToDictionary(p => p.Key,p => p.Value.Pending &&
+            (cancellations.Any(provider => p.Key.StartsWith(provider+"/",StringComparison.Ordinal)) ||
+             (cancelModels && IsModelKey(p.Key)))
+            ? p.Value with { Pending = false, Reset = "cancelled" } : p.Value);
+        if (!Save(new(1,next))) return false;
+        cancellations.Clear();
+        cancelModels = false;
+        return true;
+    }
+    internal AlertCandidate? NextLive(ProviderSnapshot claude, CodexReader codex, long now, bool enabled, bool models)
+    {
+        ApplyPreferences(enabled, models);
+        if (!enabled) return null;
+        return Next(UsageEvent.LiveRows(claude, codex), UsageAccount.Read(now).Keys(), now,
+            modelRows: models ? claude.ModelObservations : null);
+    }
+
+    internal AlertCandidate? Next(List<UsageEvent> rows, Dictionary<string,string> keys, long now, bool skipped = false,
+        IReadOnlyDictionary<string, UsageEvent>? modelRows = null)
+    {
+        if (!healthy || !ApplyCancellations()) return null;
+        var next = State with { Windows = new(State.Windows) };
+        foreach (var (provider,account) in keys.OrderBy(p => p.Key,StringComparer.Ordinal))
+        {
+            var prefix = provider+"/"+account+"/";
+            var live = rows.Where(e => e.Valid && e.Provider == provider && e.Account == account && e.AtMs <= now).ToList();
+            var groups = live.GroupBy(e => new Scope(e.Minutes, null)).ToDictionary(g => g.Key, g => g.ToList());
+            if (provider == "claude" && modelRows != null)
+                foreach (var (name, e) in modelRows)
+                    if (e.Valid && e.Account == account && e.AtMs <= now) groups[new Scope(e.Minutes, name)] = [e];
+            foreach (var key in State.Windows.Keys)
+                if (key.StartsWith(prefix, StringComparison.Ordinal) && Scope.Parse(key[prefix.Length..]) is { } saved &&
+                    (saved.Model == null || (provider == "claude" && modelRows != null))) groups.TryAdd(saved, []);
+            foreach (var scope in groups.Keys.OrderBy(s => s.Minutes).ThenBy(s => s.Model, StringComparer.Ordinal))
+            {
+                var m = scope.Minutes;
+                var k = prefix + scope.Suffix;
+                var duration = m * 60_000L;
+                var title = provider == "claude" ? "Claude" : "ChatGPT";
+                var label = scope.Model ?? Fmt.WindowLabel(m);
+                var window = groups[scope];
+                var resets = window.Where(e => e.ResetMs.HasValue).Select(e => e.ResetMs!.Value).ToList();
+                var eligible = window.Where(e =>
+                {
+                    if (e.ResetMs is { } r) return r > now;
+                    if (now-e.AtMs > duration) return false;
+                    var measured = resets.Where(r => r-duration <= e.AtMs && e.AtMs < r);
+                    return !measured.Any() || measured.Any(r => r > now);
+                }).ToList();
+                var w = next.Windows.GetValueOrDefault(k);
+                var anchors = Generations.Anchors(UsageEvent.Ordered(eligible),w?.Anchor);
+                var generation = anchors.Values.Cast<long?>().Max();
+                var current = UsageEvent.Ordered(eligible.Where(e => e.ResetMs is { } r ? anchors[r] == generation
+                    : generation is null || e.AtMs >= generation-duration-Generations.Tolerance)).ToList();
+                var row = current.LastOrDefault();
+                var newReset = row?.ResetMs ?? current.LastOrDefault(e => e.ResetMs.HasValue)?.ResetMs;
+                // Migrate a legacy low using its last observation before AtMs moves forward.
+                if (w is { Low.Length: > 0, LowAtMs: null }) w = w with { LowAtMs = w.AtMs };
+                if (w is { ResetMs: null, LowAtMs: { } lowAt } && row != null &&
+                    row.AtMs >= w.AtMs && row.AtMs-lowAt >= duration) w = null;
+                if (row != null && w != null && w.Anchor == generation && row.AtMs >= w.AtMs && newReset is { } corrected)
+                    w = w with { ResetMs = corrected };
+                var newer = w != null && row?.AtMs >= w.AtMs && newReset is { } nr &&
+                    (w.Anchor is { } a ? generation > a : nr-duration > (w.LowAtMs ?? w.AtMs));
+                if (w is { Pending:true } && (w.ResetMs <= now || newer))
+                {
+                    long? start = newer && duration > 0 ? newReset-duration : null;
+                    var boundary = Math.Min(w.ResetMs ?? long.MaxValue,start ?? long.MaxValue);
+                    var timely = boundary <= now && boundary >= now-ResetNoticeGraceMs;
+                    w = w with { Pending = false, Reset = timely && !skipped ? "sent" : "skipped" };
+                    next.Windows[k] = w;
+                    if (timely)
+                        return new(new("reset",provider,account,m,T("{0} {1} 한도가 초기화됐습니다",title,label),T("다시 100% 남았습니다."),scope.Model),next);
+                }
+                if (row == null) continue;
+                if (w != null)
+                {
+                    if (row.AtMs < w.AtMs || generation < w.Anchor) continue;
+                    if (newer || (newReset is null && w.ResetMs <= row.AtMs)) w = null;
+                    else if (w.ResetMs <= now) continue;
+                }
+                w ??= new();
+                w = w with { AtMs = row.AtMs, Anchor = w.Anchor ?? generation ?? newReset, ResetMs = newReset ?? w.ResetMs };
+                var measured = current.Where(e => e.ResetMs.HasValue).Select(e => (double?)e.Used).Max() ?? row.Used;
+                var used = provider == "claude" && newReset.HasValue ? Math.Max(row.Used,measured) : row.Used;
+                var left = 100-(int)Math.Floor(used);
+                if (left <= 10 && w.Low.Length == 0)
+                {
+                    next.Windows[k] = w with { LowAtMs = row.AtMs, Low = skipped ? "skipped" : "sent", Pending = !skipped, Reset = skipped ? "skipped" : "pending" };
+                    string? body = null;
+                    if (w.ResetMs is { } r)
+                    {
+                        var time = DateTimeOffset.FromUnixTimeMilliseconds(r).LocalDateTime;
+                        var format = time.Date == DateTimeOffset.FromUnixTimeMilliseconds(now).LocalDateTime.Date ? "HH:mm" : "M'/'d(ddd) HH:mm";
+                        body = T("{0}에 초기화됩니다.",time.ToString(format,L10n.Culture));
+                    }
+                    return new(new("low",provider,account,m,T("{0} {1} 한도 {2}% 남음",title,label,left),body,scope.Model),next);
+                }
+                next.Windows[k] = w;
+            }
+        }
+        Save(next);
+        return null;
+    }
+}
+
+// The transient icon and the balloon have the same lifetime. Closing and timing out
+// use the same transition, so a second callback cannot hide an already idle icon.
+internal sealed class BalloonPresenter(Action<bool> setVisible, Action<AlertNotice> display)
+{
+    internal bool Busy { get; private set; }
+    internal void Show(AlertNotice notice)
+    {
+        Busy = true;
+        try { setVisible(true); display(notice); }
+        catch { Dismiss(); throw; }
+    }
+    internal bool Dismiss()
+    {
+        if (!Busy) return false;
+        Busy = false; setVisible(false);
+        return true;
+    }
+}
+
+internal static class UsageCommands
+{
+    static long? Time(JsonElement obj,string name) => obj.TryGetProperty(name,out var value)
+        ? value.ValueKind == JsonValueKind.Number ? value.GetInt64() : J.Epoch(J.Number(value))?.ToUnixTimeMilliseconds() : null;
+    static DateTimeOffset Clock(string[] args)
+    {
+        var i = Array.IndexOf(args,"--now");
+        return i < 0 ? DateTimeOffset.Now : DateTimeOffset.Parse(args[i+1],CultureInfo.InvariantCulture);
+    }
+    internal static string Trend(string[] args)
+    {
+        var now = Clock(args).ToUnixTimeMilliseconds();
+        var user = UsageAccount.Read(now);
+        var rows = new UsageHistory().Rows.Concat(new SourceScan().Read(user,now));
+        return JsonSerializer.Serialize(TrendResult.Calculate(rows,user,now),UsageJson.Default.DictionaryStringTrendResult);
+    }
+    static void RequireTestHome(params string[] names)
+    {
+        static string Canonical(string path, int depth = 0)
+        {
+            if (depth > 40 || path.Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar]).Contains(".."))
+                throw new ArgumentException("AIUSAGE_HOME");
+            var full = Path.GetFullPath(path);
+            var current = Path.GetPathRoot(full)!;
+            foreach (var part in full[current.Length..].Split(Path.DirectorySeparatorChar,StringSplitOptions.RemoveEmptyEntries))
+            {
+                var childPath = Path.Combine(current,part);
+                FileSystemInfo child = Directory.Exists(childPath) ? new DirectoryInfo(childPath) : new FileInfo(childPath);
+                current = child.LinkTarget is { } link
+                    ? Canonical(Path.IsPathRooted(link) ? link : Path.Combine(current, link), depth + 1)
+                    : child.FullName;
+            }
+            return Path.TrimEndingDirectorySeparator(current);
+        }
+        var home = Environment.GetEnvironmentVariable("AIUSAGE_HOME");
+        var real = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var comparison = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        if (string.IsNullOrWhiteSpace(home) || string.Equals(Canonical(home),Canonical(real),comparison))
+            throw new ArgumentException("AIUSAGE_HOME");
+        var prefix = Canonical(home) + Path.DirectorySeparatorChar;
+        var realCache = Canonical(Path.Combine(real, ".cache", "ai-usage"));
+        foreach (var name in names)
+        {
+            var dest = Canonical(Path.Combine(UsageHistory.DirectoryPath,name));
+            if (!dest.StartsWith(prefix,comparison) || string.Equals(dest, realCache, comparison)
+                || dest.StartsWith(realCache + Path.DirectorySeparatorChar, comparison)
+                || realCache.StartsWith(dest + Path.DirectorySeparatorChar, comparison)
+                || string.Equals(dest, Canonical(Path.Combine(realCache, name)), comparison))
+                throw new ArgumentException("AIUSAGE_HOME");
+        }
+    }
+    internal static string RecordOnce(string[] args)
+    {
+        RequireTestHome("accounts.json","claude","history.jsonl");
+        return WithWriter(() => RecordLocal(args));
+    }
+    static string WithWriter(Func<string> run)
+    {
+        using var mutex = new Mutex(false,@"Local\AIUsagePet");
+        try { if (!mutex.WaitOne(TimeSpan.FromSeconds(3))) throw new IOException("History writer is busy"); }
+        catch (AbandonedMutexException) { }
+        try { return run(); }
+        finally { mutex.ReleaseMutex(); }
+    }
+    static string RecordLocal(string[] args)
+    {
+        var at = Clock(args);
+        var now = at.ToUnixTimeMilliseconds();
+        var claude = new ClaudeReader().Read(at);
+        var codex = new CodexReader();
+        codex.ReadLog(at);
+        var history = new UsageHistory();
+        var retained = history.Rows.Count(e => e.AtMs >= now-35*UsageHistory.Day);
+        if (!history.RecordLive(UsageEvent.LiveRows(claude,codex),UsageAccount.Read(now),now))
+            throw new IOException("history.jsonl");
+        return (history.Rows.Count-retained).ToString(CultureInfo.InvariantCulture);
+    }
+
+    internal static string AlertsOnce(string[] args)
+    {
+        RequireTestHome("accounts.json", "claude", "alerts.json");
+        bool Option(string name, bool fallback)
+        {
+            var i = Array.IndexOf(args, name);
+            if (i < 0) return fallback;
+            return args.ElementAtOrDefault(i + 1) switch { "0" => false, "1" => true, _ => throw new ArgumentException(name) };
+        }
+        var enabled = Option("--limit-alerts", true);
+        var models = Option("--model-alerts", false);
+        return WithWriter(() =>
+        {
+            var at = Clock(args);
+            var claude = new ClaudeReader().Read(at);
+            var codex = new CodexReader();
+            codex.ReadLog(at);
+            var alerts = new LimitAlerts();
+            var notices = new JsonArray();
+            while (alerts.NextLive(claude, codex, at.ToUnixTimeMilliseconds(), enabled, models) is { } candidate)
+            {
+                if (!alerts.Save(candidate.State)) throw new IOException("alerts.json");
+                var n = candidate.Notice;
+                notices.Add(new JsonObject {
+                    ["kind"] = n.Kind, ["provider"] = n.Provider, ["minutes"] = n.Minutes,
+                    ["scope"] = n.Model == null ? "overall" : "model", ["model"] = n.Model,
+                    ["title"] = n.Title, ["body"] = n.Body
+                });
+            }
+            if (!alerts.StorageOK) throw new IOException("alerts.json");
+            return notices.ToJsonString();
+        });
+    }
+    internal static string TestAlerts(string path)
+    {
+        RequireTestHome("alerts.json");
+        using var fixture = JsonDocument.Parse(File.ReadAllBytes(path));
+        var alerts = new LimitAlerts();
+        var events = new JsonArray();
+        var candidates = new JsonArray();
+        var icon = new JsonArray();
+        var presenter = new BalloonPresenter(visible => icon.Add((JsonNode?)JsonValue.Create(visible)), _ => { });
+        static JsonNode Report(AlertNotice n,string outcome) =>
+            new JsonObject { ["kind"]=n.Kind, ["title"]=n.Title, ["body"]=n.Body, ["result"]=outcome };
+        var keys = new Dictionary<string,string>();
+        var hidden = new HashSet<string>();
+        bool enabled = true;
+        bool? permission = null;
+        int requests = 0;
+        foreach (var s in fixture.RootElement.GetProperty("steps").EnumerateArray())
+        {
+            var now = Time(s,"now") ?? throw new FormatException("now");
+            var p = J.Str(s,"provider") ?? "codex";
+            if (J.Str(s,"account") is { } id)
+            {
+                if (UsageAccount.Hash(p,id) is { } accountKey) keys[p] = accountKey; else keys.Remove(p);
+            }
+            else keys.TryAdd(p,UsageAccount.Hash(p,"test")!);
+            if (J.Obj(s,"accounts") is { } accounts)
+                foreach (var pair in accounts.EnumerateObject())
+                    if (UsageAccount.Hash(pair.Name,pair.Value.GetString()) is { } key) keys[pair.Name] = key;
+                    else keys.Remove(pair.Name);
+            if (s.TryGetProperty("enabled",out var on)) { enabled = on.GetBoolean(); if (!enabled) alerts.Cancel(); }
+            if (s.TryGetProperty("hidden",out var hide))
+            {
+                if (hide.GetBoolean()) { hidden.Add(p); alerts.Cancel(p); } else hidden.Remove(p);
+            }
+            var rows = new List<UsageEvent>();
+            foreach (var o in s.TryGetProperty("observations",out var obs) ? obs.EnumerateArray().ToArray() : new[] { s })
+            {
+                if (J.Number(o,"used") is not { } used) continue;
+                var provider = J.Str(o,"provider") ?? p;
+                if (!keys.ContainsKey(provider) && provider != p && UsageAccount.Hash(provider,J.Str(o,"account") ?? "test") is { } initial)
+                    keys[provider] = initial;
+                var account = UsageAccount.Hash(provider,J.Str(o,"account")) ?? keys.GetValueOrDefault(provider);
+                if (account == null) continue;
+                rows.Add(new(provider,account,(int)(J.Number(o,"minutes") ?? 10080),Time(o,"atMs") ?? now,Time(o,"resetMs"),used,"codex-server","observed",J.Str(o,"slot")));
+            }
+            var active = keys.Where(k => !hidden.Contains(k.Key)).ToDictionary();
+            if (!enabled || alerts.Next(rows,active,now) is not { } first) continue;
+            var outcome = J.Str(s,"outcome") ?? "sent";
+            if (permission == null) { requests++; permission = outcome != "denied"; }
+            if (outcome is "hideWhileWaiting" or "switchWhileWaiting")
+            {
+                candidates.Add(Report(first.Notice,outcome));
+                if (outcome == "hideWhileWaiting") { hidden.Add(p); alerts.Cancel(p); }
+                else keys[p] = UsageAccount.Hash(p,"switched")!;
+                continue;
+            }
+            while (alerts.Next(rows,active,now,permission == false) is { } c)
+            {
+                var before = alerts.State;
+                if (outcome == "saveFailure" || !alerts.Save(c.State)) { candidates.Add(Report(c.Notice,"saveFailure")); break; }
+                var result = permission == false ? "skipped" : outcome;
+                candidates.Add(Report(c.Notice,result));
+                events.Add(Report(c.Notice,result));
+                if (permission == true) { presenter.Show(c.Notice); presenter.Dismiss(); }
+                if (outcome == "failed") { alerts.Save(before); break; }
+                if (outcome == "unknown") break;
+            }
+        }
+        return new JsonObject { ["events"]=events, ["candidates"]=candidates, ["permissionRequests"]=requests, ["iconVisibility"]=icon }.ToJsonString();
     }
 }
