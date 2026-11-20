@@ -100,9 +100,11 @@ struct LimitWindow: Identifiable {
     let minutes: Int
     let usedPercent: Double
     let resetsAt: Date?
+    /// 있으면 모델별 한도(예: Claude 의 「Fable」 주간) — 그 이름을 칸 이름으로 쓴다(Windows 판과 같다)
+    var name: String? = nil
 
-    /// 「5시간」「주간」 — 고른 언어로
-    var label: String { windowLabel(minutes: minutes) }
+    /// 「5시간」「주간」 — 고른 언어로. 모델별 한도는 모델 이름
+    var label: String { name ?? windowLabel(minutes: minutes) }
 
     /// 상태 표시줄과 같은 계산(100 - 사용률 내림). 초기화 시각이 지났으면 100.
     func leftPercent(now: Date) -> Int {
@@ -113,7 +115,11 @@ struct LimitWindow: Identifiable {
 
 struct ProviderSnapshot {
     fileprivate var observations: [UsageEvent] = []
+    /// 모델별 주간 한도의 가장 새 관측(「모델별 한도도 알림」에만 쓴다 — 사용 추이·기록에는 넣지 않는다)
+    fileprivate var modelObservations: [String: UsageEvent] = [:]
     var windows: [LimitWindow] = []
+    /// 모델별 줄을 뺄지 고려한 보일 줄
+    func visibleWindows(showModels: Bool) -> [LimitWindow] { windows.filter { showModels || $0.name == nil } }
     var observedAt: Date?
     var plan: String?
     var message: String?
@@ -165,9 +171,12 @@ final class ClaudeReader {
     private let dir = homeDir + "/.cache/ai-usage/claude"
     private var cache: [String: (mtime: Date, limits: [String: Any])] = [:]
 
+    /// 모델별 주간 한도의 열쇠 앞머리(「seven_day:Fable」) — Windows 판과 같다
+    static let modelPrefix = "seven_day:"
+
     func read(now: Date) -> ProviderSnapshot {
         let fm = FileManager.default
-        var entries: [(mtime: Date, limits: [String: Any])] = []
+        var entries: [(mtime: Date, limits: [String: Any], command: Bool)] = []
         var alive = Set<String>()
         for name in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] where name.hasSuffix(".json") && !name.hasPrefix(".") {
             let path = dir + "/" + name
@@ -177,14 +186,16 @@ final class ClaudeReader {
                 continue
             }
             alive.insert(path)
+            let command = name == ClaudeUsageCommand.fileName  // `claude /usage` 로 받은 값(같은 모양으로 남는다)
             if let hit = cache[path], hit.mtime == mtime {
-                entries.append(hit)
+                entries.append((hit.mtime, hit.limits, command))
                 continue
             }
             guard let data = fm.contents(atPath: path),
-                  let limits = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
+                  let limits = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date == mtime else { continue }  // 읽는 동안 바뀌면 다음에
             cache[path] = (mtime, limits)
-            entries.append((mtime, limits))
+            entries.append((mtime, limits, command))
         }
         cache = cache.filter { alive.contains($0.key) }
         let me = ClaudeCodeAccount.identity()
@@ -193,7 +204,7 @@ final class ClaudeReader {
         let tagged = me != nil && entries.contains { $0.limits["account"] as? String == me }
         entries = entries.filter { entry in
             if let account = entry.limits["account"] as? String { return account == me }  // 로그아웃이면 어느 계정 것도 아니다
-            return !tagged && entry.mtime >= since
+            return !entry.command && !tagged && entry.mtime >= since  // /usage 기록은 계정이 꼭 적혀 있어야 한다
         }
 
         var sourceRows: [UsageEvent] = []
@@ -202,7 +213,8 @@ final class ClaudeReader {
                 guard let w = entry.limits[name] as? [String: Any], let used = number(w["used_percentage"]) else { continue }
                 let window = LimitWindow(id: name, minutes: minutes, usedPercent: used,
                                          resetsAt: number(w["resets_at"]).map(Date.init(timeIntervalSince1970:)))
-                sourceRows += UsageEvent.windows([window], at: entry.mtime, provider: "claude", id: me, source: "claude-session")
+                sourceRows += UsageEvent.windows([window], at: entry.mtime, provider: "claude", id: me,
+                                                 source: entry.command ? ClaudeUsageCommand.historySource : "claude-session")
             }
         }
         // Claude Code 를 안 쓰는 동안에는 데스크톱 앱 기록이 더 새것일 수 있다(같은 계정일 때만)
@@ -246,8 +258,27 @@ final class ClaudeReader {
             snap.windows.append(LimitWindow(id: key, minutes: minutes, usedPercent: used,
                                             resetsAt: reset > 0 ? Date(timeIntervalSince1970: reset) : nil))
         }
-        snap.observedAt = [usedStatus ? statusAt : nil, usedDesktop ? desktop?.at : nil].compactMap { $0 }.max()
-        snap.source = usedStatus && usedDesktop ? T("Claude Code·데스크톱 앱") : usedDesktop ? T("Claude 데스크톱 앱 기록") : T("Claude Code 상태 표시줄")
+        var seen = [usedStatus ? statusAt : nil, usedDesktop ? desktop?.at : nil].compactMap { $0 }
+        // 모델별 주간 한도(예: Fable)는 `claude /usage` 에만 있다: 1시간 안에 받은 가장 새 /usage 기록의 것을 주간 아래에 붙인다
+        if let latest = entries.filter({ $0.command }).max(by: { $0.mtime < $1.mtime }), latest.mtime <= now,
+           let models = latest.limits["models"] as? [String: Any] {
+            var shown = false
+            for name in models.keys.sorted() where !name.isEmpty {
+                guard let w = models[name] as? [String: Any], let used = number(w["used_percentage"]) else { continue }
+                let reset = number(w["resets_at"]).flatMap { $0 > 0 ? Date(timeIntervalSince1970: $0) : nil }
+                let window = LimitWindow(id: Self.modelPrefix + name, minutes: 10_080, usedPercent: used, resetsAt: reset, name: name)
+                if let event = UsageEvent.windows([window], at: latest.mtime, provider: "claude", id: me,
+                                                  source: ClaudeUsageCommand.historySource).first {
+                    snap.modelObservations[name] = event
+                }
+                if now.timeIntervalSince(latest.mtime) <= 3_600 { snap.windows.append(window); shown = true }
+            }
+            if shown { seen.append(latest.mtime) }
+        }
+        snap.observedAt = seen.max()
+        // 가장 새 기록이 `claude /usage` 로 받은 것이면 그렇게 적는다
+        let statusName = entries.max(by: { $0.mtime < $1.mtime })?.command == true ? T("Claude Code /usage") : T("Claude Code 상태 표시줄")
+        snap.source = usedStatus && usedDesktop ? T("Claude Code·데스크톱 앱") : usedDesktop ? T("Claude 데스크톱 앱 기록") : statusName
         if snap.windows.isEmpty { snap.message = ClaudeCodeLink.emptyMessage() }
         return snap
     }
@@ -257,7 +288,23 @@ final class ClaudeReader {
 /// 앱을 쓰는 동안(창을 열고 대화할 때 등)에만 쌓이고, 4.5분에 한 번까지만 남으며, 초기화 시각은 없다.
 /// 공식 문서에 없는 파일이라 앱 업데이트로 바뀔 수 있다 — 못 읽으면 상태 표시줄 값만 쓴다.
 enum ClaudeDesktopUsage {
-    static let path = homeDir + "/Library/Application Support/Claude/plan-usage-history.json"
+    static let fileName = "plan-usage-history.json"
+
+    /// 기록 후보(있는 파일만). 앱의 데이터 폴더 이름은 Claude-Data·Claude·Claude-3p 이고, Claude-Data 는 설치마다
+    /// 하위 폴더(claude_<id>)를 둔다(Windows 판과 같은 규칙). 지금 맥 판 앱은 ~/Library/Application Support/Claude 에 둔다.
+    static func paths() -> [String] {
+        let fm = FileManager.default
+        let base = homeDir + "/Library/Application Support"
+        var result: [String] = []
+        for folder in ["Claude-Data", "Claude", "Claude-3p"] {
+            let dir = base + "/" + folder
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: dir, isDirectory: &isDir), isDir.boolValue else { continue }
+            result.append(dir + "/" + fileName)
+            for sub in ((try? fm.contentsOfDirectory(atPath: dir)) ?? []).sorted() { result.append(dir + "/" + sub + "/" + fileName) }
+        }
+        return result.filter { fm.fileExists(atPath: $0) }
+    }
 
     struct Sample {
         let org: String?
@@ -266,23 +313,453 @@ enum ClaudeDesktopUsage {
     }
 
     /// 가장 최근 기록. Claude Code 계정(조직)을 알면 그 조직 것만, 8일보다 오래된 것은 뺀다.
+    /// 후보가 여럿이면(옛 자리에 남은 파일, 여러 설치) 모두 보고 가장 새 기록을 쓴다
     static func latest(org: String?, now: Date) -> Sample? {
-        guard let data = FileManager.default.contents(atPath: path),
-              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let samples = root["samples"] as? [[String: Any]] else { return nil }
         var best: Sample?
-        for sample in samples {
-            guard let t = number(sample["t"]) else { continue }
-            let at = Date(timeIntervalSince1970: t / 1000)
-            guard now.timeIntervalSince(at) < 8 * 86_400, at > best?.at ?? .distantPast else { continue }
-            if let org, let sampleOrg = sample["org"] as? String, sampleOrg != org { continue }
-            let u = sample["u"] as? [String: Any] ?? sample  // 1판은 fh·sd 가 바로 밑에 있다
-            var used: [String: Double] = [:]
-            if let v = number(u["fh"]) { used["five_hour"] = v }
-            if let v = number(u["sd"]) { used["seven_day"] = v }
-            if !used.isEmpty { best = Sample(org: sample["org"] as? String, at: at, used: used) }
+        for path in paths() {
+            guard let data = FileManager.default.contents(atPath: path),
+                  let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let samples = root["samples"] as? [[String: Any]] else { continue }
+            for sample in samples {
+                guard let t = number(sample["t"]) else { continue }
+                let at = Date(timeIntervalSince1970: t / 1000)
+                guard now.timeIntervalSince(at) < 8 * 86_400, at > best?.at ?? .distantPast else { continue }
+                if let org, let sampleOrg = sample["org"] as? String, sampleOrg != org { continue }
+                let u = sample["u"] as? [String: Any] ?? sample  // 1판은 fh·sd 가 바로 밑에 있다
+                var used: [String: Double] = [:]
+                if let v = number(u["fh"]) { used["five_hour"] = v }
+                if let v = number(u["sd"]) { used["seven_day"] = v }
+                if !used.isEmpty { best = Sample(org: sample["org"] as? String, at: at, used: used) }
+            }
         }
         return best
+    }
+
+    /// 가장 최근에 쓰인 기록 파일과 그 시각(값이 왜 멈췄는지 알리려고). 없으면 nil
+    static func lastWrite() -> (path: String, at: Date)? {
+        paths().compactMap { path -> (String, Date)? in
+            ((try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date).map { (path, $0) }
+        }.max { $0.1 < $1.1 }
+    }
+
+    /// 데스크톱 앱은 트레이(메뉴 막대) 아이콘을 누른 뒤 하루 동안만 사용량을 계속 받고, 그 밖에는 앱을 켤 때 한 번만 받아 기록이 멈춘다.
+    /// 기록이 이보다 오래 안 바뀌었으면 그렇게 알린다(Windows 판과 같다)
+    static let staleAfter: TimeInterval = 3_600
+
+    static func staleHint(now: Date) -> String? {
+        guard let last = lastWrite(), now.timeIntervalSince(last.at) >= staleAfter else { return nil }
+        return T("Claude 데스크톱 앱 기록이 {0} 뒤로 멈춤 — 메뉴 막대의 Claude 아이콘을 누르면 그 뒤 하루 동안 다시 받습니다", fullTime(last.at))
+    }
+}
+
+// MARK: - Claude Code /usage
+
+/// `claude -p "/usage"` 로 지금 한도를 묻는다(Windows 판과 같은 규칙). Codex 의 app-server 처럼 인증은 Claude Code 가 알아서 한다(로그인 토큰을 읽지 않는다).
+/// /usage 는 모델을 부르지 않는 Claude Code 안의 명령(local_command)이라 한도를 쓰지 않는다. 혹시 모델을 불렀으면(num_turns·비용 > 0)
+/// 다시는 부르지 않게 끄고(~/.cache/ai-usage/claude-usage-disabled) 기록한다.
+/// 받은 값은 상태 표시줄 기록과 같은 모양으로 ~/.cache/ai-usage/claude/usage-command.json 에 남겨 같은 규칙(계정·창)으로 합친다.
+/// 대화 기록을 남기지 않게 --no-session-persistence 로, 늘 같은 폴더(~/.cache/ai-usage/claude-usage)에서 띄운다.
+/// 결과는 사람이 읽는 영어 문장이라 Claude Code 업데이트로 바뀔 수 있다 — 못 읽으면 이 출처만 건너뛰고 claude-usage.log 에 남긴다.
+/// 끄기: `defaults write com.local.ai-usage-pet claudeUsage -bool false` 또는 AIUSAGE_CLAUDE_USAGE=0
+enum ClaudeUsageCommand {
+    static let fileName = "usage-command.json"
+    static let historySource = "claude-usage"
+    static let settingKey = "claudeUsage"
+    static var cacheDir: String { homeDir + "/.cache/ai-usage" }
+    static var resultPath: String { cacheDir + "/claude/" + fileName }
+    static var logPath: String { cacheDir + "/claude-usage.log" }
+    static var disabledPath: String { cacheDir + "/claude-usage-disabled" }
+    private static var workDir: String { cacheDir + "/claude-usage" }
+
+    /// 대화가 이어질 때 너무 자주 묻지 않게: 두 번 사이 최소 간격
+    static let minInterval: TimeInterval = 60
+    /// 이 맥 밖(claude.ai 웹·모바일·데스크톱 앱 Chat)에서 쓴 것은 알 길이 없어 이만큼마다 묻는다
+    static let fallbackInterval: TimeInterval = 300
+    private static let timeout: TimeInterval = 60
+
+    private static let lock = NSLock()
+    private static var running = false
+    private static var processStopReason: String?
+    private static var lastLoggedError: String?
+    private static var lastLoggedLimits: [String: (used: Double, reset: Double)]?
+    private(set) static var lastCheckedAt: Date?
+    private(set) static var lastError: String?
+    private(set) static var lastSeconds: Double?
+
+    /// 꺼져 있으면 그 이유. 설정·환경 변수로 껐거나, /usage 가 모델을 부른 적이 있어 스스로 껐을 때
+    static func disabledReason() -> String? {
+        if let reason = lock.withLock({ processStopReason }) { return reason }
+        if ProcessInfo.processInfo.environment["AIUSAGE_CLAUDE_USAGE"] == "0" { return T("꺼 둠(AIUSAGE_CLAUDE_USAGE=0)") }
+        if UserDefaults.standard.object(forKey: settingKey) as? Bool == false { return T("꺼 둠(claudeUsage=false)") }
+        if FileManager.default.fileExists(atPath: disabledPath) {
+            return T("꺼짐 — /usage 가 모델을 불러 멈췄습니다({0} 를 지우면 다시 켜짐)", disabledPath)
+        }
+        return nil
+    }
+
+    static func findClaude() -> String? {
+        let fm = FileManager.default
+        var candidates = [homeDir + "/.local/bin/claude", homeDir + "/.claude/local/claude",
+                          "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+        for dir in (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":") { candidates.append(String(dir) + "/claude") }
+        if let found = candidates.first(where: { fm.isExecutableFile(atPath: $0) }) { return found }
+        return desktopBundled()
+    }
+
+    /// Claude 데스크톱 앱이 Code 탭용으로 품고 있는 Claude Code(claude-code/<버전>/<id>/claude.app) 중 가장 높은 버전.
+    /// Claude Code CLI 를 따로 깔지 않고 데스크톱 앱만 쓰는 사람도 /usage 를 물을 수 있게.
+    private static func desktopBundled() -> String? {
+        let fm = FileManager.default
+        var found: [(version: [Int], path: String)] = []
+        let base = homeDir + "/Library/Application Support"
+        var roots = ["Claude", "Claude-3p"].map { base + "/" + $0 }
+        roots += ((try? fm.contentsOfDirectory(atPath: base + "/Claude-Data")) ?? []).map { base + "/Claude-Data/" + $0 }
+        for root in roots.map({ $0 + "/claude-code" }) {
+            for name in (try? fm.contentsOfDirectory(atPath: root)) ?? [] {
+                let parts = name.split(separator: ".").compactMap { Int($0) }
+                guard parts.count >= 2, parts.count == name.split(separator: ".").count else { continue }
+                let dir = root + "/" + name
+                var paths = [dir + "/claude"]
+                for build in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] {
+                    paths += [dir + "/" + build + "/claude", dir + "/" + build + "/claude.app/Contents/MacOS/claude"]
+                }
+                for path in paths where fm.isExecutableFile(atPath: path) { found.append((parts, path)) }
+            }
+        }
+        return found.max { $0.version.lexicographicallyPrecedes($1.version) }?.path
+    }
+
+    /// 묻고 결과를 남긴다(호출한 스레드에서 끝날 때까지 — 창은 뒤에서 부른다). 성공하면 nil, 아니면 이유. 이미 묻는 중이면 nil.
+    /// reason 은 기록(claude-usage.log)에 남길 계기(시작·활동·5분·새로고침 등).
+    @discardableResult
+    static func fetch(reason: String) -> String? {
+        if let off = disabledReason() { lock.withLock { lastError = off }; return off }
+        let busy = lock.withLock { () -> Bool in
+            if running { return true }
+            running = true
+            return false
+        }
+        if busy { return nil }
+        defer { lock.withLock { running = false } }
+        if let stopped = disabledReason() { lock.withLock { lastError = stopped }; return stopped }
+        cleanOldTemps()
+        let started = Date()
+        let before = ClaudeCodeAccount.identity()
+        let result = run()
+        var error = result.error
+        if result.modelCalled {
+            do {
+                try FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
+                let stamp = formatterPOSIX("yyyy-MM-dd HH:mm:ss").string(from: Date())
+                try Data("\(stamp) /usage 가 모델을 불렀다(num_turns·비용 > 0). 이 파일을 지우면 다시 묻는다.\n".utf8)
+                    .write(to: URL(fileURLWithPath: disabledPath))
+            } catch let e {
+                let message = T("/usage 가 모델을 불러 이 실행에서 중지했습니다. 중지 파일을 저장하지 못했습니다: {0}", e.localizedDescription)
+                error = message
+                lock.withLock { processStopReason = message }
+            }
+        } else if error == nil, let limits = result.limits {
+            let after = ClaudeCodeAccount.identity()
+            if after == nil { error = T("Claude Code 에 로그인되어 있지 않습니다") }
+            else if after != before { error = T("묻는 동안 계정이 바뀌었습니다") }
+            else { error = save(limits, account: after!) }
+        }
+        let seconds = Date().timeIntervalSince(started)
+        lock.withLock { lastCheckedAt = Date(); lastError = error; lastSeconds = seconds }
+        log(reason: reason, limits: result.limits, error: error, seconds: seconds)
+        return error
+    }
+
+    private struct RunResult {
+        var limits: [String: (used: Double, reset: Double)]?
+        var error: String?
+        var modelCalled = false
+    }
+
+    private static func run() -> RunResult {
+        guard let exe = findClaude() else { return RunResult(error: T("claude 명령을 찾지 못했습니다(Claude Code 또는 Claude 데스크톱 앱 필요)")) }
+        do { try FileManager.default.createDirectory(atPath: workDir, withIntermediateDirectories: true) }
+        catch { return RunResult(error: T("claude 를 실행하지 못했습니다")) }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: exe)
+        process.arguments = ["-p", "/usage", "--output-format", "json", "--no-session-persistence"]
+        process.currentDirectoryURL = URL(fileURLWithPath: workDir)
+        var env = ProcessInfo.processInfo.environment
+        // npm 판 claude 는 node 스크립트라 그 폴더(node 가 같이 있는 곳)를 PATH 앞에 붙인다
+        let exeDir = (exe as NSString).deletingLastPathComponent
+        env["PATH"] = ([exeDir] + (env["PATH"] ?? "").split(separator: ":").map(String.init) + ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"])
+            .joined(separator: ":")
+        process.environment = env
+        let out = Pipe()
+        process.standardOutput = out
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice  // 입력을 기다리지 않게
+        do { try process.run() } catch { return RunResult(error: T("claude 를 실행하지 못했습니다")) }
+        var output = Data()
+        let reading = DispatchGroup()
+        reading.enter()
+        DispatchQueue.global(qos: .utility).async {
+            output = out.fileHandleForReading.readDataToEndOfFile()
+            reading.leave()
+        }
+        if reading.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            kill(process.processIdentifier, SIGKILL)
+            _ = reading.wait(timeout: .now() + 2)
+            return RunResult(error: T("claude 가 응답하지 않습니다"))
+        }
+        process.waitUntilExit()
+        return parse(String(decoding: output, as: UTF8.self), now: Date())
+    }
+
+    /// `claude -p "/usage" --output-format json` 의 출력을 읽는다(시험할 수 있게 따로 둔다)
+    private static func parse(_ output: String, now: Date) -> RunResult {
+        var root: [String: Any]?
+        for raw in output.split(separator: "\n").reversed() {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix("{"), let obj = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { continue }
+            root = obj
+            break
+        }
+        guard let root else { return RunResult(error: T("claude 의 답을 읽지 못했습니다")) }
+        // 모델을 불렀다면(한도를 썼다면) 값이 맞아도 쓰지 않고 멈춘다
+        if (number(root["num_turns"]) ?? 0) > 0 || (number(root["total_cost_usd"]) ?? 0) > 0 {
+            return RunResult(error: T("/usage 가 모델을 불렀습니다 — 한도를 쓰지 않도록 멈춥니다"), modelCalled: true)
+        }
+        if root["is_error"] as? Bool == true || root["local_command"] as? String != "usage" {
+            return RunResult(error: T("claude 가 /usage 를 실행하지 못했습니다"))
+        }
+        let text = root["result"] as? String ?? ""
+        let limits = parseText(text, now: now)
+        if !limits.isEmpty { return RunResult(limits: limits) }
+        return RunResult(error: text.contains("Current ")
+            ? T("/usage 결과 형식을 읽지 못했습니다(Claude Code 업데이트로 바뀌었을 수 있음)")
+            : T("/usage 에 한도가 없습니다 — Claude 구독(Pro·Max·Team)으로 로그인했는지 확인"))
+    }
+
+    // 「Current session: 8% used · resets Nov 20, 3:10pm (Asia/Seoul)」「Current week (all models): 70% used · resets …」
+    // 「Current week (Fable): 89% used · resets …」(모델별 주간 — 옛 판은 「(Sonnet only)」)
+    private static let usageLine = try! NSRegularExpression(
+        pattern: #"^Current (?:(?<session>session)|week \((?<scope>[^)]+)\))\s*:\s*(?<used>\d+(?:\.\d+)?)\s*%\s*used(?:\s*·\s*resets\s+(?<reset>.+?))?\s*$"#,
+        options: [.caseInsensitive])
+
+    /// 열쇠: five_hour, seven_day, 모델별 주간은 「seven_day:<모델>」(ClaudeReader.modelPrefix)
+    static func parseText(_ text: String, now: Date) -> [String: (used: Double, reset: Double)] {
+        var result: [String: (used: Double, reset: Double)] = [:]
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            let ns = line as NSString
+            guard let m = usageLine.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) else { continue }
+            func group(_ name: String) -> String? {
+                let r = m.range(withName: name)
+                return r.location == NSNotFound ? nil : ns.substring(with: r)
+            }
+            let key: String
+            if group("session") != nil { key = "five_hour" }
+            else {
+                var scope = (group("scope") ?? "").trimmingCharacters(in: .whitespaces)
+                if scope.caseInsensitiveCompare("all models") == .orderedSame { key = "seven_day" }
+                else {
+                    if scope.lowercased().hasSuffix(" only") { scope = String(scope.dropLast(5)).trimmingCharacters(in: .whitespaces) }
+                    guard !scope.isEmpty else { continue }
+                    key = ClaudeReader.modelPrefix + scope
+                }
+            }
+            guard let usedText = group("used"), let used = Double(usedText), used.isFinite else { continue }
+            let reset = group("reset").flatMap { parseReset($0, now: now) } ?? 0
+            result[key] = (used, reset)
+        }
+        return result
+    }
+
+    // 「Nov 20, 3:10pm (Asia/Seoul)」「Nov 22, 10am (Asia/Seoul)」「3:10pm」「Dec 1, 2027, 9:00am」
+    private static let resetText = try! NSRegularExpression(
+        pattern: #"^(?:(?<mon>[A-Za-z]{3})[A-Za-z]*\.?\s+(?<day>\d{1,2})(?:,\s*(?<year>\d{4}))?,?\s+(?:at\s+)?)?(?<h>\d{1,2})(?::(?<m>\d{2}))?\s*(?<ap>[ap]\.?m\.?)?\s*(?:\((?<tz>[^)]+)\))?$"#,
+        options: [.caseInsensitive])
+
+    /// 초기화 시각 글을 유닉스 초로. 해가 없으면 지금에 가장 가까운 앞날로, 날짜가 없으면 오늘(지났으면 내일)로 본다. 못 읽으면 nil.
+    static func parseReset(_ text: String, now: Date) -> Double? {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        let ns = trimmed as NSString
+        guard let m = resetText.firstMatch(in: trimmed, range: NSRange(location: 0, length: ns.length)) else { return nil }
+        func group(_ name: String) -> String? {
+            let r = m.range(withName: name)
+            return r.location == NSNotFound ? nil : ns.substring(with: r)
+        }
+        let zone = group("tz").flatMap { TimeZone(identifier: $0.trimmingCharacters(in: .whitespaces)) } ?? .current
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = zone
+        let local = calendar.dateComponents([.year, .month, .day], from: now)
+        guard var hour = group("h").flatMap({ Int($0) }) else { return nil }
+        let minute = group("m").flatMap { Int($0) } ?? 0
+        if let ap = group("ap") {
+            guard (1...12).contains(hour) else { return nil }
+            hour = hour % 12 + (ap.lowercased().hasPrefix("p") ? 12 : 0)
+        }
+        guard hour <= 23, minute <= 59 else { return nil }
+        var year = local.year ?? 2000, month = local.month ?? 1, day = local.day ?? 1
+        let hasDate = group("mon") != nil
+        if let mon = group("mon") {
+            let months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+            guard let index = months.firstIndex(of: mon.lowercased()) else { return nil }
+            month = index + 1
+            guard let d = group("day").flatMap({ Int($0) }) else { return nil }
+            day = d
+        }
+        let hasYear = group("year") != nil
+        if let y = group("year").flatMap({ Int($0) }) { year = y }
+        func at(_ y: Int, _ mo: Int, _ d: Int) -> Date? {
+            var c = DateComponents(year: y, month: mo, day: d, hour: hour, minute: minute)
+            c.timeZone = zone
+            guard let date = calendar.date(from: c), calendar.component(.day, from: date) == d else { return nil }
+            return date
+        }
+        guard var result = at(year, month, day) else { return nil }
+        if !hasDate && result < now { result = result.addingTimeInterval(86_400) }  // 시각만 있으면 다음에 오는 그 시각
+        else if hasDate && !hasYear && result < now.addingTimeInterval(-86_400), let next = at(year + 1, month, day) { result = next }  // 12월 → 1월
+        return result.timeIntervalSince1970.rounded(.down)
+    }
+
+    /// 상태 표시줄 기록과 같은 모양으로 남긴다(바꿔치기로 써서 읽는 쪽이 반쯤 쓴 파일을 보지 않게)
+    private static func save(_ limits: [String: (used: Double, reset: Double)], account: String) -> String? {
+        let dir = cacheDir + "/claude"
+        let temp = dir + "/.usage-command.\(getpid()).\(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()).tmp"
+        defer { try? FileManager.default.removeItem(atPath: temp) }
+        do {
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            var node: [String: Any] = [:], models: [String: Any] = [:]
+            for (key, value) in limits {
+                let window: [String: Any] = ["used_percentage": value.used, "resets_at": value.reset]
+                if key.hasPrefix(ClaudeReader.modelPrefix) { models[String(key.dropFirst(ClaudeReader.modelPrefix.count))] = window }
+                else { node[key] = window }
+            }
+            if !models.isEmpty { node["models"] = models }
+            node["account"] = account
+            node["source"] = "usage"
+            try JSONSerialization.data(withJSONObject: node).write(to: URL(fileURLWithPath: temp))
+            if ClaudeCodeAccount.identity() != account { return T("묻는 동안 계정이 바뀌었습니다") }
+            guard rename(temp, resultPath) == 0 else { throw POSIXError(.EIO) }
+            return nil
+        } catch {
+            return T("결과를 남기지 못했습니다: {0}", error.localizedDescription)
+        }
+    }
+
+    private static func cleanOldTemps() {
+        let dir = cacheDir + "/claude"
+        let cutoff = Date().addingTimeInterval(-86_400)
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+        where name.hasPrefix(".usage-command.") && name.hasSuffix(".tmp") {
+            let path = dir + "/" + name
+            if let m = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date, m < cutoff {
+                try? FileManager.default.removeItem(atPath: path)
+            }
+        }
+    }
+
+    /// 두 결과가 같은 값인지. 서버가 주는 초기화 시각은 같은 창이어도 1분쯤 오가므로 2분 안의 차이는 같은 것으로 본다.
+    private static func sameLimits(_ a: [String: (used: Double, reset: Double)]?, _ b: [String: (used: Double, reset: Double)]?) -> Bool {
+        guard let a, let b else { return a == nil && b == nil }
+        guard a.count == b.count else { return false }
+        for (key, x) in a {
+            guard let y = b[key], x.used == y.used, abs(x.reset - y.reset) <= 120 else { return false }
+        }
+        return true
+    }
+
+    /// 값이 바뀌었거나 실패했을 때만 한 줄 남긴다(같은 값·같은 실패가 이어지면 남기지 않는다). 256KB 를 넘으면 뒤쪽 절반만 남긴다.
+    private static func log(reason: String, limits: [String: (used: Double, reset: Double)]?, error: String?, seconds: Double) {
+        let skip = lock.withLock { () -> Bool in
+            if error != nil ? error == lastLoggedError : (lastLoggedError == nil && sameLimits(limits, lastLoggedLimits)) { return true }
+            lastLoggedError = error
+            lastLoggedLimits = error == nil ? limits : nil
+            return false
+        }
+        if skip { return }
+        func name(_ key: String) -> String {
+            key == "five_hour" ? "5시간" : key == "seven_day" ? "주간" : key.replacingOccurrences(of: ClaudeReader.modelPrefix, with: "주간 ")
+        }
+        func order(_ key: String) -> Int { key == "five_hour" ? 0 : key == "seven_day" ? 1 : 2 }
+        let summary = error ?? (limits ?? [:]).sorted { (order($0.key), $0.key) < (order($1.key), $1.key) }.map { key, value -> String in
+            var s = "\(name(key)) \(value.used.formatted(.number.locale(Locale(identifier: "en_US_POSIX")).grouping(.never)))%"
+            if value.reset > 0 { s += "(초기화 \(formatterPOSIX("MM-dd HH:mm").string(from: Date(timeIntervalSince1970: value.reset))))" }
+            return s
+        }.joined(separator: " · ")
+        let line = "\(formatterPOSIX("yyyy-MM-dd HH:mm:ss").string(from: Date())) [\(reason)] \(summary) (\(String(format: "%.1f", seconds))초)\n"
+        try? FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
+        if let size = (try? FileManager.default.attributesOfItem(atPath: logPath))?[.size] as? NSNumber, size.intValue > 256 * 1024,
+           let text = try? String(contentsOfFile: logPath, encoding: .utf8) {
+            let half = text.index(text.startIndex, offsetBy: text.count / 2)
+            let rest = text[half...].firstIndex(of: "\n").map { String(text[text.index(after: $0)...]) } ?? ""
+            try? rest.write(toFile: logPath, atomically: true, encoding: .utf8)
+        }
+        if let handle = FileHandle(forWritingAtPath: logPath) {
+            handle.seekToEndOfFile(); handle.write(Data(line.utf8)); try? handle.close()
+        } else {
+            try? Data(line.utf8).write(to: URL(fileURLWithPath: logPath))
+        }
+    }
+}
+
+/// 날짜를 늘 같은 모양으로(기록 파일용 — 고른 언어와 상관없이)
+private func formatterPOSIX(_ format: String) -> DateFormatter {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.dateFormat = format
+    return f
+}
+
+/// Claude Code 가 응답할 때마다 대화 기록(~/.claude/projects/…/*.jsonl)에 바로 쓰는 것을 지켜본다 — CLI·데스크톱 앱 Code 탭 모두.
+/// 바뀐 때만 적어 두고, 받는 쪽(창의 타이머)이 take() 로 가져가 /usage 를 묻는다. 폴더가 아직 없으면 ensure() 가 나중에 다시 건다.
+final class ClaudeActivityWatcher {
+    private var stream: FSEventStreamRef?
+    private let lock = NSLock()
+    private var first: Date?, last: Date?
+    private let queue = DispatchQueue(label: "ai-usage.claude-activity")
+
+    func ensure() {
+        guard stream == nil else { return }
+        let dir = homeDir + "/.claude/projects"
+        guard FileManager.default.fileExists(atPath: dir) else { return }
+        var context = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(), retain: nil, release: nil, copyDescription: nil)
+        let callback: FSEventStreamCallback = { _, info, count, paths, _, _ in
+            guard let info else { return }
+            let watcher = Unmanaged<ClaudeActivityWatcher>.fromOpaque(info).takeUnretainedValue()
+            let list = unsafeBitCast(paths, to: NSArray.self) as? [String] ?? []
+            if list.contains(where: { $0.hasSuffix(".jsonl") }) || count == 0 { watcher.mark() }
+        }
+        let flags = FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagNoDefer)
+        guard let s = FSEventStreamCreate(kCFAllocatorDefault, callback, &context, [dir] as CFArray,
+                                          FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 1.0, flags) else { return }
+        FSEventStreamSetDispatchQueue(s, queue)
+        if FSEventStreamStart(s) { stream = s } else { FSEventStreamInvalidate(s); FSEventStreamRelease(s) }
+    }
+
+    private func mark() {
+        let now = Date()
+        lock.withLock { if first == nil { first = now }; last = now }
+    }
+
+    /// 아직 가져가지 않은 활동(처음·마지막). 없으면 nil
+    func pending() -> (first: Date, last: Date)? {
+        lock.withLock { first.flatMap { f in last.map { (f, $0) } } }
+    }
+
+    /// 활동을 가져갔다(이제 /usage 를 묻는다)
+    func take() { lock.withLock { first = nil; last = nil } }
+
+    /// 지금 /usage 를 물을 때인지와 그 계기. 처음, 5분이 지났을 때, 또는 활동이 있었고 1분이 지났으며
+    /// 활동이 5초 잠잠하거나(응답이 끝남) 30초 넘게 이어질 때(긴 작업 중에도 갱신)
+    static func due(now: Date, lastAsked: Date?, pending: (first: Date, last: Date)?) -> String? {
+        guard let asked = lastAsked else { return "시작" }
+        if now.timeIntervalSince(asked) >= ClaudeUsageCommand.fallbackInterval { return "5분" }
+        if let p = pending, now.timeIntervalSince(asked) >= ClaudeUsageCommand.minInterval,
+           now.timeIntervalSince(p.last) >= 5 || now.timeIntervalSince(p.first) >= 30 { return "활동" }
+        return nil
+    }
+
+    deinit {
+        if let stream { FSEventStreamStop(stream); FSEventStreamInvalidate(stream); FSEventStreamRelease(stream) }
     }
 }
 
@@ -665,7 +1142,7 @@ final class CodexReader {
             }
         }
 
-        guard send(#"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"ai-usage-pet","version":"1.0"}}}"#),
+        guard send(#"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"ai-usage-widget","version":"1.0"}}}"#),
               receive(id: 1) != nil else { return (nil, T("codex 가 응답하지 않습니다")) }
         _ = send(#"{"method":"initialized"}"#)
         guard send(#"{"id":2,"method":"account/rateLimits/read"}"#),
@@ -682,11 +1159,11 @@ final class CodexReader {
     }
 }
 
-// MARK: - 세션 (지금 켜진 Claude Code·Codex 작업이 진행 중인지, 답을 마쳤는지)
+// MARK: - 세션 (지금 켜 둔 Claude Code·Codex 작업이 작업 중인지, 내 입력을 기다리는지, 끝났는지) — Windows 판 Sessions.cs 와 같은 규칙
 
-/// 창에 놓는 순서도 이 순서: 내 확인을 기다리는 것 → 진행 중 → 답 나옴 → 멈춤
+/// 창에 놓는 순서도 이 순서: 입력 필요 → 작업 중 → 작업 완료 → 알 수 없음
 enum SessionState: Int {
-    case waiting, working, answered, stopped, unknown
+    case waiting, working, done, unknown
 }
 
 enum SessionTool { case claude, codex }
@@ -697,15 +1174,25 @@ struct AgentSession: Identifiable {
     let name: String
     let cwd: String
     let state: SessionState
-    let since: Date  // 진행 중이면 시작한 때, 그 밖에는 그 상태가 된 때
+    let since: Date  // 작업 중이면 시작한 때, 그 밖에는 그 상태가 된 때
     var background = false  // 답은 마쳤지만 뒤에서 명령이 아직 도는 Claude 세션
+    var aborted = false  // 중단됐거나 끝 표시 없이 꺼진 Codex 작업(작업 완료로 보이고 메뉴에 「(중단됨)」)
+    var titled = false  // Codex 앱이 붙인 대화 제목을 이름으로 쓴다
+    var link: String?  // 그 대화를 여는 링크(Claude 데스크톱 앱 claude://…/epitaxy/local_…, Codex 앱 codex://threads/<id>)
+    var pid: pid_t?  // 그 세션을 돌리는 프로세스(링크가 없는 터미널 세션은 그 터미널 앱을 앞으로)
 }
 
-/// 진행 중인 것부터, 같은 상태에서는 최근에 바뀐 것부터
+/// 상태 순서대로, 같은 상태에서는 최근에 바뀐 것부터
 func sortSessions(_ list: [AgentSession]) -> [AgentSession] {
     list.sorted { a, b in
         a.state.rawValue != b.state.rawValue ? a.state.rawValue < b.state.rawValue : a.since > b.since
     }
+}
+
+/// 보일 줄: 8개까지, 넘으면 7줄과 「외 N개」
+let sessionMaxRows = 8
+func visibleSessions(_ list: [AgentSession]) -> (shown: [AgentSession], hidden: Int) {
+    list.count <= sessionMaxRows ? (list, 0) : (Array(list.prefix(sessionMaxRows - 1)), list.count - sessionMaxRows + 1)
 }
 
 func readJSONObject(_ path: String) -> [String: Any]? {
@@ -718,6 +1205,23 @@ func executablePath(_ pid: pid_t) -> String? {
     var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
     guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { return nil }
     return String(cString: buffer)
+}
+
+/// 프로세스가 시작한 때(없으면 nil)
+func processStart(_ pid: pid_t) -> Date? {
+    var info = proc_bsdinfo()
+    let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+    guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+    return Date(timeIntervalSince1970: Double(info.pbi_start_tvsec) + Double(info.pbi_start_tvusec) / 1_000_000)
+}
+
+/// 부모 프로세스(없으면 nil)
+func parentProcess(_ pid: pid_t) -> pid_t? {
+    var info = proc_bsdinfo()
+    let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+    guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+    let parent = pid_t(info.pbi_ppid)
+    return parent > 1 && parent != pid ? parent : nil
 }
 
 /// 파일 끝에서 최대 maxBytes 만큼을 줄 단위로(맨 앞의 잘린 줄은 버림)
@@ -741,7 +1245,7 @@ struct TranscriptTail {
 }
 
 /// Claude Code 는 실행 중인 세션마다 ~/.claude/sessions/<pid>.json 에 상태를 남긴다
-/// (status: busy·shell=진행 중, idle=답 나옴, waiting=권한 묻기 등에서 내 답을 기다림).
+/// (status: busy·shell=작업 중, waiting·blocked=입력 필요, idle=작업 완료). 터미널 CLI 와 데스크톱 앱 Code 탭 세션 모두.
 /// 공식 문서에 없는 형식이라 모르는 값이 오면 「알 수 없음」으로 둔다.
 final class ClaudeSessionReader {
     private var lastState: [String: SessionState] = [:]
@@ -757,16 +1261,17 @@ final class ClaudeSessionReader {
         var seen = Set<String>()
         for file in (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [] where file.hasSuffix(".json") {
             guard let obj = readJSONObject(dir + "/" + file),
-                  let pid = (obj["pid"] as? NSNumber)?.int32Value,
-                  let exe = executablePath(pid), exe.lowercased().contains("claude") else { continue }  // 꺼진 세션이 남긴 파일은 건너뛴다
-            let sessionId = obj["sessionId"] as? String ?? file
+                  let pid = number(obj["pid"]).flatMap({ $0.isFinite && $0 >= 1 && $0 <= Double(Int32.max) ? pid_t($0) : nil }),
+                  Self.alive(pid, procStart: obj["procStart"] as? String) else { continue }  // 꺼진 세션이 남긴 파일은 건너뛴다
+            if let kind = obj["kind"] as? String, kind != "interactive" { continue }  // claude -p(이 앱의 /usage 조회 등)는 빼고
+            let sessionId = obj["sessionId"] as? String ?? (file as NSString).deletingPathExtension
             let cwd = obj["cwd"] as? String ?? ""
             let changedAt = number(obj["statusUpdatedAt"]).map { Date(timeIntervalSince1970: $0 / 1000) } ?? now
             let key = "\(pid):\(sessionId)"
             seen.insert(key)
 
-            // 차례 도중(진행 중·확인 기다림)인 세션을 처음 보면 더 깊이(8MB) 읽는다 — 그 차례를 연 내 말과
-            // 지난 차례 끝에 적힌 제목이 화면 캡처 등에 밀려 멀리 있을 수 있다. 답을 마친 세션은 제목이 기록 맨 끝에 있다
+            // 차례 도중(작업 중·입력 필요)인 세션을 처음 보면 더 깊이(8MB) 읽는다 — 그 차례를 연 내 말과
+            // 지난 차례 끝에 적힌 제목이 화면 캡처 등에 밀려 멀리 있을 수 있다. 끝난 세션은 제목이 기록 맨 끝에 있다
             let status = obj["status"] as? String
             let tail = transcriptTail(sessionId: sessionId, deep: lastState[key] == nil && status != "idle")
             if let title = tail.title { titles[sessionId] = title }
@@ -779,15 +1284,16 @@ final class ClaudeSessionReader {
             switch status {
             case "busy", "shell":
                 // 뒤에서 도는 작업(백그라운드 명령 등)이 남아 있으면 답을 마친 뒤에도 busy 로 남는다 → 대화 기록 끝으로 가린다
+                // (데스크톱 앱 Code 탭 세션은 기록에 차례 끝 표시가 없어 status 를 그대로 믿는다)
                 if let ended = tail.turnEndedAt {
-                    state = .answered
+                    state = .done
                     since = ended
                     background = true
                 } else {
                     state = .working
                     promptAt = tail.promptAt
                 }
-            case "idle": state = .answered
+            case "idle": state = .done
             case "waiting", "blocked": state = .waiting
             default: state = .unknown
             }
@@ -796,7 +1302,7 @@ final class ClaudeSessionReader {
                 if lastState[key] == .working, let kept = workingSince[key] {
                     since = kept
                 } else if let before = lastState[key], before != .working {
-                    since = promptAt ?? now  // 이 앱이 보는 동안 진행 중으로 바뀜
+                    since = promptAt ?? now  // 이 앱이 보는 동안 작업 중으로 바뀜
                 } else {
                     since = promptAt ?? changedAt  // 앱을 막 켰을 때
                 }
@@ -805,8 +1311,11 @@ final class ClaudeSessionReader {
                 workingSince[key] = nil
             }
             lastState[key] = state
+            // 데스크톱 앱 Code 탭 세션은 앱 사이드바의 세션 id(hostSessionId)로 그 세션을 바로 연다
+            let host = obj["hostSessionId"] as? String
+            let link = host.flatMap { $0.range(of: "^local_[0-9A-Za-z-]{1,64}$", options: .regularExpression) != nil ? "claude://claude.ai/epitaxy/" + $0 : nil }
             result.append(AgentSession(id: "claude:" + key, tool: .claude, name: name, cwd: cwd, state: state, since: since,
-                                       background: background))
+                                       background: background, link: link, pid: pid))
         }
         lastState = lastState.filter { seen.contains($0.key) }
         workingSince = workingSince.filter { seen.contains($0.key) }
@@ -815,14 +1324,38 @@ final class ClaudeSessionReader {
         return result
     }
 
-    /// 보일 이름: /rename 으로 붙인 이름 → 대화 기록의 제목(Claude 가 붙인 것) → 지금 폴더 이름.
-    /// sessions/<pid>.json 의 name 은 직접 붙이지 않았으면(nameSource: derived) 켤 때 시작 폴더로 한 번 만든
+    /// 그 pid 가 아직 Claude Code 인가(실행 파일 경로에 claude — 맥의 Claude Code 는 실행 파일 이름이 판 번호다).
+    /// procStart(프로세스 시작 시각, 맥에서는 「Mon Nov 16 00:53:33 2026」 UTC)가 있으면 같은 pid 를 다른 프로세스가 다시 쓴 것도 가린다
+    static func alive(_ pid: pid_t, procStart: String?) -> Bool {
+        guard pid > 0, let exe = executablePath(pid), exe.lowercased().contains("claude") else { return false }
+        guard let text = procStart, let recorded = parseProcStart(text), let started = processStart(pid) else { return true }
+        let gap = abs(started.timeIntervalSince(recorded))
+        // 시간대를 붙이지 않고 적은 판이 있어도 놓치지 않게, 이 맥의 시간대만큼 어긋난 것도 같은 프로세스로 본다
+        let zone = Double(abs(TimeZone.current.secondsFromGMT(for: started)))
+        return gap < 2 || abs(gap - zone) < 2
+    }
+
+    private static let procStartFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "EEE MMM d HH:mm:ss yyyy"
+        return f
+    }()
+
+    static func parseProcStart(_ text: String) -> Date? {
+        let words = text.split(separator: " ", omittingEmptySubsequences: true).joined(separator: " ")
+        return procStartFormat.date(from: words)
+    }
+
+    /// 보일 이름: 직접 붙인 이름(데스크톱 앱 사이드바 제목·/rename) → 대화 기록의 제목(Claude 가 붙인 것) → 지금 폴더 이름.
+    /// sessions/<pid>.json 의 name 은 직접 붙이지 않았으면(nameSource 가 user 가 아니면) 켤 때 시작 폴더로 한 번 만든
     /// 「폴더-16진수 2자리」라서, 다른 폴더로 옮기거나 일이 바뀌어도 그대로다 — 그래서 쓰지 않는다.
     static func sessionName(_ obj: [String: Any], title: String?, cwd: String) -> String {
-        let given = (obj["name"] as? String)?.trimmingCharacters(in: .whitespaces) ?? ""
+        let given = (obj["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if obj["nameSource"] as? String == "user", !given.isEmpty { return given }
         if let title = title?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty { return title }
-        let folder = (cwd as NSString).lastPathComponent
+        let folder = folderName(cwd)
         return folder.isEmpty ? "Claude" : folder
     }
 
@@ -859,7 +1392,6 @@ final class ClaudeSessionReader {
             }
             if turnFound { continue }
             guard line.range(of: Data("\"type\":\"user\"".utf8)) != nil
-                    || line.range(of: Data("\"type\":\"assistant\"".utf8)) != nil
                     || line.range(of: Data("\"turn_duration\"".utf8)) != nil,
                   let entry = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else { continue }
             let at = (entry["timestamp"] as? String).flatMap(parseDate)
@@ -898,9 +1430,17 @@ final class ClaudeSessionReader {
     }
 }
 
+/// 경로의 마지막 폴더 이름(끝의 / \ 는 무시)
+func folderName(_ path: String) -> String {
+    var trimmed = Substring(path)
+    while let last = trimmed.last, last == "/" || last == "\\" { trimmed = trimmed.dropLast() }
+    return trimmed.split(whereSeparator: { $0 == "/" || $0 == "\\" }).last.map(String.init) ?? ""
+}
+
 /// Codex 는 작업마다 ~/.codex/sessions/<날짜>/rollout-*.jsonl 에 기록을 남긴다.
-/// 마지막 표시가 task_started 면 진행 중, task_complete 면 답 나옴, turn_aborted 면 멈춤.
-/// 진행 중으로 남았는데 그 파일을 연 codex 프로세스가 없으면 도중에 꺼진 것(멈춤).
+/// 마지막 표시가 task_started 면 작업 중, task_complete 면 작업 완료, turn_aborted 면 중단(작업 완료로 보이고 메뉴에 「(중단됨)」).
+/// 작업 중으로 남았는데 그 파일을 연 codex 프로세스가 없으면 도중에 꺼진 것(역시 중단).
+/// Windows 판은 다른 프로세스가 연 파일을 알기 어려워 「기록이 20분 넘게 안 바뀌었거나 codex 가 없으면 중단」으로 본다 — 그 밖의 규칙은 같다.
 final class CodexSessionReader {
     /// 끝난 작업을 창에 남겨 두는 시간
     static let keepFinished: TimeInterval = 30 * 60
@@ -909,17 +1449,24 @@ final class CodexSessionReader {
         var offset: UInt64 = 0
         var cwd = ""
         var isSubagent = false
-        var startedAt: Date?
         var lastKind: String?
         var lastAt: Date?
     }
     private var tracks: [String: Track] = [:]
+    private var threadNames: [String: String] = [:]
+    private var namesSize: UInt64?
 
     func read(now: Date) -> [AgentSession] {
         let open = Self.openRolloutFiles()
+        var files = Self.recentlyWritten(now: now)
+        // 열려 있는 기록은 오래전에 바뀌었어도 본다(맥은 codex 가 연 파일을 바로 안다)
+        for path in open where !files.contains(where: { $0.path == path }) {
+            if let mtime = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date { files.append((path, mtime)) }
+        }
+        let names = threadNamesNow()
         var result: [AgentSession] = []
         var seen = Set<String>()
-        for file in CodexReader.recentRolloutFiles(now: now) {
+        for file in files {
             let isOpen = open.contains(file.path)
             if !isOpen && now.timeIntervalSince(file.mtime) > Self.keepFinished { continue }
             seen.insert(file.path)
@@ -930,24 +1477,80 @@ final class CodexSessionReader {
 
             let state: SessionState
             let since: Date
+            var aborted = false
             switch track.lastKind {
             case "task_complete":
-                state = .answered; since = track.lastAt ?? file.mtime
+                state = .done; since = track.lastAt ?? file.mtime
             case "turn_aborted":
-                state = .stopped; since = track.lastAt ?? file.mtime
+                state = .done; since = track.lastAt ?? file.mtime; aborted = true
+            case "task_started" where isOpen:
+                state = .working; since = track.lastAt ?? file.mtime
             case "task_started":
-                if isOpen { state = .working; since = track.lastAt ?? file.mtime } else { state = .stopped; since = file.mtime }
+                state = .done; since = file.mtime; aborted = true
             default:
-                guard isOpen else { continue }
-                state = .working; since = track.startedAt ?? file.mtime
+                continue  // 아직 시작한 작업이 없다
             }
-            let name = track.cwd.isEmpty ? "Codex" : (track.cwd as NSString).lastPathComponent
-            result.append(AgentSession(id: "codex:" + file.path, tool: .codex, name: name, cwd: track.cwd, state: state, since: since))
+            if state == .done && now.timeIntervalSince(since) > Self.keepFinished { continue }
+            // 이름: Codex 앱이 붙인 대화 제목, 없으면(CLI) 작업 폴더
+            let id = Self.threadId(file.path)
+            let title = names[id]
+            let folder = folderName(track.cwd)
+            let name = title ?? (folder.isEmpty ? "Codex" : folder)
+            result.append(AgentSession(id: "codex:" + file.path, tool: .codex, name: name, cwd: track.cwd, state: state, since: since,
+                                       aborted: aborted, titled: title != nil, link: Self.threadLink(id)))
         }
         tracks = tracks.filter { seen.contains($0.key) }
-        // 같은 폴더에서 Codex 를 다시 돌리면(설계 → 구현 등) 앞의 끝난 기록은 빼고 최근 것만
-        let latest = Dictionary(result.map { ($0.cwd, $0.since) }, uniquingKeysWith: max)
-        return result.filter { $0.state == .working || $0.cwd.isEmpty || $0.since >= latest[$0.cwd, default: $0.since] }
+        // 제목 없는 CLI 작업을 같은 폴더에서 다시 돌리면(설계 → 구현 등) 앞의 끝난 기록은 빼고 최근 것만.
+        // 제목이 있는 Codex 앱 대화는 같은 폴더라도 서로 다른 대화라 그대로 둔다
+        let latest = Dictionary(result.filter { !$0.titled }.map { ($0.cwd, $0.since) }, uniquingKeysWith: max)
+        return result.filter { $0.titled || $0.state == .working || $0.cwd.isEmpty || $0.since >= latest[$0.cwd, default: $0.since] }
+    }
+
+    /// 최근(끝난 작업을 남겨 두는 시간 안)에 바뀐 rollout 기록. Codex 앱은 대화를 처음 만든 날짜 폴더(예: 10/30)에 계속 이어 쓰므로
+    /// 날짜 폴더가 아니라 바뀐 시각으로 고른다
+    static func recentlyWritten(now: Date) -> [(path: String, mtime: Date)] {
+        let root = homeDir + "/.codex/sessions"
+        guard let walker = FileManager.default.enumerator(atPath: root) else { return [] }
+        var files: [(path: String, mtime: Date)] = []
+        while let relative = walker.nextObject() as? String {
+            let name = (relative as NSString).lastPathComponent
+            guard name.hasPrefix("rollout-"), name.hasSuffix(".jsonl"),
+                  let mtime = walker.fileAttributes?[.modificationDate] as? Date,
+                  now.timeIntervalSince(mtime) <= keepFinished else { continue }
+            files.append((root + "/" + relative, mtime))
+        }
+        return files
+    }
+
+    /// rollout-2026-10-30T11-22-00-<대화 id>.jsonl 의 대화 id
+    static func threadId(_ path: String) -> String {
+        let name = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
+        return name.count > 36 ? String(name.suffix(36)) : name
+    }
+
+    /// Codex 앱에서 그 대화를 여는 링크(대화 id 가 UUID 모양일 때만)
+    static func threadLink(_ id: String) -> String? {
+        id.range(of: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", options: .regularExpression) != nil
+            ? "codex://threads/" + id : nil
+    }
+
+    /// ~/.codex/session_index.jsonl: 대화 id 마다 제목(thread_name). 이름을 바꾸면 줄이 덧붙으므로 마지막 것이 지금 제목
+    private func threadNamesNow() -> [String: String] {
+        let path = homeDir + "/.codex/session_index.jsonl"
+        let size = ((try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? NSNumber)?.uint64Value ?? 0
+        if size == namesSize { return threadNames }
+        var next: [String: String] = [:]
+        if let data = FileManager.default.contents(atPath: path) {
+            for line in data.split(separator: 0x0A) {
+                guard let entry = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any],
+                      let id = entry["id"] as? String,
+                      let title = (entry["thread_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty else { continue }
+                next[id] = title
+            }
+        }
+        threadNames = next
+        namesSize = size
+        return next
     }
 
     /// 지난번 읽은 곳 다음부터 끝난 줄만 읽는다(기록은 수 MB 까지 커진다)
@@ -970,7 +1573,6 @@ final class CodexSessionReader {
             case "session_meta":
                 track.cwd = payload["cwd"] as? String ?? track.cwd
                 track.isSubagent = payload["source"] is [String: Any]  // 하위 작업은 source 가 {subagent: …}
-                track.startedAt = at
             case "event_msg":
                 if let kind = payload["type"] as? String, ["task_started", "task_complete", "turn_aborted"].contains(kind) {
                     track.lastKind = kind
@@ -982,7 +1584,7 @@ final class CodexSessionReader {
         }
     }
 
-    /// 실행 파일 이름이 codex 로 시작하는 프로세스들이 열어 둔 rollout 기록 파일
+    /// 실행 파일 이름이 codex 로 시작하는(대소문자 무시) 프로세스들이 열어 둔 rollout 기록 파일
     static func openRolloutFiles() -> Set<String> {
         var result = Set<String>()
         let count = proc_listallpids(nil, 0)
@@ -990,7 +1592,7 @@ final class CodexSessionReader {
         var pids = [pid_t](repeating: 0, count: Int(count) + 64)
         let filled = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size))
         for pid in pids.prefix(Int(max(0, filled))) where pid > 0 {
-            guard let exe = executablePath(pid), (exe as NSString).lastPathComponent.hasPrefix("codex") else { continue }
+            guard let exe = executablePath(pid), (exe as NSString).lastPathComponent.lowercased().hasPrefix("codex") else { continue }
             let bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
             guard bytes > 0 else { continue }
             let stride = MemoryLayout<proc_fdinfo>.stride
@@ -1007,6 +1609,35 @@ final class CodexSessionReader {
             }
         }
         return result
+    }
+}
+
+/// 세션 줄을 누르면 그 대화를 연다: 데스크톱 앱 세션은 앱의 링크(claude://…, codex://threads/…)로 그 대화를,
+/// 링크가 없는 터미널 세션은 그 프로세스를 띄운 터미널 앱(Ghostty·cmux·터미널 등)을 앞으로(어느 탭인지까지는 못 고른다)
+enum SessionOpener {
+    static func open(_ s: AgentSession) {
+        if let link = s.link, let url = URL(string: link), NSWorkspace.shared.urlForApplication(toOpen: url) != nil {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        guard let pid = s.pid, let app = terminalApp(of: pid), let bundle = app.bundleURL else { return }
+        // 이 앱은 초점을 뺏지 않는 창이라 앞에 있지 않다 — macOS 14 부터는 앞에 없는 앱이 다른 앱을 직접 앞으로 못 꺼내므로
+        // Finder·Dock 처럼 LaunchServices 로 「열기」를 해서 앞으로 가져온다(이미 떠 있으면 새로 띄우지 않는다)
+        app.unhide()
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.openApplication(at: bundle, configuration: configuration)
+    }
+
+    /// 그 프로세스와 부모들 가운데 화면에 창을 띄우는 앱(Dock 에 보이는 앱). 12대까지 올라간다
+    static func terminalApp(of pid: pid_t) -> NSRunningApplication? {
+        var current: pid_t? = pid
+        for _ in 0..<12 {
+            guard let p = current else { return nil }
+            if let app = NSRunningApplication(processIdentifier: p), app.activationPolicy == .regular { return app }
+            current = parentProcess(p)
+        }
+        return nil
     }
 }
 
@@ -1061,22 +1692,29 @@ func durationText(since: Date, now: Date) -> String? {
     return minutes % 60 == 0 ? T("{0}시간", minutes / 60) : T("{0}시간 {1}분", minutes / 60, minutes % 60)
 }
 
-/// 세션 줄 오른쪽 글자: 「진행 중 12분」「답 나옴 8분 전」「확인 기다림」「멈춤 25분 전」
+/// 세션 줄 오른쪽 글자: 「작업 중 12분」「입력 필요」「작업 완료 8분 전」(Windows 판 AgentSession.StatusText 와 같다)
 func sessionStatusText(_ s: AgentSession, now: Date) -> String {
     switch s.state {
-    case .working: return [T("진행 중"), durationText(since: s.since, now: now)].compactMap { $0 }.joined(separator: " ")
-    case .answered: return T("답 나옴 {0}", ageText(s.since, now: now))
-    case .waiting: return T("확인 기다림")
-    case .stopped: return T("멈춤 {0}", ageText(s.since, now: now))
+    case .working: return [T("작업 중"), durationText(since: s.since, now: now)].compactMap { $0 }.joined(separator: " ")
+    case .waiting: return T("입력 필요")
+    case .done: return T("작업 완료 {0}", ageText(s.since, now: now))
     case .unknown: return T("알 수 없음")
     }
 }
 
+/// 메뉴·--print 한 줄: 「Claude · 이름 — 작업 중 12분 · ~/폴더」
 func describeSession(_ s: AgentSession, now: Date) -> String {
     let home = homeDir
     let place = s.cwd.hasPrefix(home) ? "~" + s.cwd.dropFirst(home.count) : s.cwd
-    let note = s.background ? " " + T("(뒤에서 명령이 아직 도는 중)") : ""
+    let note = s.background ? " " + T("(뒤에서 명령이 아직 도는 중)") : s.aborted ? " " + T("(중단됨)") : ""
     return "\(s.tool == .claude ? "Claude" : "Codex") · \(s.name) — \(sessionStatusText(s, now: now))\(note)\(place.isEmpty ? "" : " · \(place)")"
+}
+
+/// 「세션」 아래 한 줄씩(--print·--sessions, Windows 판 Report.DescribeSessions 와 같다)
+func describeSessions(_ sessions: [AgentSession], now: Date) -> String {
+    var lines = [T("세션")]
+    lines += sessions.isEmpty ? ["  " + T("열린 세션이 없습니다")] : sessions.map { "  " + describeSession($0, now: now) }
+    return lines.joined(separator: "\n")
 }
 
 /// 상태 표시줄과 같은 기준: 50% 이상 초록, 20% 이상 노랑, 그 아래 빨강
@@ -1102,7 +1740,28 @@ enum Shown {
     static let claudeKey = "showClaude"
     static let codexKey = "showCodex"
     static let sessionsKey = "showSessions"
+    static let modelsKey = "showModelLimits"  // 모델별 한도(Fable 등) 줄 — 처음엔 켜짐
+    static let modelAlertsKey = "modelLimitAlerts"  // 모델별 한도도 알림 — 처음엔 꺼짐
+    // 칸 접기(머리줄을 누르면 접고 펴고, 기억한다 — Windows 판 FoldSessions·FoldClaude·FoldCodex)
+    static let foldSessionsKey = "foldSessions"
+    static let foldClaudeKey = "foldClaude"
+    static let foldCodexKey = "foldCodex"
     static func get(_ key: String) -> Bool { UserDefaults.standard.object(forKey: key) as? Bool ?? true }
+    static func folded(_ key: String) -> Bool { UserDefaults.standard.object(forKey: key) as? Bool ?? false }
+}
+
+/// 표시 방식: 떠 있는 창(0) 또는 메뉴 막대 간단 모드(1), 그리고 메뉴 막대 게이지 크기(75 작게, 100 크게) — Windows 판 DisplayMode·TaskbarSize
+enum Display {
+    static let modeKey = "displayMode"
+    static let sizeKey = "menuBarSize"
+    static var mode: Int {
+        get { [0, 1].contains(UserDefaults.standard.integer(forKey: modeKey)) ? UserDefaults.standard.integer(forKey: modeKey) : 0 }
+        set { UserDefaults.standard.set(newValue, forKey: modeKey) }
+    }
+    static var size: Int {
+        get { UserDefaults.standard.integer(forKey: sizeKey) == 75 ? 75 : 100 }
+        set { UserDefaults.standard.set(newValue, forKey: sizeKey) }
+    }
 }
 
 /// 창 안 칸. 순서는 「칸 순서」 메뉴에서 고르고 기억한다(처음엔 세션 → Claude → ChatGPT)
@@ -1195,8 +1854,10 @@ struct PetAppearance {
     var opacity: Double { [1, 0.70, 0.48, 0.26][background] }
     func length(_ points: CGFloat) -> CGFloat { points * CGFloat(window) / 100 }
     func typeSize(_ points: CGFloat) -> CGFloat { length(points) * CGFloat(text) / 100 }
-    var labelWidth: CGFloat { L10n.current == "en" ? 40 : 30 }
-    var width: CGFloat { length(290 + (labelWidth + 62 + 70) * CGFloat(text - 100) / 100) }
+    /// 모델별 줄(예: 「Fable」)처럼 긴 칸 이름에 맞춰 이름 칸을 늘린 만큼(기본 글자 크기 기준, 최대 64) — 늘린 만큼 창도 넓어진다
+    var labelExtra: CGFloat = 0
+    var labelWidth: CGFloat { (L10n.current == "en" ? 40 : 30) + labelExtra }
+    var width: CGFloat { length(290 + (labelWidth + 62 + 70) * CGFloat(text - 100) / 100 + labelExtra) }
 
     @ViewBuilder func shaded(_ text: Text) -> some View {
         if background == 3 {
@@ -1230,17 +1891,54 @@ final class UsageModel: ObservableObject {
     @Published var showClaude = Shown.get(Shown.claudeKey)
     @Published var showCodex = Shown.get(Shown.codexKey)
     @Published var showSessions = Shown.get(Shown.sessionsKey)
+    @Published var showModels = Shown.get(Shown.modelsKey)
+    @Published var foldSessions = Shown.folded(Shown.foldSessionsKey)
+    @Published var foldClaude = Shown.folded(Shown.foldClaudeKey)
+    @Published var foldCodex = Shown.folded(Shown.foldCodexKey)
+    /// 마우스가 올라간 세션 줄(밝은 바탕)
+    @Published var hovered: String?
+    /// 누를 수 있는 곳(떠 있는 창·세션 패널 안 좌표, 위에서부터). 그릴 때마다 바뀌므로 다시 그리게 하지 않는다
+    var hits: [HitTarget: CGRect] = [:]
+    var panelHits: [HitTarget: CGRect] = [:]
 }
 
 let claudeTint = Color(red: 0.851, green: 0.467, blue: 0.341)
 let codexTint = Color(red: 0.063, green: 0.639, blue: 0.498)
+
+/// 누를 수 있는 곳: 칸 머리줄(접고 펴기), 세션 줄(그 대화 열기). 창 안 좌표(위에서부터)는 HitTargetKey 로 모은다
+enum HitTarget: Hashable {
+    case header(Pane)
+    case session(String)
+}
+
+struct HitTargetKey: PreferenceKey {
+    static let defaultValue: [HitTarget: CGRect] = [:]
+    static func reduce(value: inout [HitTarget: CGRect], nextValue: () -> [HitTarget: CGRect]) {
+        value.merge(nextValue()) { $1 }
+    }
+}
+
+extension View {
+    /// 이 뷰의 자리를 이름 붙인 좌표계(떠 있는 창 「pet」, 세션 패널 「panel」) 안에서 남긴다
+    func hitTarget(_ target: HitTarget, in space: String) -> some View {
+        background(GeometryReader { geo in
+            Color.clear.preference(key: HitTargetKey.self, value: [target: geo.frame(in: .named(space))])
+        })
+    }
+}
+
+func hitTarget(at point: NSPoint, in hits: [HitTarget: CGRect]) -> HitTarget? {
+    // 세션 줄이 머리줄보다 먼저(겹치지 않지만 혹시 겹치면 줄을 고른다)
+    let found = hits.filter { $0.value.contains(point) }.map(\.key)
+    return found.first { if case .session = $0 { return true } else { return false } } ?? found.first
+}
 
 struct PetView: View {
     @ObservedObject var model: UsageModel
 
     var body: some View {
         let look = model.appearance
-        // 고른 순서대로, 켜 둔 칸만. 칸 사이에만 구분선을 넣는다.
+        // 고른 순서대로, 켜 둔 칸만(세션은 열린 세션이 있을 때만). 칸 사이에만 구분선을 넣는다.
         let panes = model.order.filter(isShown)
         VStack(alignment: .leading, spacing: look.length(9)) {
             ForEach(Array(panes.enumerated()), id: \.element) { index, pane in
@@ -1253,57 +1951,125 @@ struct PetView: View {
         .padding(.horizontal, look.length(12))
         .padding(.vertical, look.length(10))
         .frame(width: look.width)
+        .coordinateSpace(name: "pet")
+        .onPreferenceChange(HitTargetKey.self) { [model] hits in model.hits = hits }
         .environment(\.petAppearance, look)
     }
 
     private func isShown(_ pane: Pane) -> Bool {
         switch pane {
-        case .sessions: return model.showSessions
+        case .sessions: return model.showSessions && !model.sessions.isEmpty
         case .claude: return model.showClaude
         case .codex: return model.showCodex
         }
     }
 
     @ViewBuilder private func paneView(_ pane: Pane) -> some View {
+        let look = model.appearance
+        // 접은 Claude·ChatGPT 의 막대가 같은 자리에서 시작하게 이름 칸은 긴 쪽 너비로
+        let nameFont = NSFont.systemFont(ofSize: look.typeSize(12), weight: .semibold)
+        let nameColumn = ["Claude", "ChatGPT"].map { ($0 as NSString).size(withAttributes: [.font: nameFont]).width.rounded(.up) }.max() ?? 0
         switch pane {
         case .sessions:
-            SessionSection(sessions: model.sessions, now: model.now)
+            SessionSection(sessions: model.sessions, now: model.now, folded: model.foldSessions, hovered: model.hovered)
         case .claude:
-            ProviderSection(name: "Claude", detail: nil, color: claudeTint, snap: model.claude, now: model.now)
+            ProviderSection(pane: .claude, name: "Claude", detail: nil, color: claudeTint, snap: model.claude, now: model.now,
+                            showModels: model.showModels, folded: model.foldClaude, nameColumn: nameColumn)
         case .codex:
-            ProviderSection(name: "ChatGPT", detail: ["Codex", model.codex.plan].compactMap { $0 }.joined(separator: " · "),
-                            color: codexTint, snap: model.codex, now: model.now)
+            ProviderSection(pane: .codex, name: "ChatGPT", detail: ["Codex", model.codex.plan].compactMap { $0 }.joined(separator: " · "),
+                            color: codexTint, snap: model.codex, now: model.now, showModels: model.showModels,
+                            folded: model.foldCodex, nameColumn: nameColumn)
         }
+    }
+}
+
+/// 머리줄 오른쪽 끝: 펼침 ▲ / 접힘 ▼ (누르면 바뀐다)
+struct Caret: View {
+    @Environment(\.petAppearance) private var look
+    let folded: Bool
+
+    var body: some View {
+        Path { p in
+            let w = look.length(8), h = look.length(8) * 0.55
+            if folded {
+                p.move(to: CGPoint(x: 0, y: 0)); p.addLine(to: CGPoint(x: w, y: 0)); p.addLine(to: CGPoint(x: w / 2, y: h))
+            } else {
+                p.move(to: CGPoint(x: 0, y: h)); p.addLine(to: CGPoint(x: w, y: h)); p.addLine(to: CGPoint(x: w / 2, y: 0))
+            }
+            p.closeSubpath()
+        }
+        .fill(Color(nsColor: .tertiaryLabelColor))
+        .frame(width: look.length(8), height: look.length(8) * 0.55)
     }
 }
 
 struct ProviderSection: View {
     @Environment(\.petAppearance) private var look
 
+    let pane: Pane
     let name: String
     let detail: String?
     let color: Color
     let snap: ProviderSnapshot
     let now: Date
+    var showModels = true
+    var folded = false
+    var nameColumn: CGFloat = 0
 
     var body: some View {
+        let windows = snap.visibleWindows(showModels: showModels)
         VStack(alignment: .leading, spacing: look.length(5)) {
-            HStack(spacing: look.length(6)) {
-                Circle().fill(color).frame(width: look.length(7), height: look.length(7))
-                look.shaded(Text(name)).font(.system(size: look.typeSize(12), weight: .semibold))
-                if let detail, !detail.isEmpty {
-                    look.shaded(Text(detail)).font(.system(size: look.typeSize(10))).foregroundStyle(.secondary)
+            if folded { foldedHeader } else { header }
+            if !folded {
+                if windows.isEmpty {
+                    look.shaded(Text(snap.message ?? T("값이 없습니다"))).font(.system(size: look.typeSize(11))).foregroundStyle(.secondary)
                 }
-                Spacer(minLength: look.length(4))
-                look.shaded(Text(ageText(snap.observedAt, now: now))).font(.system(size: look.typeSize(10))).foregroundStyle(.tertiary)
-            }
-            if snap.windows.isEmpty {
-                look.shaded(Text(snap.message ?? T("값이 없습니다"))).font(.system(size: look.typeSize(11))).foregroundStyle(.secondary)
-            }
-            ForEach(snap.windows) { window in
-                WindowRow(window: window, now: now)
+                ForEach(windows) { window in
+                    WindowRow(window: window, now: now)
+                }
             }
         }
+    }
+
+    private var header: some View {
+        HStack(spacing: look.length(6)) {
+            Circle().fill(color).frame(width: look.length(7), height: look.length(7))
+            look.shaded(Text(name)).font(.system(size: look.typeSize(12), weight: .semibold))
+            if let detail, !detail.isEmpty {
+                look.shaded(Text(detail)).font(.system(size: look.typeSize(10))).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: look.length(4))
+            look.shaded(Text(ageText(snap.observedAt, now: now))).font(.system(size: look.typeSize(10))).foregroundStyle(.tertiary)
+            Caret(folded: false)
+        }
+        .contentShape(Rectangle())
+        .hitTarget(.header(pane), in: "pet")
+    }
+
+    /// 「● Claude ▬▬── 26% ▼」: 주간 한도만(없으면 첫 한도)
+    private var foldedHeader: some View {
+        let weekly = snap.windows.first { $0.name == nil && $0.minutes == 10_080 } ?? snap.windows.first { $0.name == nil }
+        let percentFont = NSFont.monospacedDigitSystemFont(ofSize: look.typeSize(11), weight: .semibold)
+        let percentWidth = ("100%" as NSString).size(withAttributes: [.font: percentFont]).width.rounded(.up)
+        return HStack(spacing: look.length(6)) {
+            Circle().fill(color).frame(width: look.length(7), height: look.length(7))
+            look.shaded(Text(name)).font(.system(size: look.typeSize(12), weight: .semibold))
+                .frame(width: nameColumn + look.length(4), alignment: .leading)
+            if let weekly {
+                let left = weekly.leftPercent(now: now)
+                let tint = statusColor(left)
+                Bar(fraction: Double(left) / 100, color: tint)
+                look.shaded(Text("\(left)%")).font(.system(size: look.typeSize(11), weight: .semibold).monospacedDigit())
+                    .foregroundStyle(tint).frame(width: percentWidth, alignment: .trailing)
+            } else {
+                look.shaded(Text(snap.message ?? T("값이 없습니다"))).font(.system(size: look.typeSize(10))).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.tail)
+                Spacer(minLength: 0)
+            }
+            Caret(folded: true)
+        }
+        .contentShape(Rectangle())
+        .hitTarget(.header(pane), in: "pet")
     }
 }
 
@@ -1318,7 +2084,8 @@ struct WindowRow: View {
         let tint = statusColor(left)
         let reset = resetText(window.resetsAt, now: now)
         HStack(spacing: look.length(8)) {
-            look.shaded(Text(window.label)).font(.system(size: look.typeSize(11))).foregroundStyle(.secondary).frame(width: look.typeSize(look.labelWidth), alignment: .leading)
+            look.shaded(Text(window.label)).font(.system(size: look.typeSize(11))).foregroundStyle(.secondary)
+                .lineLimit(1).truncationMode(.tail).frame(width: look.typeSize(look.labelWidth), alignment: .leading)
             Bar(fraction: Double(left) / 100, color: tint)
             look.shaded(Text(T("{0}% 남음", left))).font(.system(size: look.typeSize(11), weight: .semibold).monospacedDigit())
                 .foregroundStyle(tint).frame(width: look.typeSize(62), alignment: .trailing)
@@ -1353,157 +2120,220 @@ struct Bar: View {
     }
 }
 
-/// 세션 목록 — 한 줄에 「상태 표시 · 도구 점 · 이름 · 상태 글자」
+/// 세션 칸 — 머리줄 「≡ 세션 ▲」(접으면 「입력 1 · 진행 2 · 완료 2 ▼」) 아래 한 줄씩
 struct SessionSection: View {
     @Environment(\.petAppearance) private var look
 
     let sessions: [AgentSession]
     let now: Date
-    static let maxRows = 8
+    var folded = false
+    var hovered: String?
+    var space = "pet"
 
     var body: some View {
-        let count = { (state: SessionState) in sessions.filter { $0.state == state }.count }
         VStack(alignment: .leading, spacing: look.length(5)) {
             HStack(spacing: look.length(6)) {
                 Image(systemName: "list.bullet").font(.system(size: look.length(10), weight: .semibold)).foregroundStyle(.secondary).frame(width: look.length(7))
                 look.shaded(Text(T("세션"))).font(.system(size: look.typeSize(12), weight: .semibold))
                 Spacer(minLength: look.length(4))
-                look.shaded(Text(T("진행 {0} · 답 {1} · 확인 {2}", count(.working), count(.answered), count(.waiting))))
-                    .font(.system(size: look.typeSize(10)).monospacedDigit()).foregroundStyle(.tertiary)
+                if folded { SessionCounts(sessions: sessions) }
+                Caret(folded: folded)
             }
-            if sessions.isEmpty {
-                look.shaded(Text(T("켜져 있는 세션이 없습니다"))).font(.system(size: look.typeSize(11))).foregroundStyle(.secondary)
-            }
-            ForEach(sessions.prefix(Self.maxRows)) { SessionRow(session: $0, now: now) }
-            if sessions.count > Self.maxRows {
-                look.shaded(Text(T("외 {0}개", sessions.count - Self.maxRows))).font(.system(size: look.typeSize(10))).foregroundStyle(.tertiary).padding(.leading, look.length(30))
+            .contentShape(Rectangle())
+            .hitTarget(.header(.sessions), in: space)
+            if !folded {
+                SessionRows(sessions: sessions, now: now, hovered: hovered, space: space)
             }
         }
     }
 }
 
+/// 접은 세션 칸의 개수: 0개는 빼고, 입력 필요는 주황·작업 중은 파랑·작업 완료는 회색
+struct SessionCounts: View {
+    @Environment(\.petAppearance) private var look
+    let sessions: [AgentSession]
+
+    var body: some View {
+        let entries: [(state: SessionState, text: String, color: Color)] = [
+            (.waiting, T("입력 {0}", count(.waiting)), sessionTint(.waiting)),
+            (.working, T("진행 {0}", count(.working)), sessionTint(.working)),
+            (.done, T("완료 {0}", count(.done)), Color.secondary),
+        ]
+        let parts = entries.filter { count($0.state) > 0 }
+        HStack(spacing: 0) {
+            ForEach(Array(parts.enumerated()), id: \.offset) { index, part in
+                if index > 0 { look.shaded(Text(" · ")).foregroundStyle(.tertiary) }
+                look.shaded(Text(part.text)).foregroundStyle(part.color)
+            }
+        }
+        .font(.system(size: look.typeSize(10)).monospacedDigit())
+        .fixedSize()
+    }
+
+    private func count(_ state: SessionState) -> Int { sessions.filter { $0.state == state }.count }
+}
+
+/// 세션 줄들: 8개까지, 넘으면 7줄과 「외 N개」
+struct SessionRows: View {
+    @Environment(\.petAppearance) private var look
+    let sessions: [AgentSession]
+    let now: Date
+    var hovered: String?
+    var space = "pet"
+
+    var body: some View {
+        let (shown, hidden) = visibleSessions(sessions)
+        ForEach(shown) { session in
+            SessionRow(session: session, now: now, hovered: hovered == session.id)
+                .hitTarget(.session(session.id), in: space)
+        }
+        if hidden > 0 {
+            look.shaded(Text(T("외 {0}개", hidden))).font(.system(size: look.typeSize(10))).foregroundStyle(.tertiary)
+                .padding(.leading, look.length(11))
+        }
+    }
+}
+
+/// 세션 상태 색: 입력 필요 주황, 작업 중 파랑, 작업 완료 초록, 그 밖엔 흐린 회색
+func sessionTint(_ state: SessionState) -> Color {
+    switch state {
+    case .waiting: return Color(nsColor: .systemOrange)
+    case .working: return Color(nsColor: .systemBlue)
+    case .done: return Color(nsColor: .systemGreen)
+    case .unknown: return Color(nsColor: .tertiaryLabelColor)
+    }
+}
+
+/// 세션 한 줄: 「● 이름 ……………… ◌ 작업 중 12분」 — 앞의 점은 도구(주황 Claude, 초록 Codex). Windows 판과 같은 모양
 struct SessionRow: View {
     @Environment(\.petAppearance) private var look
 
     let session: AgentSession
     let now: Date
+    var hovered = false
 
     var body: some View {
-        let style = Self.style(session.state)
-        let dim = session.state == .stopped || session.state == .unknown
+        let tint = sessionTint(session.state)
         HStack(spacing: look.length(6)) {
-            Group {
-                if session.state == .working {
-                    SpinningSymbol(name: style.icon, color: .systemBlue)
-                } else {
-                    Image(systemName: style.icon)
-                }
-            }
-            .font(.system(size: look.length(11), weight: .semibold)).foregroundStyle(style.tint).frame(width: look.length(13))
             Circle().fill(session.tool == .claude ? claudeTint : codexTint).frame(width: look.length(5), height: look.length(5))
-            look.shaded(Text(session.name)).font(.system(size: look.typeSize(11))).lineLimit(1).truncationMode(.middle)
-                .foregroundStyle(dim ? Color.secondary : Color.primary)
+            look.shaded(Text(session.name)).font(.system(size: look.typeSize(11))).lineLimit(1).truncationMode(.tail)
             Spacer(minLength: look.length(6))
-            look.shaded(Text(sessionStatusText(session, now: now)))
-                .font(.system(size: look.typeSize(10), weight: dim ? .regular : .medium).monospacedDigit())
-                .foregroundStyle(dim ? Color.secondary : style.tint)
-                .fixedSize()
+            HStack(spacing: look.length(4)) {
+                SessionIcon(state: session.state, color: tint)
+                look.shaded(Text(sessionStatusText(session, now: now)))
+                    .font(.system(size: look.typeSize(10), weight: .medium).monospacedDigit())
+                    .foregroundStyle(tint)
+            }
+            .fixedSize()
+        }
+        .contentShape(Rectangle())
+        .background {
+            if hovered {
+                RoundedRectangle(cornerRadius: look.length(5)).fill(Color.white.opacity(0.12))
+                    .padding(.horizontal, -look.length(5)).padding(.vertical, -look.length(2.5))
+            }
         }
     }
+}
 
-    static func style(_ state: SessionState) -> (icon: String, tint: Color) {
-        switch state {
-        case .waiting: return ("exclamationmark.circle.fill", Color(nsColor: .systemOrange))
-        case .working: return ("circle.dotted", Color(nsColor: .systemBlue))
-        case .answered: return ("checkmark.circle.fill", Color(nsColor: .systemGreen))
-        case .stopped: return ("stop.circle", Color.secondary)
-        case .unknown: return ("questionmark.circle", Color.secondary)
+/// 상태 기호: 작업 중은 도는 고리, 입력 필요는 주황 동그라미 안 「!」, 작업 완료는 초록 체크, 알 수 없음은 비움
+struct SessionIcon: View {
+    @Environment(\.petAppearance) private var look
+    let state: SessionState
+    let color: Color
+
+    var body: some View {
+        Group {
+            switch state {
+            case .working:
+                if renderingStill || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                    Circle().trim(from: 0, to: 0.75)
+                        .stroke(color, style: StrokeStyle(lineWidth: max(1.5, look.length(1.6)), lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                        .padding(look.length(1.5))
+                } else {
+                    SpinningArc(color: .systemBlue, lineWidth: max(1.5, look.length(1.6)))
+                }
+            case .waiting:
+                Image(systemName: "exclamationmark.circle.fill").font(.system(size: look.length(11), weight: .semibold)).foregroundStyle(color)
+            case .done:
+                Image(systemName: "checkmark").font(.system(size: look.length(9.5), weight: .bold)).foregroundStyle(color)
+            case .unknown:
+                Color.clear
+            }
         }
+        .frame(width: look.length(12), height: look.length(12))
     }
 }
 
 /// 그림 저장(--snapshot) 중에는 도는 표시 대신 멈춘 기호를 그린다(ImageRenderer 는 AppKit 뷰를 못 그린다)
 var renderingStill = false
 
-/// 진행 중 표시 — 2초에 한 바퀴 돈다. 회전은 Core Animation 에 맡겨 화면 합성기가 돌리므로 앱 CPU 를 거의 안 쓴다
-/// (SwiftUI 애니메이션·기호 효과는 앱이 매 프레임 다시 그려 3~5% 를 썼다). 「동작 줄이기」를 켜 두면 멈춰 있다.
-struct SpinningSymbol: View {
-    @Environment(\.petAppearance) private var look
-
-    let name: String
+/// 작업 중 표시 — 270° 고리가 1.5초에 한 바퀴 돈다(Windows 판과 같은 모양). 회전은 Core Animation 에 맡겨 화면 합성기가 돌리므로
+/// 앱 CPU 를 거의 안 쓴다(SwiftUI 애니메이션은 앱이 매 프레임 다시 그려 3~5% 를 썼다). 「동작 줄이기」를 켜 두면 멈춰 있다.
+struct SpinningArc: NSViewRepresentable {
     let color: NSColor
-
-    var body: some View {
-        if renderingStill || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-            Image(systemName: name)
-        } else {
-            SpinningLayer(name: name, color: color, pointSize: look.length(11)).frame(width: look.length(13), height: look.length(13))
-        }
-    }
-}
-
-struct SpinningLayer: NSViewRepresentable {
-    let name: String
-    let color: NSColor
-    let pointSize: CGFloat
+    let lineWidth: CGFloat
     func makeNSView(context: Context) -> SpinnerView { SpinnerView(frame: .zero) }
     func updateNSView(_ view: SpinnerView, context: Context) {
-        view.configure(name: name, color: color, pointSize: pointSize)
+        view.configure(color: color, lineWidth: lineWidth)
     }
 }
 
 final class SpinnerView: NSView {
-    private let symbol = CALayer()
-    private var image: NSImage?
-    private var pointSize: CGFloat = 0
+    private let arc = CAShapeLayer()
+    private var lineWidth: CGFloat = 1.5
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        symbol.contentsGravity = .center
-        layer?.addSublayer(symbol)
-    }
-
-    func configure(name: String, color: NSColor, pointSize: CGFloat) {
-        guard self.pointSize != pointSize else { return }
-        self.pointSize = pointSize
-        let config = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .semibold)
-            .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
-        image = NSImage(systemSymbolName: name, accessibilityDescription: T("진행 중"))?.withSymbolConfiguration(config)
-        symbol.contents = image?.layerContents(forContentsScale: symbol.contentsScale)
+        arc.fillColor = nil
+        arc.lineCap = .round
+        layer?.addSublayer(arc)
     }
 
     required init?(coder: NSCoder) { nil }
+
+    func configure(color: NSColor, lineWidth: CGFloat) {
+        arc.strokeColor = color.cgColor
+        self.lineWidth = lineWidth
+        arc.lineWidth = lineWidth
+        needsLayout = true
+    }
 
     override func layout() {
         super.layout()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        symbol.bounds = bounds
-        symbol.position = CGPoint(x: bounds.midX, y: bounds.midY)  // 가운데를 축으로 돈다
+        arc.bounds = bounds
+        arc.position = CGPoint(x: bounds.midX, y: bounds.midY)  // 가운데를 축으로 돈다
+        let inset = lineWidth / 2 + max(0, (bounds.width - bounds.width * 0.82) / 2)
+        let rect = bounds.insetBy(dx: inset, dy: inset)
+        let path = CGMutablePath()
+        path.addArc(center: CGPoint(x: rect.midX, y: rect.midY), radius: rect.width / 2, startAngle: .pi / 2,
+                    endAngle: .pi / 2 - 1.5 * .pi, clockwise: true)
+        arc.path = path
         CATransaction.commit()
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard let window else { return }
-        let scale = window.backingScaleFactor
-        symbol.contentsScale = scale
-        symbol.contents = image?.layerContents(forContentsScale: scale)
-        guard symbol.animation(forKey: "spin") == nil else { return }
+        arc.contentsScale = window.backingScaleFactor
+        guard arc.animation(forKey: "spin") == nil else { return }
         let spin = CABasicAnimation(keyPath: "transform.rotation.z")
         spin.fromValue = 0
         spin.toValue = -2 * Double.pi  // 시계 방향
-        spin.duration = 2
+        spin.duration = 1.5
         spin.repeatCount = .infinity
         spin.isRemovedOnCompletion = false
-        symbol.add(spin, forKey: "spin")
+        arc.add(spin, forKey: "spin")
     }
 }
 
 // MARK: - 창
 
-/// 글자 위를 눌러도 창이 끌리도록 클릭은 모두 이 뷰가 받는다
+/// 글자 위를 눌러도 창이 끌리도록 클릭은 모두 이 뷰가 받는다(누를 곳은 PanelInput 이 가려낸다)
 final class ContainerView: NSVisualEffectView {
     let input = PanelInput()
 
@@ -1512,7 +2342,10 @@ final class ContainerView: NSVisualEffectView {
     }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func mouseDown(with event: NSEvent) { input.mouseDown(event, in: window) }
-    override func rightMouseDown(with event: NSEvent) { input.onRightClick?(event) }
+    override func rightMouseUp(with event: NSEvent) { input.onRightClick?(event) }
+    override func updateTrackingAreas() { super.updateTrackingAreas(); input.track(self) }
+    override func mouseMoved(with event: NSEvent) { input.moved(event) }
+    override func mouseExited(with event: NSEvent) { input.onHover?(nil) }
 }
 
 final class TranslucentRoot: NSView {
@@ -1523,15 +2356,54 @@ final class TranslucentRoot: NSView {
     }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func mouseDown(with event: NSEvent) { input.mouseDown(event, in: window) }
-    override func rightMouseDown(with event: NSEvent) { input.onRightClick?(event) }
+    override func rightMouseUp(with event: NSEvent) { input.onRightClick?(event) }
+    override func updateTrackingAreas() { super.updateTrackingAreas(); input.track(self) }
+    override func mouseMoved(with event: NSEvent) { input.moved(event) }
+    override func mouseExited(with event: NSEvent) { input.onHover?(nil) }
 }
 
+/// 떠 있는 창·세션 패널의 마우스: 끌면 창을 옮기고(draggable), 끌지 않고 눌렀다 떼면 그 자리를 onClick 으로,
+/// 마우스를 올리면 onHover 로(앞에 있지 않은 창이어도). 자리는 SwiftUI 와 같은 좌표(내용의 왼쪽 위에서부터)
 final class PanelInput {
-    var onDoubleClick: (() -> Void)?
+    var draggable = true
+    var onClick: ((NSPoint) -> Void)?
     var onRightClick: ((NSEvent) -> Void)?
+    var onHover: ((NSPoint?) -> Void)?
+    /// 좌표를 잴 뷰(SwiftUI 를 품은 뷰)
+    weak var content: NSView?
+    private var area: NSTrackingArea?
+
+    func point(_ event: NSEvent) -> NSPoint? {
+        guard let content else { return nil }
+        let p = content.convert(event.locationInWindow, from: nil)
+        return NSPoint(x: p.x, y: content.isFlipped ? p.y : content.bounds.height - p.y)
+    }
 
     func mouseDown(_ event: NSEvent, in window: NSWindow?) {
-        if event.clickCount == 2 { onDoubleClick?() } else { window?.performDrag(with: event) }
+        guard let window else { return }
+        let startMouse = NSEvent.mouseLocation
+        let startOrigin = window.frame.origin
+        var moved = false
+        // 손을 뗄 때까지: 3pt 넘게 움직이면 창을 옮기고, 아니면 누른 것으로 본다
+        while let next = window.nextEvent(matching: [.leftMouseUp, .leftMouseDragged]) {
+            if next.type == .leftMouseUp { break }
+            let now = NSEvent.mouseLocation
+            if !moved && hypot(now.x - startMouse.x, now.y - startMouse.y) < 3 { continue }
+            guard draggable else { continue }
+            moved = true
+            window.setFrameOrigin(NSPoint(x: startOrigin.x + now.x - startMouse.x, y: startOrigin.y + now.y - startMouse.y))
+        }
+        if !moved, let p = point(event) { onClick?(p) }
+    }
+
+    func moved(_ event: NSEvent) { onHover?(point(event)) }
+
+    func track(_ view: NSView) {
+        if let area { view.removeTrackingArea(area) }
+        let next = NSTrackingArea(rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                  owner: view, userInfo: nil)
+        view.addTrackingArea(next)
+        area = next
     }
 }
 
@@ -1547,6 +2419,222 @@ func roundedMask(radius: CGFloat) -> NSImage {
     return image
 }
 
+// MARK: - 메뉴 막대 간단 모드
+
+/// 메뉴 막대 간단 모드: 시계 왼쪽에 한도마다 동그란 게이지(Windows 판 TaskbarGauge 와 같은 그림).
+/// 테두리 길이가 남은 비율, 가운데 숫자가 남은 %, 앞의 색 점이 회사(주황 Claude, 초록 ChatGPT).
+/// 입력이 필요한 세션이 있으면 맨 앞에 주황 「!」. 왼쪽 클릭 = 세션 패널, 오른쪽 클릭 = 메뉴(한 번·두 번은 AppDelegate 가 가린다)
+final class MenuBarGauge: NSObject, NSViewToolTipOwner {
+    /// 원 하나: 마우스를 올리면 보일 글과 남은 %(값이 없으면 nil)
+    struct Ring { let tip: String; let left: Int? }
+    /// 회사 하나: 앞의 색 점과 원들
+    struct Group { let dot: NSColor; let rings: [Ring] }
+
+    /// 그릴 것 하나(왼쪽 끝 x)
+    fileprivate enum Mark { case badge, separator, dot(NSColor), ring(Int?) }
+    struct Layout {
+        fileprivate var marks: [(x: CGFloat, mark: Mark)] = []
+        var hits: [(x: CGFloat, width: CGFloat, tip: String)] = []
+        var size = NSSize.zero
+        var ring: CGFloat = 0, gap: CGFloat = 0, dot: CGFloat = 0, badge: CGFloat = 0, stroke: CGFloat = 0
+    }
+
+    private let item: NSStatusItem
+    var onLeftClick: (() -> Void)?
+    var onRightClick: (() -> Void)?
+    private var tips: [NSView.ToolTipTag: String] = [:]
+    private var drawnKey: String?
+
+    override init() {
+        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        super.init()
+        item.autosaveName = "AIUsageGauge"  // ⌘ 를 누르고 끌어 옮긴 자리를 기억한다
+        if let button = item.button {
+            button.target = self
+            button.action = #selector(clicked)
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            button.imagePosition = .imageOnly
+            button.setAccessibilityLabel(T("AI 사용량"))
+        }
+    }
+
+    @objc private func clicked() {
+        if NSApp.currentEvent?.type == .rightMouseUp { onRightClick?() } else { onLeftClick?() }
+    }
+
+    func remove() { NSStatusBar.system.removeStatusItem(item) }
+
+    /// 게이지 단추의 창(이 창을 누른 것은 세션 패널 바깥 클릭이 아니다)
+    var window: NSWindow? { item.button?.window }
+
+    /// 게이지가 화면에 놓인 자리(세션 패널을 그 아래에 띄운다)
+    var screenFrame: NSRect? {
+        guard let button = item.button, let window = button.window else { return nil }
+        return window.convertToScreen(button.convert(button.bounds, to: nil))
+    }
+
+    /// 메뉴 막대 게이지 자리에서 메뉴를 연다(메뉴 막대 아이콘 메뉴처럼 바로 아래에)
+    func showMenu(_ menu: NSMenu) {
+        item.menu = menu
+        item.button?.performClick(nil)
+        item.menu = nil
+    }
+
+    /// 자리 잡기 — Windows 판 Render 와 같은 비율(원 지름 = 메뉴 막대 높이 - 6pt, 작게는 그 75%)
+    static func layout(groups: [Group], waiting: Int, size: Int, barHeight: CGFloat) -> Layout {
+        var l = Layout()
+        l.ring = max(12, ((barHeight - 6) * CGFloat(size) / 100).rounded())
+        l.gap = max(2, (l.ring * 0.22).rounded())
+        l.dot = max(4, (l.ring * 0.2).rounded())
+        l.stroke = max(1.5, l.ring * 0.1)
+        l.badge = max(10, (l.ring * 0.62).rounded())
+        let pad: CGFloat = 2
+        var x = pad
+        if waiting > 0 {  // 입력이 필요한 세션이 있으면 맨 앞에 주황 「!」
+            l.marks.append((x, .badge))
+            l.hits.append((x, l.badge, T("입력이 필요한 세션 {0}개", waiting)))
+            x += l.badge + l.gap
+        }
+        for group in groups {
+            if let last = l.marks.last, case .badge = last.mark {} else if !l.marks.isEmpty {
+                x += l.gap
+                l.marks.append((x, .separator))
+                x += 1 + l.gap
+            }
+            l.marks.append((x, .dot(group.dot)))
+            x += l.dot + l.gap
+            for (index, ring) in group.rings.enumerated() {
+                if index > 0 { x += l.gap }
+                l.marks.append((x, .ring(ring.left)))
+                l.hits.append((x, l.ring, ring.tip))
+                x += l.ring
+            }
+        }
+        l.size = NSSize(width: max(x + pad, pad * 2 + l.ring), height: barHeight)
+        return l
+    }
+
+    /// 그리기(dark: 메뉴 막대가 어두운지). 밝은 메뉴 막대면 글자·테두리를 어둡게, 색은 진하게(Windows 판과 같은 값)
+    static func draw(_ l: Layout, dark: Bool) {
+        func rgb(_ hex: Int, _ alpha: CGFloat = 1) -> NSColor {
+            NSColor(srgbRed: CGFloat(hex >> 16 & 0xFF) / 255, green: CGFloat(hex >> 8 & 0xFF) / 255, blue: CGFloat(hex & 0xFF) / 255, alpha: alpha)
+        }
+        let text = dark ? rgb(0xF2F2F4) : rgb(0x1E1E20)
+        let track = dark ? NSColor(white: 1, alpha: 60 / 255) : NSColor(white: 0, alpha: 45 / 255)
+        func status(_ left: Int) -> NSColor {
+            dark ? (left >= 50 ? rgb(0x30D158) : left >= 20 ? rgb(0xFFD60A) : rgb(0xFF453A))
+                 : (left >= 50 ? rgb(0x1F9D47) : left >= 20 ? rgb(0xB88600) : rgb(0xD92D20))
+        }
+        let mid = l.size.height / 2
+        let centered = NSMutableParagraphStyle()
+        centered.alignment = .center
+        func label(_ s: String, in rect: NSRect, size: CGFloat, color: NSColor) {
+            let font = NSFont.monospacedDigitSystemFont(ofSize: size, weight: .semibold)
+            let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color, .paragraphStyle: centered]
+            let height = (s as NSString).size(withAttributes: attributes).height
+            (s as NSString).draw(in: NSRect(x: rect.minX - 4, y: rect.midY - height / 2, width: rect.width + 8, height: height), withAttributes: attributes)
+        }
+        for (x, mark) in l.marks {
+            switch mark {
+            case .badge:
+                let rect = NSRect(x: x, y: mid - l.badge / 2, width: l.badge, height: l.badge)
+                rgb(0xFF9F0A).setFill()
+                NSBezierPath(ovalIn: rect).fill()
+                label("!", in: rect, size: l.badge * 0.72, color: rgb(0x1E1E20))
+            case .separator:
+                track.setFill()
+                NSRect(x: x, y: mid - l.ring * 0.3, width: 1, height: l.ring * 0.6).fill()
+            case .dot(let color):
+                color.setFill()
+                NSBezierPath(ovalIn: NSRect(x: x, y: mid - l.dot / 2, width: l.dot, height: l.dot)).fill()
+            case .ring(let left):
+                let box = NSRect(x: x + l.stroke / 2, y: mid - l.ring / 2 + l.stroke / 2, width: l.ring - l.stroke, height: l.ring - l.stroke)
+                let base = NSBezierPath(ovalIn: box)
+                base.lineWidth = l.stroke
+                track.setStroke()
+                base.stroke()
+                if let left, left > 0 {
+                    let arc = NSBezierPath()
+                    arc.appendArc(withCenter: NSPoint(x: box.midX, y: box.midY), radius: box.width / 2,
+                                  startAngle: 90, endAngle: 90 - 360 * CGFloat(min(100, left)) / 100, clockwise: true)
+                    arc.lineWidth = l.stroke
+                    arc.lineCapStyle = .round
+                    status(left).setStroke()
+                    arc.stroke()
+                }
+                let s = left.map(String.init) ?? "–"
+                // Windows 판은 원 지름의 36% 글자 — 메뉴 막대는 작아서 두 자리까지는 46%, 세 자리(100)는 34%
+                label(s, in: NSRect(x: x, y: mid - l.ring / 2, width: l.ring, height: l.ring),
+                      size: max(5.5, l.ring * (s.count >= 3 ? 0.34 : 0.46)), color: text)
+            }
+        }
+    }
+
+    func update(groups: [Group], waiting: Int, size: Int) {
+        guard let button = item.button else { return }
+        let l = Self.layout(groups: groups, waiting: waiting, size: size, barHeight: NSStatusBar.system.thickness)
+        let key = "\(size)|\(waiting)|" + l.hits.map { "\($0.x):\($0.tip)" }.joined(separator: "|")
+            + groups.map { $0.rings.map { "\($0.left ?? -1)" }.joined(separator: ",") }.joined(separator: ";")
+        guard key != drawnKey else { return }
+        drawnKey = key
+        // 그릴 때마다 메뉴 막대가 어두운지 본다(바탕 화면에 따라 바뀐다)
+        button.image = NSImage(size: l.size, flipped: false) { _ in
+            let dark = NSAppearance.currentDrawing().bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            Self.draw(l, dark: dark)
+            return true
+        }
+        item.length = l.size.width
+        button.removeAllToolTips()
+        tips = [:]
+        for hit in l.hits {
+            let tag = button.addToolTip(NSRect(x: hit.x, y: 0, width: hit.width, height: l.size.height), owner: self, userData: nil)
+            tips[tag] = hit.tip
+        }
+    }
+
+    func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
+        tips[tag] ?? ""
+    }
+}
+
+/// 메뉴 막대 게이지를 누르면 바로 아래로 내려오는 세션 패널(Windows 판 SessionPopup 과 같은 내용).
+/// 줄을 누르면 그 대화를 열고 닫힌다. 바깥을 누르거나 Esc, 게이지를 다시 누르면 닫힌다.
+/// 초점을 뺏지 않는 패널이지만 Esc 를 받으려고 key 창은 된다(쓰던 앱은 앞에 그대로)
+final class SessionPanel: NSPanel {
+    var onCancel: (() -> Void)?
+    override var canBecomeKey: Bool { true }
+    override func cancelOperation(_ sender: Any?) { onCancel?() }
+}
+
+struct SessionPanelView: View {
+    @ObservedObject var model: UsageModel
+
+    var body: some View {
+        let look = PetAppearance()  // 떠 있는 창의 「창 크기」·「글자 크기」와는 따로(Windows 판과 같다)
+        let counts = [(SessionState.waiting, T("입력 필요")), (SessionState.working, T("작업 중"))]
+            .map { entry in (entry.1, model.sessions.filter { $0.state == entry.0 }.count) }
+            .filter { $0.1 > 0 }.map { "\($0.0) \($0.1)" }.joined(separator: " · ")
+        VStack(alignment: .leading, spacing: look.length(5)) {
+            HStack(spacing: look.length(6)) {
+                Text(T("세션")).font(.system(size: 12, weight: .semibold))
+                Spacer(minLength: 4)
+                Text(counts).font(.system(size: 10).monospacedDigit()).foregroundStyle(.tertiary)
+            }
+            if model.sessions.isEmpty {
+                Text(T("열린 세션이 없습니다")).font(.system(size: 11)).foregroundStyle(.secondary)
+            } else {
+                SessionRows(sessions: model.sessions, now: model.now, hovered: model.hovered, space: "panel")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(width: 340, alignment: .leading)
+        .coordinateSpace(name: "panel")
+        .onPreferenceChange(HitTargetKey.self) { [model] hits in model.panelHits = hits }
+        .environment(\.petAppearance, look)
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, UNUserNotificationCenterDelegate {
     private lazy var history = UsageHistory()
     private lazy var alerts = LimitAlerts()
@@ -1560,14 +2648,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     private var requestedPermission = false
     private var sending = false
     private var enabled: Bool { UserDefaults.standard.object(forKey: "limitAlerts") as? Bool ?? true }
+    private var modelAlerts: Bool { UserDefaults.standard.object(forKey: Shown.modelAlertsKey) as? Bool ?? false }
+    // Claude Code 가 응답하면(대화 기록이 바뀌면) 곧 `claude /usage` 를 묻고, 그 밖에는 5분마다 — 5초마다 때인지 본다(Windows 판과 같다)
+    private let activity = ClaudeActivityWatcher()
+    private var usageAskedAt: Date?
+    private var askingUsage = false
     private var liveRows: [UsageEvent] { UsageEvent.liveRows(claude: model.claude, codex: codex) }
     private var trendOpen: Bool { trendWindow?.isVisible == true || trendWindow?.isMiniaturized == true }
 
     @objc private func openTrend() {
         if trendWindow == nil {
+            // 크기는 고정(Windows 판과 같다) — 창 안 그림이 늘 같은 모양이도록
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 630, height: 490),
-                             styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-            w.minSize = NSSize(width: 560, height: 470)
+                             styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
             w.appearance = NSAppearance(named: .darkAqua)
             w.isReleasedWhenClosed = false
             w.contentView = NSHostingView(rootView: TrendScreen(data: trends, model: model))
@@ -1635,7 +2728,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         guard historyWriter, !sending, enabled, Bundle.main.bundleURL.pathExtension == "app",
               !(Bundle.main.bundleIdentifier ?? "").isEmpty else { return }
         let n = millis(Date()), keys = UsageAccount(now: n).keys.filter { $0.key == "claude" ? model.showClaude : model.showCodex }
-        guard let c = alerts.next(liveRows, keys: keys, now: n, skipped: permission == false) else { return }
+        guard let c = alerts.nextLive(claude: model.claude, codex: codex, keys: keys, now: n, enabled: enabled,
+                                      models: modelAlerts, skipped: permission == false) else { return }
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         if permission == nil {
@@ -1676,6 +2770,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         if !enabled && historyWriter { alerts.cancel() }
         sendNextAlert()
     }
+    /// 「모델별 한도도 알림」 — 「한도 알림」이 꺼져 있으면 흐리게(누를 수 없음)
+    @objc private func toggleModelAlerts() {
+        guard enabled else { return }
+        UserDefaults.standard.set(!modelAlerts, forKey: Shown.modelAlertsKey)
+        if historyWriter { alerts.applyPreferences(enabled: enabled, models: modelAlerts) }
+        sendNextAlert()
+    }
+    /// 「모델별 한도 보이기 (Fable 등)」 — 작은 창·상세 줄에서 모델별 줄을 빼거나 넣는다(/usage 조회·기록은 그대로)
+    @objc private func toggleModelDisplay() {
+        model.showModels.toggle()
+        UserDefaults.standard.set(model.showModels, forKey: Shown.modelsKey)
+        updateLabelExtra()
+        afterUpdate()
+    }
+
+    /// 보일 칸 이름 중 가장 긴 것에 맞춰 이름 칸을 늘린다(최대 64, 기본 이름만 있으면 0 — 지금 모양 그대로)
+    private func updateLabelExtra() {
+        let font = NSFont.systemFont(ofSize: 11)
+        let names = (model.showClaude ? model.claude.visibleWindows(showModels: model.showModels) : [])
+            + (model.showCodex ? model.codex.visibleWindows(showModels: model.showModels) : [])
+        let widest = names.map { ($0.label as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
+        let base: CGFloat = L10n.current == "en" ? 40 : 30
+        let extra = min(64, max(0, (widest - base).rounded(.up)))
+        if model.appearance.labelExtra != extra { model.appearance.labelExtra = extra }
+    }
+
+    /// 지금 `claude /usage` 를 물을 때인지 본다(처음·Claude Code 응답 직후·5분마다)
+    @objc private func checkClaudeUsage() {
+        guard model.showClaude, ClaudeUsageCommand.disabledReason() == nil else { return }
+        activity.ensure()
+        if let reason = ClaudeActivityWatcher.due(now: Date(), lastAsked: usageAskedAt, pending: activity.pending()) {
+            askClaudeUsage(reason)
+        }
+    }
+
+    private func askClaudeUsage(_ reason: String) {
+        guard !askingUsage, model.showClaude, ClaudeUsageCommand.disabledReason() == nil else { return }
+        askingUsage = true
+        usageAskedAt = Date()
+        activity.take()
+        DispatchQueue.global(qos: .utility).async {
+            ClaudeUsageCommand.fetch(reason: reason)
+            DispatchQueue.main.async {
+                self.askingUsage = false
+                self.refreshLocal()
+            }
+        }
+    }
 
     private let model = UsageModel()
     private let claude = ClaudeReader()
@@ -1701,9 +2843,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         buildMainMenu()
         buildPanel()
         refreshAll()
+        applyDisplayMode()
         Timer.scheduledTimer(timeInterval: 15, target: self, selector: #selector(refreshLocal), userInfo: nil, repeats: true)
         Timer.scheduledTimer(timeInterval: 3, target: self, selector: #selector(refreshSessions), userInfo: nil, repeats: true)
         Timer.scheduledTimer(timeInterval: 300, target: self, selector: #selector(refreshServer), userInfo: nil, repeats: true)
+        Timer.scheduledTimer(timeInterval: 5, target: self, selector: #selector(checkClaudeUsage), userInfo: nil, repeats: true)
         DispatchQueue.main.asyncAfter(deadline: .now() + Updater.firstDelay) { [weak self] in self?.checkForUpdate(manual: false) }
         Timer.scheduledTimer(timeInterval: Updater.interval, target: self, selector: #selector(autoCheckForUpdate), userInfo: nil, repeats: true)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(refreshAll),
@@ -1722,8 +2866,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         container.blendingMode = .behindWindow
         container.state = .active
         for input in [container.input, translucentRoot.input] {
-            input.onDoubleClick = { [weak self] in self?.refreshAll() }
-            input.onRightClick = { [weak self] event in self?.showMenu(event) }
+            input.content = hosting
+            input.onClick = { [weak self] point in self?.click(point) }
+            input.onHover = { [weak self] point in self?.hover(point) }
+            // 오른쪽 한 번이면 메뉴(두 번째 클릭을 기다려 조금 늦게), 두 번이면 메뉴 막대 간단 모드로 — Windows 판과 같다
+            input.onRightClick = { [weak self] event in
+                guard let self, let view = self.panel.contentView else { return }
+                let at = view.convert(event.locationInWindow, from: nil)
+                self.rightClick(single: { [weak self] in self?.showMenu(at: at) }, double: { [weak self] in self?.setDisplayMode(1) })
+            }
         }
         background.wantsLayer = true
         background.autoresizingMask = [.width, .height]
@@ -1744,7 +2895,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         panel.isReleasedWhenClosed = false
         panel.appearance = NSAppearance(named: .darkAqua)
         placePanel(reset: false)
-        panel.orderFrontRegardless()
+        if Display.mode == 0 { panel.orderFrontRegardless() }
     }
 
     private func applyAppearance() {
@@ -1777,24 +2928,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         model.claude = claude.read(now: model.now)
         let codexSwitched = codex.readLog(now: model.now)
         model.codex = codex.current
+        updateLabelExtra()
         syncUsage()
         refreshSessions()
         afterUpdate()
         if codexSwitched { refreshServer() }  // ChatGPT 계정이 바뀌었다: 5분 기다리지 않고 새 계정 값을 묻는다
     }
 
-    /// 세션 상태는 자주 바뀌므로 3초마다 읽는다(파일 몇 개와 기록 끝부분만 읽어 가볍다)
+    /// 세션 상태는 자주 바뀌므로 3초마다 읽는다(파일 몇 개와 기록 끝부분만 읽어 가볍다).
+    /// 「세션 보이기」를 꺼도 읽는다 — 메뉴 막대 게이지를 누르면 나오는 세션 패널이 쓴다(Windows 판과 같다)
     @objc private func refreshSessions() {
-        guard model.showSessions else {
-            if !model.sessions.isEmpty { model.sessions = [] }
-            return
-        }
         let now = Date()
         let sessions = sortSessions(claudeSessions.read(now: now) + codexSessions.read(now: now))
-        let resized = sessions.count != model.sessions.count
+        let resized = sessions.count != model.sessions.count  // 세션 칸이 생기거나 없어지거나 줄 수가 바뀌면 창 높이를 맞춘다
         model.now = now
         model.sessions = sessions
-        if resized { afterUpdate() }
+        if let id = model.hovered, !sessions.contains(where: { $0.id == id }) { model.hovered = nil }
+        if resized { afterUpdate() } else { updateGauge() }
+        if sessionPanel?.isVisible == true { DispatchQueue.main.async { self.placeSessionPanel(animated: false) } }
     }
 
     @objc private func refreshServer() {
@@ -1802,6 +2953,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         codex.refreshServer { [weak self] in
             guard let self else { return }
             self.model.codex = self.codex.current
+            self.updateLabelExtra()
             self.syncUsage()
             self.afterUpdate()
         }
@@ -1810,10 +2962,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     @objc private func refreshAll() {
         refreshLocal()
         refreshServer()
+        askClaudeUsage("새로고침")
     }
 
     private func afterUpdate() {
         panel.contentView?.toolTip = detailLines().joined(separator: "\n")
+        updateGauge()
         DispatchQueue.main.async { self.fitPanel() }  // SwiftUI 가 새 값으로 다시 그린 뒤 크기를 맞춘다
     }
 
@@ -1896,7 +3050,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         var lines: [String] = []
         func add(_ title: String, _ snap: ProviderSnapshot) {
             lines.append(T("{0} · 마지막 값 {1}", title, snap.observedAt.map(fullTime) ?? T("없음")))
-            for w in snap.windows {
+            for w in snap.visibleWindows(showModels: model.showModels) {
                 lines.append("    " + T("{0} {1}% 남음 · 초기화 {2}", w.label, w.leftPercent(now: now), w.resetsAt.map(fullTime) ?? "-"))
             }
         }
@@ -1904,11 +3058,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             switch pane {
             case .claude where model.showClaude:
                 add("Claude (\(model.claude.source ?? T("Claude Code 상태 표시줄")))", model.claude)
+                // Claude 값이 오래됐고 데스크톱 앱 기록도 멈췄으면 다시 받게 하는 법을 알린다
+                if model.claude.observedAt.map({ now.timeIntervalSince($0) >= ClaudeDesktopUsage.staleAfter }) ?? true,
+                   let hint = ClaudeDesktopUsage.staleHint(now: now) { lines.append("    " + hint) }
+                let usageError = ClaudeUsageCommand.disabledReason() ?? ClaudeUsageCommand.lastError
+                lines.append(T("Claude /usage 확인 {0}", ClaudeUsageCommand.lastCheckedAt.map(clock) ?? T("전")) + (usageError.map { " — \($0)" } ?? ""))
             case .codex where model.showCodex:
                 add(T("ChatGPT (Codex 한도)"), model.codex)
                 lines.append(T("Codex 서버 확인 {0}", codex.serverCheckedAt.map(clock) ?? T("전")) + (codex.serverError.map { " — \($0)" } ?? ""))
-            case .sessions where model.showSessions:
-                for s in model.sessions { lines.append(T("세션 · {0}", describeSession(s, now: now))) }
+            case .sessions where model.showSessions && !model.sessions.isEmpty:
+                lines.append(T("세션"))
+                for s in model.sessions { lines.append("    " + describeSession(s, now: now)) }
             default:
                 break
             }
@@ -1916,7 +3076,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         return lines
     }
 
-    private func showMenu(_ event: NSEvent) {
+    /// 떠 있는 창을 오른쪽 클릭한 자리에서 메뉴를 연다
+    private func showMenu(at point: NSPoint) {
+        guard let view = panel.contentView else { return }
+        contextMenu().popUp(positioning: nil, at: point, in: view)
+    }
+
+    /// 떠 있는 창·메뉴 막대 게이지의 오른쪽 클릭 메뉴(맨 위에 값 줄)
+    private func contextMenu() -> NSMenu {
         let menu = NSMenu()
         for line in detailLines() {
             let info = NSMenuItem(title: line, action: nil, keyEquivalent: "")
@@ -1933,7 +3100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         menu.addItem(updateMenuItem())
         menu.addItem(.separator())
         menu.addItem(menuItem(T("종료"), #selector(quit)))
-        NSMenu.popUpContextMenu(menu, with: event, for: panel.contentView!)
+        return menu
     }
 
     // MARK: 자동 업데이트
@@ -2015,10 +3182,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         menu.addItem(menuItem(T("ChatGPT 보이기"), #selector(toggleCodex)))
         menu.addItem(menuItem(T("세션 보이기"), #selector(toggleSessions)))
         menu.addItem(orderMenuItem())
+        menu.addItem(menuItem(T("모델별 한도 보이기 (Fable 등)"), #selector(toggleModelDisplay)))
         menu.addItem(appearanceMenuItem())
         menu.addItem(languageMenuItem())
         menu.addItem(.separator())
         menu.addItem(menuItem(T("한도 알림"), #selector(toggleAlerts)))
+        menu.addItem(menuItem(T("모델별 한도도 알림"), #selector(toggleModelAlerts)))
     }
 
     /// 「칸 순서」 — 고를 수 있는 순서를 다 늘어놓고 지금 것에 체크(체크는 validateMenuItem 이 붙인다)
@@ -2036,6 +3205,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     private func appearanceMenuItem() -> NSMenuItem {
         let submenu = NSMenu()
+        // 표시 방식·메뉴 막대 크기(Windows 판 「표시 방식」·「작업 표시줄 크기」)
+        for (title, labels, values, action) in [
+            (T("표시 방식"), [T("떠 있는 창"), T("메뉴 막대 (간단 모드)")], [0, 1], #selector(chooseDisplayMode(_:))),
+            (T("메뉴 막대 크기"), [T("작게"), T("크게")], [75, 100], #selector(chooseMenuBarSize(_:))),
+        ] {
+            if !submenu.items.isEmpty { submenu.addItem(.separator()) }
+            let header = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            submenu.addItem(header)
+            for (label, value) in zip(labels, values) {
+                let item = menuItem(label, action)
+                item.tag = value
+                submenu.addItem(item)
+            }
+        }
         for setting in PetSetting.allCases {
             if !submenu.items.isEmpty { submenu.addItem(.separator()) }
             let header = NSMenuItem(title: setting.title, action: nil, keyEquivalent: "")
@@ -2051,6 +3235,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let item = NSMenuItem(title: T("모양"), action: nil, keyEquivalent: "")
         item.submenu = submenu
         return item
+    }
+
+    @objc private func chooseDisplayMode(_ item: NSMenuItem) { setDisplayMode(item.tag) }
+
+    @objc private func chooseMenuBarSize(_ item: NSMenuItem) {
+        guard [75, 100].contains(item.tag), item.tag != Display.size else { return }
+        Display.size = item.tag
+        updateGauge()
     }
 
     @objc private func chooseAppearance(_ item: NSMenuItem) {
@@ -2103,7 +3295,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     @objc private func toggleSessions() {
         model.showSessions.toggle()
         UserDefaults.standard.set(model.showSessions, forKey: Shown.sessionsKey)
-        refreshSessions()
         afterUpdate()
     }
 
@@ -2119,6 +3310,216 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         syncUsage()
         if codexTurnedOn { refreshServer() }
         afterUpdate()
+    }
+
+    // MARK: 마우스 · 칸 접기
+
+    /// 끌지 않고 눌렀다 뗐을 때: 머리줄이면 접고 펴고, 세션 줄이면 그 대화를 연다
+    private func click(_ point: NSPoint) {
+        switch hitTarget(at: point, in: model.hits) {
+        case .header(let pane)?: toggleFold(pane)
+        case .session(let id)?: if let s = model.sessions.first(where: { $0.id == id }) { SessionOpener.open(s) }
+        case nil: break
+        }
+    }
+
+    /// 세션 줄 위에서는 밝은 바탕과 손가락 커서(머리줄도 손가락)
+    private func hover(_ point: NSPoint?, hits: [HitTarget: CGRect]? = nil) {
+        let target = point.flatMap { hitTarget(at: $0, in: hits ?? model.hits) }
+        var id: String?
+        if case .session(let s)? = target { id = s }
+        (target == nil ? NSCursor.arrow : NSCursor.pointingHand).set()
+        if model.hovered != id { model.hovered = id }
+    }
+
+    private func toggleFold(_ pane: Pane) {
+        switch pane {
+        case .sessions:
+            model.foldSessions.toggle()
+            UserDefaults.standard.set(model.foldSessions, forKey: Shown.foldSessionsKey)
+        case .claude:
+            model.foldClaude.toggle()
+            UserDefaults.standard.set(model.foldClaude, forKey: Shown.foldClaudeKey)
+        case .codex:
+            model.foldCodex.toggle()
+            UserDefaults.standard.set(model.foldCodex, forKey: Shown.foldCodexKey)
+        }
+        model.hovered = nil
+        afterUpdate()
+    }
+
+    private var rightTimer: Timer?
+
+    /// 오른쪽 클릭: 두 번째 클릭이 더블클릭 시간 안에 안 오면 한 번(메뉴), 오면 두 번(표시 방식 바꾸기)
+    private func rightClick(single: @escaping () -> Void, double: @escaping () -> Void) {
+        if let timer = rightTimer {
+            timer.invalidate()
+            rightTimer = nil
+            double()
+            return
+        }
+        rightTimer = Timer.scheduledTimer(withTimeInterval: NSEvent.doubleClickInterval, repeats: false) { [weak self] _ in
+            self?.rightTimer = nil
+            single()
+        }
+    }
+
+    // MARK: 메뉴 막대 간단 모드
+
+    private var gauge: MenuBarGauge?
+    private var sessionPanel: SessionPanel?
+    private var sessionHosting: NSHostingView<SessionPanelView>?
+    private var panelMonitors: [Any] = []
+    private var ignoreGaugeClick = false
+
+    /// 「표시 방식」: 떠 있는 창 ↔ 메뉴 막대 간단 모드(떠 있는 창은 숨는다)
+    private func setDisplayMode(_ mode: Int) {
+        guard [0, 1].contains(mode), mode != Display.mode || (mode == 1) != (gauge != nil) else { return }
+        Display.mode = mode
+        applyDisplayMode()
+    }
+
+    private func applyDisplayMode() {
+        if Display.mode == 1 {
+            if gauge == nil {
+                let made = MenuBarGauge()
+                made.onLeftClick = { [weak self] in self?.gaugeClicked() }
+                made.onRightClick = { [weak self] in
+                    self?.rightClick(single: { [weak self] in self?.showGaugeMenu() }, double: { [weak self] in self?.setDisplayMode(0) })
+                }
+                gauge = made
+            }
+            updateGauge()
+            panel.orderOut(nil)
+        } else {
+            closeSessionPanel()
+            gauge?.remove()
+            gauge = nil
+            panel.orderFrontRegardless()
+            fitPanel()
+        }
+    }
+
+    /// 지금 값을 게이지에 넘긴다: 「칸 순서」대로 켜 둔 회사마다 색 점 하나와 원들(5시간·주간·모델별)
+    private func updateGauge() {
+        guard let gauge else { return }
+        let now = Date()
+        func group(_ name: String, _ snap: ProviderSnapshot, _ color: Color) -> MenuBarGauge.Group {
+            var rings = snap.visibleWindows(showModels: model.showModels).map { w in
+                MenuBarGauge.Ring(tip: "\(name) · " + T("{0} {1}% 남음 · 초기화 {2}", w.label, w.leftPercent(now: now), w.resetsAt.map(fullTime) ?? "-"),
+                                  left: w.leftPercent(now: now))
+            }
+            if rings.isEmpty { rings = [MenuBarGauge.Ring(tip: "\(name) · \(snap.message ?? T("값이 없습니다"))", left: nil)] }
+            return MenuBarGauge.Group(dot: NSColor(color), rings: rings)
+        }
+        let groups = model.order.compactMap { pane -> MenuBarGauge.Group? in
+            switch pane {
+            case .claude where model.showClaude: return group("Claude", model.claude, claudeTint)
+            case .codex where model.showCodex: return group("ChatGPT", model.codex, codexTint)
+            default: return nil
+            }
+        }
+        gauge.update(groups: groups, waiting: model.showSessions ? model.sessions.filter { $0.state == .waiting }.count : 0, size: Display.size)
+    }
+
+    private func showGaugeMenu() {
+        closeSessionPanel()
+        gauge?.showMenu(contextMenu())
+    }
+
+    private func gaugeClicked() {
+        if ignoreGaugeClick { ignoreGaugeClick = false; return }  // 열려 있던 패널이 이 클릭에 먼저 닫혔다
+        toggleSessionPanel()
+    }
+
+    private func toggleSessionPanel() {
+        if sessionPanel?.isVisible == true { closeSessionPanel() } else { showSessionPanel() }
+    }
+
+    private func showSessionPanel() {
+        let panel = sessionPanel ?? makeSessionPanel()
+        model.hovered = nil
+        placeSessionPanel(animated: true)
+        panel.makeKeyAndOrderFront(nil)  // 초점을 뺏지 않는 패널: 쓰던 앱은 앞에 그대로, Esc 만 받는다
+        // 바깥(다른 앱·이 앱의 다른 창)을 누르면 닫는다. 게이지를 눌러 닫았으면 그 클릭으로 다시 열지 않는다
+        panelMonitors.append(NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
+            self?.closeSessionPanel()
+        } as Any)
+        panelMonitors.append(NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] event in
+            guard let self, event.window !== self.sessionPanel else { return event }
+            if event.type == .leftMouseDown, event.window != nil, event.window === self.gauge?.window { self.ignoreGaugeClick = true }
+            self.closeSessionPanel()
+            return event
+        } as Any)
+    }
+
+    private func closeSessionPanel() {
+        for monitor in panelMonitors { NSEvent.removeMonitor(monitor) }
+        panelMonitors = []
+        guard let panel = sessionPanel, panel.isVisible else { return }
+        panel.orderOut(nil)
+        model.hovered = nil
+    }
+
+    private func makeSessionPanel() -> SessionPanel {
+        let hosting = NSHostingView(rootView: SessionPanelView(model: model))
+        let root = ContainerView(frame: NSRect(origin: .zero, size: hosting.fittingSize))
+        root.material = .hudWindow
+        root.blendingMode = .behindWindow
+        root.state = .active
+        root.maskImage = roundedMask(radius: 12)
+        root.input.draggable = false
+        root.input.content = hosting
+        root.input.onClick = { [weak self] point in
+            guard let self else { return }
+            if case .session(let id)? = hitTarget(at: point, in: self.model.panelHits),
+               let s = self.model.sessions.first(where: { $0.id == id }) {
+                self.closeSessionPanel()
+                SessionOpener.open(s)
+            }
+        }
+        root.input.onHover = { [weak self] point in self?.hover(point, hits: self?.model.panelHits) }
+        root.input.onRightClick = { _ in }
+        hosting.autoresizingMask = [.width, .height]
+        hosting.frame = root.bounds
+        root.addSubview(hosting)
+        let made = SessionPanel(contentRect: root.frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        made.contentView = root
+        made.isOpaque = false
+        made.backgroundColor = .clear
+        made.hasShadow = true
+        made.level = .popUpMenu
+        made.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
+        made.hidesOnDeactivate = false
+        made.isReleasedWhenClosed = false
+        made.appearance = NSAppearance(named: .darkAqua)
+        made.onCancel = { [weak self] in self?.closeSessionPanel() }
+        sessionPanel = made
+        sessionHosting = hosting
+        return made
+    }
+
+    /// 게이지 바로 아래, 오른쪽 끝을 게이지 오른쪽 끝에 맞춘다(화면 밖으로 나가지 않게). 처음 열 때는 조금 위에서 내려온다
+    private func placeSessionPanel(animated: Bool) {
+        guard let panel = sessionPanel, let hosting = sessionHosting else { return }
+        let size = hosting.fittingSize
+        let anchor = gauge?.screenFrame ?? NSRect(x: (NSScreen.main?.visibleFrame.maxX ?? 400) - 20, y: NSScreen.main?.visibleFrame.maxY ?? 400, width: 1, height: 1)
+        let visible = (NSScreen.screens.first { $0.frame.intersects(anchor) } ?? NSScreen.main)?.visibleFrame ?? .zero
+        let x = max(visible.minX + 4, min(anchor.maxX - size.width, visible.maxX - size.width - 4))
+        let frame = NSRect(x: x, y: anchor.minY - 6 - size.height, width: size.width, height: size.height)
+        guard animated, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            if panel.frame != frame { panel.setFrame(frame, display: true) }
+            panel.alphaValue = 1
+            return
+        }
+        panel.setFrame(frame.offsetBy(dx: 0, dy: 10), display: false)
+        panel.alphaValue = 0
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.16
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().setFrame(frame, display: true)
+            panel.animator().alphaValue = 1
+        }
     }
 
     // MARK: Dock 앱
@@ -2143,7 +3544,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     /// Dock 아이콘을 누르면 창을 맨 앞으로(다른 데스크톱에 있다가 돌아왔을 때 등)
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        panel.orderFrontRegardless()
+        if Display.mode == 1 { toggleSessionPanel() } else { panel.orderFrontRegardless() }  // 메뉴 막대 간단 모드면 세션 패널을
         return true
     }
 
@@ -2186,6 +3587,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         switch menuItem.action {
         case #selector(toggleAlerts):
             menuItem.state = enabled ? .on : .off
+        case #selector(toggleModelAlerts):
+            menuItem.state = enabled && modelAlerts ? .on : .off
+            return enabled  // 「한도 알림」이 꺼져 있으면 흐리게
+        case #selector(toggleModelDisplay):
+            menuItem.state = model.showModels ? .on : .off
         case #selector(toggleLoginItem):
             menuItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
         case #selector(toggleClaude):
@@ -2196,6 +3602,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             return model.showClaude
         case #selector(toggleSessions):
             menuItem.state = model.showSessions ? .on : .off
+        case #selector(chooseDisplayMode(_:)):
+            menuItem.state = Display.mode == menuItem.tag ? .on : .off
+        case #selector(chooseMenuBarSize(_:)):
+            menuItem.state = Display.size == menuItem.tag ? .on : .off
         case #selector(chooseAppearance(_:)):
             guard let key = menuItem.representedObject as? String, let setting = PetSetting(rawValue: key) else { return false }
             menuItem.state = model.appearance[setting] == menuItem.tag ? .on : .off
@@ -2305,7 +3715,7 @@ enum StatusLine {
 /// 켠 뒤 1분, 그 뒤 6시간마다 확인한다. 끄기: defaults write com.local.ai-usage-pet autoUpdate -bool false
 /// 순서: 받기 → SHA-256·번들 id·버전·서명·실행 확인 → 지금 앱을 옆에 숨긴 이름(.<이름>.old)으로 비키고 새 앱을 그 자리에 → 앱이 꺼지면 다시 띄움
 enum Updater {
-    static let repo = "TeddyBEARs56/ai-usage-pet"
+    static let repo = "TeddyBEARs56/ai-usage-widget"
     static let tagPrefix = "mac-v"
     static let assetPrefix = "AIUsage-mac-"
     static let autoKey = "autoUpdate"
@@ -2623,11 +4033,14 @@ func takeSingleInstanceLock() -> Bool {
 }
 
 @MainActor func printOnce() {
-    let now = Date()
     let codex = CodexReader()
     codex.readLog()
     codex.readServerSync()
     let fromLog = codex.fromLog
+    let usageStarted = Date()
+    let usageError = ClaudeUsageCommand.fetch(reason: "확인(--print)")
+    let usageSeconds = Date().timeIntervalSince(usageStarted)
+    let now = Date()
     let claude = ClaudeReader().read(now: now)
     print(describe("Claude", claude, now: now))
     let link: String
@@ -2638,16 +4051,25 @@ func takeSingleInstanceLock() -> Bool {
     case .connected: link = T("됨")
     }
     print("  " + T("출처: {0} · Claude Code 연결: {1}", claude.windows.isEmpty ? "-" : claude.source ?? "-", link))
+    print("  " + T("Claude Code /usage: {0}", usageError ?? T("됨 · {0}초 · {1}", String(format: "%.1f", usageSeconds),
+                                                                 ClaudeUsageCommand.findClaude() ?? "-")))
     if let data = FileManager.default.contents(atPath: ClaudeCodeLink.seenPath),
        let seen = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any], let at = number(seen["at"]) {
         print("  " + T("상태 표시줄 마지막 실행 {0} · 한도 값 {1} · Claude Code {2}", fullTime(Date(timeIntervalSince1970: at)), seen["limits"] as? Bool == true ? T("옴") : T("안 옴"), seen["version"] as? String ?? "?"))
     }
+    if let desktop = ClaudeDesktopUsage.lastWrite() {
+        print("  " + T("데스크톱 앱 기록 {0} · 마지막으로 바뀜 {1}", desktop.path, fullTime(desktop.at)))
+    } else {
+        print("  " + T("데스크톱 앱 기록: 못 찾음"))
+    }
+    // Claude 값이 새것이면(예: /usage 로 받음) 데스크톱 기록이 멈춰 있어도 알릴 까닭이 없다
+    if claude.observedAt.map({ now.timeIntervalSince($0) >= ClaudeDesktopUsage.staleAfter }) ?? true,
+       let hint = ClaudeDesktopUsage.staleHint(now: now) { print("  " + hint) }
     print(describe(T("ChatGPT · 기록"), fromLog ?? ProviderSnapshot(message: T("최근 기록 없음")), now: now))
     print(describe(T("ChatGPT · 서버"), codex.fromServer ?? ProviderSnapshot(message: codex.serverError ?? T("실패")), now: now))
     print(describe(T("ChatGPT · 표시"), codex.current, now: now))
-    let sessions = sortSessions(ClaudeSessionReader().read(now: now) + CodexSessionReader().read(now: now))
-    print(T("세션 {0}개", sessions.count))
-    for s in sessions { print("  " + describeSession(s, now: now)) }
+    let sessionsAt = Date()
+    print(describeSessions(sortSessions(ClaudeSessionReader().read(now: sessionsAt) + CodexSessionReader().read(now: sessionsAt)), now: sessionsAt))
 }
 
 /// --check-update: 올라온 최신 판만 본다(바꾸지 않음)
@@ -2705,16 +4127,52 @@ private func fillSnapshotSample(_ model: UsageModel) {
     ], observedAt: now)
     model.codex = ProviderSnapshot(windows: [weekly], observedAt: now, plan: "Pro Lite")
     model.sessions = [
-        AgentSession(id: "working", tool: .codex, name: "ai-usage-pet-v17", cwd: "", state: .working, since: now.addingTimeInterval(-720)),
-        AgentSession(id: "answered", tool: .claude, name: "Local LLM", cwd: "", state: .answered, since: now.addingTimeInterval(-60))
+        AgentSession(id: "waiting", tool: .claude, name: "결제 웹훅 재시도 고치기", cwd: "", state: .waiting, since: now.addingTimeInterval(-30)),
+        AgentSession(id: "working", tool: .codex, name: "ai-usage-widget", cwd: "", state: .working, since: now.addingTimeInterval(-720)),
+        AgentSession(id: "done", tool: .claude, name: "Local LLM", cwd: "", state: .done, since: now.addingTimeInterval(-480))
     ]
 }
 
-@MainActor func saveSnapshot(to path: String, sample: Bool, appearance: PetAppearance?) {
+/// --gauge-snapshot <png> [--size 75|100] [--light]: 메뉴 막대 게이지 그림(보기 시험용, 예시 값)
+@MainActor func saveGaugeSnapshot(to path: String, size: Int, dark: Bool) {
+    _ = NSApplication.shared
+    let model = UsageModel()
+    fillSnapshotSample(model)
+    let now = model.now
+    func group(_ name: String, _ snap: ProviderSnapshot, _ color: Color) -> MenuBarGauge.Group {
+        MenuBarGauge.Group(dot: NSColor(color), rings: snap.visibleWindows(showModels: true).map {
+            MenuBarGauge.Ring(tip: name, left: $0.leftPercent(now: now))
+        })
+    }
+    let bar: CGFloat = 24
+    let layout = MenuBarGauge.layout(groups: [group("Claude", model.claude, claudeTint), group("ChatGPT", model.codex, codexTint)],
+                                     waiting: 1, size: size, barHeight: bar)
+    let scale: CGFloat = 4, margin: CGFloat = 8
+    let width = layout.size.width + margin * 2
+    guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(width * scale), pixelsHigh: Int(bar * scale),
+                                     bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                     colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { exit(1) }
+    rep.size = NSSize(width: width, height: bar)
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    (dark ? NSColor(white: 0.16, alpha: 1) : NSColor(white: 0.93, alpha: 1)).setFill()
+    NSRect(x: 0, y: 0, width: width, height: bar).fill()
+    NSGraphicsContext.current?.cgContext.translateBy(x: margin, y: 0)
+    MenuBarGauge.draw(layout, dark: dark)
+    NSGraphicsContext.restoreGraphicsState()
+    guard let png = rep.representation(using: .png, properties: [:]) else { exit(1) }
+    do { try png.write(to: URL(fileURLWithPath: path)); print(path) } catch { fputs("저장 실패: \(error)\n", stderr); exit(1) }
+}
+
+@MainActor func saveSnapshot(to path: String, sample: Bool, appearance: PetAppearance?, fold: Bool = false, panel: Bool = false, hovered: String? = nil) {
     _ = NSApplication.shared
     renderingStill = true
     let model = UsageModel()
     if let appearance { model.appearance = appearance }
+    model.foldSessions = fold
+    model.foldClaude = fold
+    model.foldCodex = fold
+    model.hovered = hovered
     if sample {
         fillSnapshotSample(model)
     } else {
@@ -2725,9 +4183,10 @@ private func fillSnapshotSample(_ model: UsageModel) {
         model.codex = codex.current
         model.sessions = sortSessions(ClaudeSessionReader().read(now: model.now) + CodexSessionReader().read(now: model.now))
     }
-    let view = PetView(model: model)
-        .background(Color(red: 0.12, green: 0.12, blue: 0.13, opacity: model.appearance.opacity))
-        .clipShape(RoundedRectangle(cornerRadius: model.appearance.length(14)))
+    let content: AnyView = panel ? AnyView(SessionPanelView(model: model)) : AnyView(PetView(model: model))
+    let view = content
+        .background(Color(red: 0.12, green: 0.12, blue: 0.13, opacity: panel ? 1 : model.appearance.opacity))
+        .clipShape(RoundedRectangle(cornerRadius: panel ? 12 : model.appearance.length(14)))
         .environment(\.colorScheme, .dark)
     let renderer = ImageRenderer(content: view)
     renderer.scale = 2
@@ -2750,7 +4209,8 @@ enum Main {
     @MainActor static func main() {
         signal(SIGPIPE, SIG_IGN)
         let args = CommandLine.arguments
-        if args.contains("--trend-json") || args.contains("--test-alerts") || args.contains("--trend-snapshot") || args.contains("--record-once") {
+        if args.contains("--trend-json") || args.contains("--test-alerts") || args.contains("--trend-snapshot") || args.contains("--record-once")
+            || args.contains("--alerts-once") {
             do {
                 if let i = args.firstIndex(of: "--test-alerts") {
                     guard args.indices.contains(i+1) else { throw CocoaError(.coderInvalidValue) }
@@ -2762,6 +4222,7 @@ enum Main {
                     now = millis(d)
                 }
                 if args.contains("--record-once") { print(try recordOnce(now: now)); return }
+                if args.contains("--alerts-once") { print(try alertsOnce(args, now: now)); return }
                 let user = UsageAccount(now: now)
                 var scan = SourceScan()
                 let result = TrendResult.calculate(UsageHistory().rows + scan.read(user, now: now), user: user, now: now)
@@ -2789,6 +4250,17 @@ enum Main {
             printOnce()
             return
         }
+        if args.contains("--sessions") {  // 세션 목록만(값은 묻지 않는다) — Windows 판 AIUsageStatus --sessions 와 같다
+            let now = Date()
+            print(describeSessions(sortSessions(ClaudeSessionReader().read(now: now) + CodexSessionReader().read(now: now)), now: now))
+            return
+        }
+        if let i = args.firstIndex(of: "--gauge-snapshot") {
+            guard args.indices.contains(i + 1) else { fputs("--gauge-snapshot <png> [--size 75|100] [--light]\n", stderr); exit(2) }
+            let size = args.firstIndex(of: "--size").flatMap { args.indices.contains($0 + 1) ? Int(args[$0 + 1]) : nil } ?? 100
+            saveGaugeSnapshot(to: args[i + 1], size: size == 75 ? 75 : 100, dark: !args.contains("--light"))
+            return
+        }
         if args.contains("--connect") {  // 메뉴의 「Claude Code 에 연결」과 같은 일(터미널에서)
             print(ClaudeCodeLink.connect())
             return
@@ -2810,7 +4282,9 @@ enum Main {
                 }
                 appearance = look
             }
-            saveSnapshot(to: args[i + 1], sample: args.contains("--sample"), appearance: appearance)
+            let hovered = args.firstIndex(of: "--hover").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil }
+            saveSnapshot(to: args[i + 1], sample: args.contains("--sample"), appearance: appearance, fold: args.contains("--fold"),
+                         panel: args.contains("--panel"), hovered: hovered)
             return
         }
         if args.contains("--check-update") {
@@ -2908,7 +4382,9 @@ private struct UsageEvent: Codable, Hashable {
     static func windows(_ windows: [LimitWindow], at: Date, provider: String, id: String?, source: String) -> [Self] {
         guard let key = UsageAccount.hash(provider, id) else { return [] }
         return windows.compactMap { w in
-            let reset = validMillis(w.resetsAt.map { $0.timeIntervalSince1970 * 1000 })
+            var reset = validMillis(w.resetsAt.map { $0.timeIntervalSince1970 * 1000 })
+            // /usage 글에서 읽은 초기화 시각이 창 길이보다 멀면(날짜 없는 시각을 내일로 넘긴 경우 등) 원천 값으로 쓰지 않는다
+            if source == ClaudeUsageCommand.historySource, let r = reset, r > millis(at) + Int64(w.minutes) * 60_000 { reset = nil }
             let event = Self(provider: provider, account: key, minutes: w.minutes, atMs: millis(at),
                              resetMs: reset, used: w.usedPercent, source: source,
                              quality: provider == "claude" && reset == nil ? "rough" : "observed", slot: w.id)
@@ -2941,30 +4417,33 @@ private struct SourceScan {
             let dir = usageDirectory.appendingPathComponent("claude").path
             for name in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] where name.hasSuffix(".json") && !name.hasPrefix(".") {
                 let path = dir + "/" + name
+                let command = name == ClaudeUsageCommand.fileName
                 scan(path) { file in
                     let at = millis(file.modified)
                     guard at >= now - 8 * dayMs else { return true }
                     guard at <= now, let obj = readJSONObject(path) else { return false }
                     if let owner = obj["account"] as? String { guard owner == user.claude else { return true } }
-                    else if at < user.since { return true }
+                    else if command || at < user.since { return true }  // /usage 기록은 계정이 꼭 적혀 있어야 한다
                     if let w = obj["seven_day"] as? [String: Any], let used = number(w["used_percentage"]) {
-                        let reset = validMillis(number(w["resets_at"]).map { $0 * 1000 })
-                        rows.append(UsageEvent(provider: "claude", account: key, minutes: 10080, atMs: at,
-                                               resetMs: reset, used: used, source: "claude-session",
-                                               quality: reset == nil ? "rough" : "observed", slot: "seven_day"))
+                        let window = LimitWindow(id: "seven_day", minutes: 10080, usedPercent: used,
+                                                 resetsAt: number(w["resets_at"]).map(Date.init(timeIntervalSince1970:)))
+                        rows += UsageEvent.windows([window], at: file.modified, provider: "claude", id: user.claude,
+                                                   source: command ? ClaudeUsageCommand.historySource : "claude-session")
                     }
                     return true
                 }
             }
-            scan(ClaudeDesktopUsage.path) { _ in
-                guard let samples = readJSONObject(ClaudeDesktopUsage.path)?["samples"] as? [[String: Any]] else { return false }
-                for s in samples {
-                    guard let org = user.org, s["org"] as? String == org, let t = validMillis(number(s["t"])),
-                          t >= user.since, let used = number((s["u"] as? [String: Any] ?? s)["sd"]) else { continue }
-                    rows.append(UsageEvent(provider: "claude", account: key, minutes: 10080, atMs: t,
-                                           resetMs: nil, used: used, source: "claude-desktop", quality: "rough", slot: "seven_day"))
+            for path in ClaudeDesktopUsage.paths() {
+                scan(path) { _ in
+                    guard let samples = readJSONObject(path)?["samples"] as? [[String: Any]] else { return false }
+                    for s in samples {
+                        guard let org = user.org, s["org"] as? String == org, let t = validMillis(number(s["t"])),
+                              t >= user.since, let used = number((s["u"] as? [String: Any] ?? s)["sd"]) else { continue }
+                        rows.append(UsageEvent(provider: "claude", account: key, minutes: 10080, atMs: t,
+                                               resetMs: nil, used: used, source: "claude-desktop", quality: "rough", slot: "seven_day"))
+                    }
+                    return true
                 }
-                return true
             }
         }
         let root = homeDir + "/.codex/sessions"
@@ -3235,6 +4714,38 @@ private struct AlertWindow: Codable, Equatable {
 private struct AlertNotice: Equatable, Encodable {
     let kind: String, provider: String, account: String, minutes: Int
     let title: String, body: String?
+    var model: String? = nil
+}
+
+/// 알림 상태 열쇠의 창 부분: 전체 한도는 분 길이(「300」「10080」), 모델별 주간은 「10080/model/<이름 base64url>」(Windows 판과 같다)
+private struct AlertScope: Hashable {
+    let minutes: Int
+    let model: String?
+    var suffix: String {
+        guard let model else { return String(minutes) }
+        let encoded = Data(model.utf8).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+        return "\(minutes)/model/\(encoded)"
+    }
+    static func parse(_ suffix: Substring) -> AlertScope? {
+        if let m = Int(suffix), m >= 0, String(m) == suffix { return AlertScope(minutes: m, model: nil) }
+        let prefix = "10080/model/"
+        guard suffix.hasPrefix(prefix), suffix.count > prefix.count else { return nil }
+        var text = String(suffix.dropFirst(prefix.count)).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while text.count % 4 != 0 { text += "=" }
+        guard let data = Data(base64Encoded: text), let name = String(data: data, encoding: .utf8) else { return nil }
+        let scope = AlertScope(minutes: 10080, model: name)
+        return scope.suffix == suffix ? scope : nil
+    }
+    static func ordered(_ a: Self, _ b: Self) -> Bool {
+        if a.minutes != b.minutes { return a.minutes < b.minutes }
+        switch (a.model, b.model) {
+        case (nil, nil): return false
+        case (nil, _): return true
+        case (_, nil): return false
+        case let (x?, y?): return Array(x.utf16).lexicographicallyPrecedes(Array(y.utf16))
+        }
+    }
 }
 private struct AlertFile: Codable, Equatable {
     var v = 1
@@ -3245,6 +4756,7 @@ private final class LimitAlerts {
     static let url = usageDirectory.appendingPathComponent("alerts.json")
     var state = AlertFile()
     private var cancellations = Set<String>()
+    private var cancelModels = false
     var healthy = true
     init() {
         do {
@@ -3267,33 +4779,64 @@ private final class LimitAlerts {
         if let provider { cancellations.insert(provider) } else { cancellations.formUnion(["claude", "codex"]) }
         _ = applyCancellations()
     }
+    /// 「한도 알림」을 끄면 전부, 「모델별 한도도 알림」만 끄면 모델별 한도의 초기화 대기를 지운다(꺼진 동안은 판단하지 않는다)
+    func applyPreferences(enabled: Bool, models: Bool) {
+        if !enabled { cancel() }
+        else if !models { cancelModels = true; _ = applyCancellations() }
+    }
+
     private func applyCancellations() -> Bool {
-        guard !cancellations.isEmpty else { return true }
+        guard cancelModels || !cancellations.isEmpty else { return true }
+        func isModelKey(_ k: String) -> Bool {
+            guard k.hasPrefix("claude/"), let slash = k.dropFirst("claude/".count).firstIndex(of: "/") else { return false }
+            return AlertScope.parse(k[k.index(after: slash)...])?.model != nil
+        }
         var next = state
-        for k in next.windows.keys where next.windows[k]?.pending == true && cancellations.contains(where: { k.hasPrefix($0 + "/") }) {
+        for k in next.windows.keys where next.windows[k]?.pending == true &&
+            (cancellations.contains(where: { k.hasPrefix($0 + "/") }) || (cancelModels && isModelKey(k))) {
             next.windows[k]?.pending = false
             next.windows[k]?.reset = "cancelled"
         }
         guard save(next) else { return false }
         cancellations.removeAll()
+        cancelModels = false
         return true
+    }
+
+    /// 실제 창과 같은 판단: 지금 읽은 원천 값으로. 모델별 한도는 「모델별 한도도 알림」이 켜졌을 때만
+    func nextLive(claude: ProviderSnapshot, codex: CodexReader, keys: [String: String], now: Int64,
+                  enabled: Bool, models: Bool, skipped: Bool = false) -> (notice: AlertNotice, state: AlertFile)? {
+        applyPreferences(enabled: enabled, models: models)
+        guard enabled else { return nil }
+        return next(UsageEvent.liveRows(claude: claude, codex: codex), keys: keys, now: now, skipped: skipped,
+                    modelRows: models ? claude.modelObservations : nil)
     }
 
     // Return a single transition. Adapters request permission / wait for the balloon, then
     // re-evaluate against the current account and clock before reserving this transition.
-    func next(_ rows: [UsageEvent], keys: [String: String], now: Int64, skipped: Bool = false)
-        -> (notice: AlertNotice, state: AlertFile)? {
+    func next(_ rows: [UsageEvent], keys: [String: String], now: Int64, skipped: Bool = false,
+              modelRows: [String: UsageEvent]? = nil) -> (notice: AlertNotice, state: AlertFile)? {
         guard healthy, applyCancellations() else { return nil }
         var next = state
         for p in keys.keys.sorted() {
             let account = keys[p]!
             let prefix = p + "/" + account + "/"
             let live = rows.filter { $0.provider == p && $0.account == account && $0.valid && $0.atMs <= now }
-            let lengths = Set(live.map(\.minutes) + next.windows.keys.filter { $0.hasPrefix(prefix) }.compactMap { Int($0.dropFirst(prefix.count)) })
-            for m in lengths.sorted() {
-                let k = prefix + String(m), duration = Int64(m)*60_000
-                let title = Pane(rawValue: p)!.title, label = windowLabel(minutes: m)
-                let window = live.filter { $0.minutes == m }
+            var groups: [AlertScope: [UsageEvent]] = [:]
+            for e in live { groups[AlertScope(minutes: e.minutes, model: nil), default: []].append(e) }
+            if p == "claude", let modelRows {
+                for (name, e) in modelRows where e.valid && e.account == account && e.atMs <= now { groups[AlertScope(minutes: e.minutes, model: name)] = [e] }
+            }
+            for key in next.windows.keys where key.hasPrefix(prefix) {
+                guard let saved = AlertScope.parse(key.dropFirst(prefix.count)),
+                      saved.model == nil || (p == "claude" && modelRows != nil), groups[saved] == nil else { continue }
+                groups[saved] = []
+            }
+            for scope in groups.keys.sorted(by: AlertScope.ordered) {
+                let m = scope.minutes
+                let k = prefix + scope.suffix, duration = Int64(m)*60_000
+                let title = Pane(rawValue: p)!.title, label = scope.model ?? windowLabel(minutes: m)
+                let window = groups[scope] ?? []
                 let resets = window.compactMap(\.resetMs)
                 let eligible = window.filter { e in
                     if let reset = e.resetMs { return reset > now }
@@ -3332,7 +4875,8 @@ private final class LimitAlerts {
                     next.windows[k] = old
                     if timely {
                         return (AlertNotice(kind: "reset", provider: p, account: account, minutes: m,
-                                            title: T("{0} {1} 한도가 초기화됐습니다", title, label), body: T("다시 100% 남았습니다.")), next)
+                                            title: T("{0} {1} 한도가 초기화됐습니다", title, label), body: T("다시 100% 남았습니다."),
+                                            model: scope.model), next)
                     }
                     w = old
                 }
@@ -3361,7 +4905,7 @@ private final class LimitAlerts {
                         return T("{0}에 초기화됩니다.", when)
                     }
                     return (AlertNotice(kind: "low", provider: p, account: account, minutes: m,
-                                        title: T("{0} {1} 한도 {2}% 남음", title, label, left), body: body), next)
+                                        title: T("{0} {1} 한도 {2}% 남음", title, label, left), body: body, model: scope.model), next)
                 }
                 next.windows[k] = current
             }
@@ -3417,6 +4961,32 @@ private func recordOnce(now: Int64) throws -> Int {
     guard history.recordLive(UsageEvent.liveRows(claude: claude, codex: codex), user: UsageAccount(now: now), now: now)
     else { throw CocoaError(.fileWriteUnknown) }
     return history.rows.count - retained
+}
+
+/// 실제 창과 같은 판단으로(지금 원천 값을 읽어) 알림 후보를 낸다 — 보내지 않고 가짜 홈의 alerts.json 에만 남긴다(Windows 판과 같은 출력)
+/// --limit-alerts 0|1(기본 1) · --model-alerts 0|1(기본 0)
+private func alertsOnce(_ args: [String], now: Int64) throws -> String {
+    try requireTestHome(writing: ["pet.lock", "accounts.json", "claude", "alerts.json"])
+    guard takeSingleInstanceLock(), historyWriter else { throw CocoaError(.fileWriteNoPermission) }
+    func option(_ name: String, _ fallback: Bool) throws -> Bool {
+        guard let i = args.firstIndex(of: name) else { return fallback }
+        guard args.indices.contains(i + 1), ["0", "1"].contains(args[i + 1]) else { throw CocoaError(.coderInvalidValue) }
+        return args[i + 1] == "1"
+    }
+    let enabled = try option("--limit-alerts", true), models = try option("--model-alerts", false)
+    let date = instant(now), codex = CodexReader()
+    let claude = ClaudeReader().read(now: date)
+    codex.readLog(now: date)
+    let alerts = LimitAlerts()
+    var notices: [[String: Any]] = []
+    while let c = alerts.nextLive(claude: claude, codex: codex, keys: UsageAccount(now: now).keys, now: now, enabled: enabled, models: models) {
+        guard alerts.save(c.state) else { throw CocoaError(.fileWriteUnknown) }
+        let n = c.notice
+        notices.append(["kind": n.kind, "provider": n.provider, "minutes": n.minutes, "scope": n.model == nil ? "overall" : "model",
+                        "model": n.model as Any? ?? NSNull(), "title": n.title, "body": n.body as Any? ?? NSNull()])
+    }
+    guard alerts.healthy else { throw CocoaError(.fileWriteUnknown) }
+    return String(decoding: try JSONSerialization.data(withJSONObject: notices, options: [.sortedKeys, .withoutEscapingSlashes]), as: UTF8.self)
 }
 
 private func testAlerts(_ path: String) throws {

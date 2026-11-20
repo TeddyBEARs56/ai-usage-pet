@@ -15,7 +15,7 @@ namespace AIUsage;
 
 static class Updater
 {
-    const string Repo = "TeddyBEARs56/ai-usage-pet";
+    const string Repo = "TeddyBEARs56/ai-usage-widget";
     const string TagPrefix = "windows-v";
     const string AssetName = "AIUsage.exe";
 

@@ -5,8 +5,9 @@ AI 사용량 — Claude·ChatGPT(Codex)의 남은 사용 한도를 화면 위에
 ━━ 이런 경우에 값이 나옵니다 ━━
 • macOS 14 이상(애플 칩·인텔 모두)
 • Claude 칸: Claude Code(터미널)를 Claude 구독(Pro·Max·Team)으로 로그인해 쓸 때,
-  또는 Claude 데스크톱 앱을 쓸 때(앱을 쓰는 동안 받은 값만, 초기화 시각 없이)
-  — claude.ai 웹만 쓰면 값이 나오지 않습니다.
+  또는 Claude 데스크톱 앱을 쓸 때. 둘 중 하나가 깔려 있으면 5분마다 Claude Code 에게 직접 물어(/usage, 한도를 쓰지 않음)
+  claude.ai 웹·모바일에서 쓴 양도 반영합니다.
+  — 둘 다 없이 claude.ai 웹만 쓰면 값이 나오지 않습니다.
   — 값이 안 나오면 Claude 칸에 이유가 나옵니다. 「연결되지 않았습니다」면
     창 오른쪽 클릭 → 「Claude Code 에 연결」.
 • ChatGPT 칸: Codex 를 ChatGPT 계정으로 로그인해 쓸 때
@@ -22,9 +23,14 @@ AI 사용량 — Claude·ChatGPT(Codex)의 남은 사용 한도를 화면 위에
 • 「한도 알림」은 처음에 켜져 있습니다. 한도가 10% 이하로 남으면 알립니다. 초기화 시각을 알면 그 시각부터 60분 안에 확인한 초기화도 알립니다. 창 오른쪽 클릭 메뉴에서 켜고 끕니다.
 • 같은 메뉴의 「사용 추이…」에서 이번 주 사용 속도와 지난 4주 일별 사용량을 봅니다.
   현재 계정의 주간 한도를 보여 주며 기록은 ~/.cache/ai-usage/history.jsonl 에 35일간 남습니다.
-• 창은 끌어서 옮기고, 두 번 클릭하면 새로고침합니다.
-• 안 쓰는 칸 숨기기: 창(또는 Dock 아이콘) 오른쪽 클릭 → 「Claude 보이기」·「ChatGPT 보이기」를 눌러 체크를 끕니다.
-  다시 누르면 다시 보입니다. 둘 다 끌 수는 없습니다.
+• 창은 끌어서 옮깁니다. 오른쪽 클릭하면 메뉴(0.5초쯤 뒤), 오른쪽 두 번 클릭하면 메뉴 막대 간단 모드
+  (화면 위 시계 옆에 동그란 게이지만)로 바뀌고, 게이지를 오른쪽 두 번 클릭하면 돌아옵니다.
+  새로고침은 메뉴의 「지금 새로고침」.
+• 세션 줄을 누르면 그 대화(Claude·Codex 데스크톱 앱, 또는 터미널)가 열리고, 칸 머리줄을 누르면 그 칸이 접힙니다.
+• 안 쓰는 칸 숨기기: 창(또는 Dock 아이콘) 오른쪽 클릭 → 「Claude 보이기」·「ChatGPT 보이기」·「세션 보이기」를 눌러 체크를 끕니다.
+  다시 누르면 다시 보입니다. Claude·ChatGPT 를 둘 다 끌 수는 없습니다.
+• Fable 같은 모델별 주간 한도 줄: 같은 메뉴의 「모델별 한도 보이기 (Fable 등)」로 숨기고,
+  「모델별 한도도 알림」(처음엔 꺼짐)을 켜면 그 줄도 10% 이하일 때 알립니다.
 • 언어 바꾸기: 창 오른쪽 클릭 → 「언어 (Language)」. 처음엔 맥의 언어를 따릅니다(한국어·영어·일본어·중국어 간체).
 • 창을 오른쪽 클릭하고 「모양」에서 배경 투명도, 창 크기, 글자 크기를 고릅니다. 다음에 열 때도 그대로 적용됩니다.
 • 칸 순서 바꾸기: 같은 메뉴의 「칸 순서」에서 고릅니다(세션·Claude·ChatGPT 를 놓는 순서).
@@ -56,9 +62,10 @@ ChatGPT (Codex) usage limits on screen.
 ━━ When values appear ━━
 • macOS 14 or later (Apple silicon and Intel)
 • Claude: when you use Claude Code (terminal) signed in with a Claude
-  subscription (Pro·Max·Team), or the Claude desktop app (values received
-  while the app is in use, without reset times).
-  — claude.ai on the web alone does not provide values.
+  subscription (Pro·Max·Team), or the Claude desktop app. If either is
+  installed, the app asks Claude Code directly every 5 minutes (/usage,
+  which uses no quota), so usage on claude.ai web and mobile shows too.
+  — claude.ai on the web alone, with neither installed, does not provide values.
   — If no value shows, the Claude section explains why. If it says
     "Not connected", right-click the window → "Connect to Claude Code".
 • ChatGPT: when you use Codex signed in with a ChatGPT account.
@@ -76,11 +83,19 @@ ChatGPT (Codex) usage limits on screen.
 • Right-click the window to toggle “Limit Alerts” (on by default). Each limit alerts once at 10% remaining or less. You also get a reset alert if the app detects a known reset within one hour.
 • Open “Usage Trends…” to see your current account’s weekly pace and the past four weeks of daily usage.
   The app keeps 35 days of weekly-limit history in ~/.cache/ai-usage/history.jsonl.
-• Drag the window to move it; double-click to refresh.
+• Drag the window to move it. Right-click for the menu (after about half a second);
+  right-double-click switches to the compact menu-bar mode (round gauges next to the clock),
+  and right-double-clicking the gauge switches back. To refresh, use "Refresh Now" in the menu.
+• Click a session row to open that conversation (Claude/Codex desktop app, or the terminal);
+  click a section header to fold it.
 • Language: right-click the window → "Language". It follows the macOS
   language at first (Korean, English, Japanese, Simplified Chinese).
 • Hide a section: right-click the window (or the Dock icon) → uncheck
-  "Show Claude" or "Show ChatGPT". You can't hide both.
+  "Show Claude", "Show ChatGPT" or "Show Sessions". You can't hide both
+  Claude and ChatGPT.
+• Per-model weekly limits (such as Fable): hide them with "Show model limits
+  (Fable, etc.)"; turn on "Also notify for model limits" (off at first) to be
+  alerted for them at 10% or less.
 • Right-click the window and choose "Appearance" to set background transparency, window size, and text size. Your choices are saved.
 • Section order: "Section Order" in the same menu.
 • Open at every login: "Open at Login" in the same menu.

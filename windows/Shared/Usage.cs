@@ -1343,7 +1343,7 @@ public sealed class CodexReader
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
         try
         {
-            await Send(process, """{"id":1,"method":"initialize","params":{"clientInfo":{"name":"ai-usage-pet","version":"1.0"}}}""");
+            await Send(process, """{"id":1,"method":"initialize","params":{"clientInfo":{"name":"ai-usage-widget","version":"1.0"}}}""");
             using (var init = await Receive(process, 1, timeout.Token))
                 if (init is null) return (null, T("codex 가 응답하지 않습니다"));
             await Send(process, """{"method":"initialized"}""");
@@ -2135,11 +2135,15 @@ internal sealed class LimitAlerts
         cancelModels = false;
         return true;
     }
-    internal AlertCandidate? NextLive(ProviderSnapshot claude, CodexReader codex, long now, bool enabled, bool models)
+    /// shown: 창에 보이는 칸(claude·codex)만 알린다 — 숨긴 칸은 맥판처럼 알리지 않는다
+    internal AlertCandidate? NextLive(ProviderSnapshot claude, CodexReader codex, long now, bool enabled, bool models,
+                                      Func<string, bool>? shown = null)
     {
         ApplyPreferences(enabled, models);
         if (!enabled) return null;
-        return Next(UsageEvent.LiveRows(claude, codex), UsageAccount.Read(now).Keys(), now,
+        var keys = UsageAccount.Read(now).Keys();
+        if (shown != null) keys = keys.Where(p => shown(p.Key)).ToDictionary(p => p.Key, p => p.Value);
+        return Next(UsageEvent.LiveRows(claude, codex), keys, now,
             modelRows: models ? claude.ModelObservations : null);
     }
 

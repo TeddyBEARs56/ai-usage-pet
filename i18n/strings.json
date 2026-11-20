@@ -11,6 +11,7 @@
   "모델별 한도 보이기 (Fable 등)": {"en": "Show model limits (Fable, etc.)", "ja": "モデル別の上限を表示（Fable など）", "zh-Hans": "显示各模型限额（如 Fable）"},
   "모델별 한도도 알림": {"en": "Also notify for model limits", "ja": "モデル別の上限も通知", "zh-Hans": "同时提醒各模型限额"},
   "꺼 둠(ClaudeUsage=0)": {"en": "Disabled (ClaudeUsage=0)", "ja": "無効（ClaudeUsage=0）", "zh-Hans": "已关闭（ClaudeUsage=0）"},
+  "꺼 둠(claudeUsage=false)": {"en": "Disabled (claudeUsage=false)", "ja": "無効（claudeUsage=false）", "zh-Hans": "已关闭（claudeUsage=false）"},
   "/usage 설정을 읽지 못했습니다: {0}": {"en": "Couldn't read the /usage setting: {0}", "ja": "/usage の設定を読み取れませんでした：{0}", "zh-Hans": "无法读取 /usage 设置：{0}"},
   "/usage 가 모델을 불러 이 실행에서 중지했습니다. 중지 파일을 저장하지 못했습니다: {0}": {"en": "/usage called a model and is disabled for this run. Couldn't save the stop file: {0}", "ja": "/usage がモデルを呼び出したため、今回は停止しました。停止ファイルを保存できませんでした：{0}", "zh-Hans": "/usage 调用了模型，本次运行已停止查询。无法保存停用文件：{0}"},
   "이번 주": {"en": "This Week", "ja": "今週", "zh-Hans": "本周"},
@@ -66,10 +67,6 @@
   "{0}시간 전": { "en": "{0}h ago", "ja": "{0}時間前", "zh-Hans": "{0}小时前" },
   "{0}일 전": { "en": "{0}d ago", "ja": "{0}日前", "zh-Hans": "{0}天前" },
 
-  "진행 중": { "en": "Working", "ja": "作業中", "zh-Hans": "进行中" },
-  "답 나옴 {0}": { "en": "Done {0}", "ja": "回答済み {0}", "zh-Hans": "已回复 {0}" },
-  "확인 기다림": { "en": "Needs you", "ja": "確認待ち", "zh-Hans": "等待确认" },
-  "멈춤 {0}": { "en": "Stopped {0}", "ja": "停止 {0}", "zh-Hans": "已停止 {0}" },
   "알 수 없음": { "en": "Unknown", "ja": "不明", "zh-Hans": "未知" },
   "(뒤에서 명령이 아직 도는 중)": { "en": "(a background command is still running)", "ja": "(バックグラウンドでコマンドが実行中)", "zh-Hans": "(后台命令仍在运行)" },
 
@@ -81,8 +78,6 @@
   "세션": { "en": "Sessions", "ja": "セッション", "zh-Hans": "会话" },
   "값이 없습니다": { "en": "No value yet", "ja": "値がありません", "zh-Hans": "暂无数值" },
   "{0}% 남음": { "en": "{0}% left", "ja": "残り {0}%", "zh-Hans": "剩余 {0}%" },
-  "진행 {0} · 답 {1} · 확인 {2}": { "en": "Working {0} · Done {1} · Waiting {2}", "ja": "作業中 {0} · 回答 {1} · 確認待ち {2}", "zh-Hans": "进行中 {0} · 已回复 {1} · 待确认 {2}" },
-  "켜져 있는 세션이 없습니다": { "en": "No open sessions", "ja": "開いているセッションはありません", "zh-Hans": "没有打开的会话" },
   "외 {0}개": { "en": "+{0} more", "ja": "ほか {0} 件", "zh-Hans": "另有 {0} 个" },
 
   "{0} · 마지막 값 {1}": { "en": "{0} · last value {1}", "ja": "{0} · 最終取得 {1}", "zh-Hans": "{0} · 最近数值 {1}" },
@@ -90,7 +85,6 @@
   "ChatGPT (Codex 한도)": { "en": "ChatGPT (Codex limits)", "ja": "ChatGPT (Codex の上限)", "zh-Hans": "ChatGPT (Codex 限额)" },
   "Codex 서버 확인 {0}": { "en": "Codex server checked {0}", "ja": "Codex サーバー確認 {0}", "zh-Hans": "Codex 服务器检查 {0}" },
   "전": { "en": "not yet", "ja": "まだ", "zh-Hans": "尚未" },
-  "세션 · {0}": { "en": "Session · {0}", "ja": "セッション · {0}", "zh-Hans": "会话 · {0}" },
 
   "지금 새로고침": { "en": "Refresh Now", "ja": "今すぐ更新", "zh-Hans": "立即刷新" },
   "위치 초기화": { "en": "Reset Position", "ja": "位置をリセット", "zh-Hans": "重置位置" },
@@ -111,9 +105,11 @@
   "진행 {0}": {"en": "Working {0}", "ja": "作業中 {0}", "zh-Hans": "进行中 {0}"},
   "완료 {0}": {"en": "Done {0}", "ja": "完了 {0}", "zh-Hans": "已完成 {0}"},
   "작업 표시줄 크기": {"en": "Taskbar Size", "ja": "タスクバーでのサイズ", "zh-Hans": "任务栏大小"},
+  "메뉴 막대 크기": {"en": "Menu Bar Size", "ja": "メニューバーでのサイズ", "zh-Hans": "菜单栏大小"},
   "표시 방식": {"en": "Display", "ja": "表示方法", "zh-Hans": "显示方式"},
   "떠 있는 창": {"en": "Floating Window", "ja": "フローティングウィンドウ", "zh-Hans": "悬浮窗口"},
   "작업 표시줄 (간단 모드)": {"en": "Taskbar (Compact)", "ja": "タスクバー（簡易表示）", "zh-Hans": "任务栏（简洁模式）"},
+  "메뉴 막대 (간단 모드)": {"en": "Menu Bar (Compact)", "ja": "メニューバー（簡易表示）", "zh-Hans": "菜单栏（简洁模式）"},
   "작업 표시줄을 찾지 못했습니다": {"en": "Couldn't find the taskbar", "ja": "タスクバーが見つかりません", "zh-Hans": "找不到任务栏"},
   "작업 표시줄에 자리가 없습니다": {"en": "Not enough room on the taskbar", "ja": "タスクバーに空きがありません", "zh-Hans": "任务栏空间不足"},
   "세로 작업 표시줄은 지원하지 않습니다": {"en": "Vertical taskbars aren't supported", "ja": "縦向きのタスクバーには対応していません", "zh-Hans": "不支持竖向任务栏"},
@@ -187,6 +183,7 @@
   "데스크톱 앱 기록 {0} · 마지막으로 바뀜 {1}": { "en": "desktop app record {0} · last changed {1}", "ja": "デスクトップアプリの記録 {0} · 最終更新 {1}", "zh-Hans": "桌面应用记录 {0} · 最近更新 {1}" },
   "데스크톱 앱 기록: 못 찾음": { "en": "desktop app record: not found", "ja": "デスクトップアプリの記録: 見つかりません", "zh-Hans": "桌面应用记录:未找到" },
   "Claude 데스크톱 앱 기록이 {0} 뒤로 멈춤 — 작업 표시줄 알림 영역의 Claude 아이콘을 오른쪽 클릭하면 그 뒤 하루 동안 다시 받습니다": { "en": "Claude desktop app record stopped at {0} — right-click the Claude icon in the taskbar notification area and it resumes for a day", "ja": "Claude デスクトップアプリの記録が {0} から止まっています — タスクバーの通知領域にある Claude アイコンを右クリックすると、その後1日間再開します", "zh-Hans": "Claude 桌面应用记录自 {0} 起停止 — 右键点击任务栏通知区域中的 Claude 图标即可恢复一天" },
+  "Claude 데스크톱 앱 기록이 {0} 뒤로 멈춤 — 메뉴 막대의 Claude 아이콘을 누르면 그 뒤 하루 동안 다시 받습니다": {"en": "Claude desktop app record stopped at {0} — click the Claude icon in the menu bar and it resumes for a day", "ja": "Claude デスクトップアプリの記録が {0} から止まっています — メニューバーの Claude アイコンをクリックすると、その後1日間再開します", "zh-Hans": "Claude 桌面应用记录自 {0} 起停止 — 点击菜单栏中的 Claude 图标即可恢复一天"},
   "Claude /usage 확인 {0}": { "en": "Claude /usage checked {0}", "ja": "Claude /usage 確認 {0}", "zh-Hans": "Claude /usage 检查 {0}" },
   "Claude Code /usage": { "en": "Claude Code /usage", "ja": "Claude Code /usage", "zh-Hans": "Claude Code /usage" },
   "Claude Code /usage: {0}": { "en": "Claude Code /usage: {0}", "ja": "Claude Code /usage: {0}", "zh-Hans": "Claude Code /usage: {0}" },
@@ -211,7 +208,6 @@
   "ChatGPT · 서버": { "en": "ChatGPT · server", "ja": "ChatGPT · サーバー", "zh-Hans": "ChatGPT · 服务器" },
   "실패": { "en": "failed", "ja": "失敗", "zh-Hans": "失败" },
   "ChatGPT · 표시": { "en": "ChatGPT · shown", "ja": "ChatGPT · 表示", "zh-Hans": "ChatGPT · 显示" },
-  "세션 {0}개": { "en": "{0} sessions", "ja": "セッション {0} 件", "zh-Hans": "{0} 个会话" },
 
   "지금 {0} · 올라온 최신 {1} — {2}": { "en": "current {0} · latest released {1} — {2}", "ja": "現在 {0} · 公開中の最新 {1} — {2}", "zh-Hans": "当前 {0} · 已发布最新 {1} — {2}" },
   "새 판 있음": { "en": "update available", "ja": "新しいバージョンあり", "zh-Hans": "有新版本" },

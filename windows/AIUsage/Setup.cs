@@ -150,6 +150,9 @@ static class Settings
     public static readonly PetSetting TaskbarSize = new("TaskbarSize", 100, [75, 100]);
     /// 떠 있는 창 맨 위 세션 칸과 작업 표시줄의 「!」(1 보임)
     public static readonly PetSetting ShowSessions = new("ShowSessions", 1, [0, 1]);
+    /// 창에 보일 칸(맥판 showClaude·showCodex) — 처음엔 켬, 둘 중 하나는 꼭 남는다
+    public static readonly PetSetting ShowClaude = new("ShowClaude", 1, [0, 1]);
+    public static readonly PetSetting ShowCodex = new("ShowCodex", 1, [0, 1]);
     /// 떠 있는 창의 칸 접기(1 접음): 머리줄을 누르면 바뀐다
     public static readonly PetSetting FoldSessions = new("FoldSessions", 0, [0, 1]);
     public static readonly PetSetting FoldClaude = new("FoldClaude", 0, [0, 1]);
@@ -248,19 +251,41 @@ static class Settings
         }
     }
 
-    /// 「칸 순서」 메뉴에 나오는 순서 전부. 맨 앞이 기본(맥판의 세션 칸은 Windows 에 없다).
-    public static readonly Pane[][] Orders = { new[] { Pane.Claude, Pane.Codex }, new[] { Pane.Codex, Pane.Claude } };
+    /// 「칸 순서」 메뉴에 나오는 순서 전부(3칸이면 6가지). 맨 앞이 기본 — 맥판 Pane.orders 와 같다
+    public static readonly Pane[][] Orders =
+    [
+        [Pane.Sessions, Pane.Claude, Pane.Codex], [Pane.Sessions, Pane.Codex, Pane.Claude],
+        [Pane.Claude, Pane.Codex, Pane.Sessions], [Pane.Codex, Pane.Claude, Pane.Sessions],
+        [Pane.Claude, Pane.Sessions, Pane.Codex], [Pane.Codex, Pane.Sessions, Pane.Claude],
+    ];
 
-    public static string Title(Pane pane) => pane == Pane.Codex ? "ChatGPT" : "Claude";
+    public static string Title(Pane pane) => pane switch
+    {
+        Pane.Sessions => T("세션"),
+        Pane.Codex => "ChatGPT",
+        _ => "Claude",
+    };
 
-    /// 창 안 칸 순서(값 Order = "claude,codex"). 모르는 값이면 기본 순서.
+    /// 창 안 칸 순서(값 Order = "sessions,claude,codex", 맥판 paneOrder 와 같은 이름).
+    /// 1.4.1 까지는 세션 칸이 늘 맨 위였으므로, 저장된 순서에 세션이 없으면 맨 앞에 둔다. 모르는 값이면 기본 순서
     public static Pane[] Order
     {
         get
         {
-            using var key = Registry.CurrentUser.OpenSubKey(Key);
-            var saved = key?.GetValue("Order") as string;
-            return Orders.FirstOrDefault(o => string.Join(",", o.Select(Name)) == saved) ?? Orders[0];
+            string? saved = null;
+            try
+            {
+                using var key = Registry.CurrentUser.OpenSubKey(Key);
+                saved = key?.GetValue("Order") as string;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException) { }
+            var result = new List<Pane>();
+            foreach (var name in (saved ?? "").Split(','))
+                foreach (var pane in Orders[0])
+                    if (Name(pane) == name.Trim() && !result.Contains(pane)) result.Add(pane);
+            if (result.Count > 0 && !result.Contains(Pane.Sessions)) result.Insert(0, Pane.Sessions);
+            foreach (var pane in Orders[0]) if (!result.Contains(pane)) result.Add(pane);
+            return Orders.FirstOrDefault(o => o.SequenceEqual(result)) ?? Orders[0];
         }
         set
         {
@@ -269,10 +294,10 @@ static class Settings
         }
     }
 
-    static string Name(Pane pane) => pane == Pane.Codex ? "codex" : "claude";  // 맥판 paneOrder 와 같은 이름
+    static string Name(Pane pane) => pane switch { Pane.Sessions => "sessions", Pane.Codex => "codex", _ => "claude" };  // 맥판 paneOrder 와 같은 이름
 }
 
-enum Pane { Claude, Codex }
+enum Pane { Sessions, Claude, Codex }
 
 /// Claude 값을 받으려면 Claude Code 상태 표시줄을 AIUsageStatus 로 걸어야 한다
 static class ClaudeLink

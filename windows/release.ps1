@@ -10,7 +10,7 @@ param([string]$Notes = '')
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path $PSScriptRoot -Parent
-$repo = 'TeddyBEARs56/ai-usage-pet'
+$repo = 'TeddyBEARs56/ai-usage-widget'
 $target = 'windows'
 Set-Location $root
 

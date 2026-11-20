@@ -28,6 +28,18 @@ sealed class MainForm : Form
     readonly BalloonPresenter balloons;
     bool showModels = Settings.Read(Settings.ShowModelLimits) == 1;
     bool modelAlerts = Settings.Read(Settings.ModelLimitAlerts) == 1;
+    // 창에 보일 칸(오른쪽 클릭 「Claude 보이기」「ChatGPT 보이기」, 맥판과 같다). 둘 중 하나는 꼭 남는다
+    bool showClaude = Settings.Read(Settings.ShowClaude) == 1 || Settings.Read(Settings.ShowCodex) == 0;
+    bool showCodex = Settings.Read(Settings.ShowCodex) == 1;
+    /// 켜 둔 Claude·ChatGPT 칸을 고른 순서대로(작업 표시줄 게이지·사용 추이가 쓴다)
+    Pane[] Panes => order.Where(p => p == Pane.Claude ? showClaude : p == Pane.Codex && showCodex).ToArray();
+    /// 떠 있는 창에 그릴 칸: 고른 순서대로, 켜 둔 칸만(세션은 열린 세션이 있을 때만) — 맥판과 같다
+    List<Pane> ShownPanes => order.Where(p => p switch
+    {
+        Pane.Sessions => SessionRows > 0,
+        Pane.Codex => showCodex,
+        _ => showClaude,
+    }).ToList();
 
     List<UsageEvent> LiveRows() => UsageEvent.LiveRows(claudeSnap,codex);
 
@@ -37,10 +49,16 @@ sealed class MainForm : Form
         var user = UsageAccount.Read(n);
         var changed = user != activeUser;
         activeUser = user;
+        if (Settings.LimitAlerts)
+        {
+            // 숨긴 칸은 알리지 않는다(맥판과 같다): 기다리던 초기화 알림도 지운다
+            if (!showClaude) alerts.Cancel("claude");
+            if (!showCodex) alerts.Cancel("codex");
+        }
         history.RecordLive(LiveRows(),user,n);
         if (trend != null)
         {
-            trend.SetData(TrendResult.Calculate(history.VisibleRows,user,n),n,order);
+            trend.SetData(TrendResult.Calculate(history.VisibleRows,user,n),n,Panes);
             if (allowScan && (changed || rescanOnRefresh)) ScanHistory();
         }
         SendAlert();
@@ -102,7 +120,7 @@ sealed class MainForm : Form
             return;
         }
         var n = DateTimeOffset.Now.ToUnixTimeMilliseconds();
-        var c = alerts.NextLive(claudeSnap, codex, n, enabled, modelAlerts);
+        var c = alerts.NextLive(claudeSnap, codex, n, enabled, modelAlerts, provider => provider == "claude" ? showClaude : showCodex);
         if (c == null) return;
         if (!Settings.LimitAlerts || (c.Notice.Model != null && !modelAlerts) ||
             UsageAccount.Read(n).Keys().GetValueOrDefault(c.Notice.Provider) != c.Notice.Account) return;
@@ -130,6 +148,21 @@ sealed class MainForm : Form
         if (!Settings.LimitAlerts) return;
         modelAlerts = Settings.Save(Settings.ModelLimitAlerts, modelAlerts ? 0 : 1, modelAlerts ? 1 : 0) == 1;
         SendAlert();
+    }
+
+    void SetShown(bool claudeOn, bool codexOn)
+    {
+        if (!claudeOn && !codexOn) return;  // 둘 다 끄면 빈 창이 되므로 하나는 남긴다
+        var codexTurnedOn = codexOn && !showCodex;
+        showClaude = Settings.Save(Settings.ShowClaude, claudeOn ? 1 : 0, showClaude ? 1 : 0) == 1;
+        showCodex = Settings.Save(Settings.ShowCodex, codexOn ? 1 : 0, showCodex ? 1 : 0) == 1;
+        if (!showClaude && !showCodex) showClaude = true;
+        if (!showClaude) alerts.Cancel("claude");
+        if (!showCodex) alerts.Cancel("codex");
+        SyncUsage();
+        if (codexTurnedOn) RefreshServer();
+        FitSize();
+        Redraw();
     }
 
     void ToggleModelDisplay()
@@ -373,7 +406,7 @@ sealed class MainForm : Form
 
     async void RefreshServer(bool retry = true)
     {
-        if (fetching) return;
+        if (fetching || !showCodex) return;  // ChatGPT 칸을 껐으면 codex 를 띄우지 않는다
         fetching = true;
         try
         {
@@ -411,14 +444,14 @@ sealed class MainForm : Form
     /// 지금 `claude /usage` 를 물을 때인지 본다(처음·Claude Code 응답 직후·5분마다)
     void CheckClaudeUsage()
     {
-        if (ClaudeUsageCommand.DisabledReason() != null) return;
+        if (!showClaude || ClaudeUsageCommand.DisabledReason() != null) return;  // Claude 칸을 껐으면 묻지 않는다
         activity.Ensure();
         if (ClaudeActivityWatcher.Due(DateTimeOffset.Now, usageAskedAt, activity.Pending()) is { } reason) AskClaudeUsage(reason);
     }
 
     async void AskClaudeUsage(string reason)
     {
-        if (askingUsage || ClaudeUsageCommand.DisabledReason() != null) return;
+        if (askingUsage || !showClaude || ClaudeUsageCommand.DisabledReason() != null) return;
         askingUsage = true;
         usageAskedAt = DateTimeOffset.Now;
         activity.Take();
@@ -457,8 +490,13 @@ sealed class MainForm : Form
     int SectionHeight(ProviderSnapshot snap) => Folded(snap) ? HeaderHeight : HeaderHeight + Rows(snap) * (Content(Gap) + RowHeight);
     /// 세션 칸 줄 수(끄거나 세션이 없으면 0 — 칸이 없어진다). 8개가 넘으면 7줄 + 「외 N개」
     int SessionRows => !showSessions ? 0 : Math.Min(sessions.Count, SessionRow.MaxRows);
-    int SessionsHeight => SessionRows == 0 ? 0
-        : HeaderHeight + (sessionsFolded ? 0 : SessionRows * (Content(Gap) + RowHeight)) + Content(SectionGap) * 2 + DividerHeight;
+    int SessionsHeight => SessionRows == 0 ? 0 : HeaderHeight + (sessionsFolded ? 0 : SessionRows * (Content(Gap) + RowHeight));
+    int PaneHeight(Pane pane) => pane switch
+    {
+        Pane.Sessions => SessionsHeight,
+        Pane.Codex => SectionHeight(codexSnap),
+        _ => SectionHeight(claudeSnap),
+    };
 
     void FitSize()
     {
@@ -466,8 +504,9 @@ sealed class MainForm : Form
         MeasureColumns();
         int width = Content(BaseWidth) + labelWidth - Content(LabelW)
             + percentWidth - Content(PercentW) + resetWidth - Content(ResetW);
-        var size = new Size(width, Content(PadY) * 2 + SectionHeight(claudeSnap)
-            + Content(SectionGap) * 2 + DividerHeight + SectionHeight(codexSnap) + SessionsHeight);
+        var panes = ShownPanes;
+        var size = new Size(width, Content(PadY) * 2 + panes.Sum(PaneHeight)
+            + Math.Max(0, panes.Count - 1) * (Content(SectionGap) * 2 + DividerHeight));
         bool resized = size != Size;
         var location = Location;
         if (!dragging && anchor is Point point)
@@ -631,7 +670,7 @@ sealed class MainForm : Form
 
     void MeasureColumns(bool force = false)
     {
-        var names = claudeSnap.VisibleWindows(showModels).Concat(codexSnap.VisibleWindows(showModels))
+        var names = (showClaude ? claudeSnap.VisibleWindows(showModels) : []).Concat(showCodex ? codexSnap.VisibleWindows(showModels) : [])
             .Select(w => w.Label).ToHashSet(StringComparer.Ordinal);
         if (!force && measuredNames.SetEquals(names)) return;
         measuredNames = names;
@@ -721,13 +760,8 @@ sealed class MainForm : Form
         var y = Content(PadY);
         sessionHits.Clear();
         headerHits.Clear();
-        if (SessionRows > 0)  // 맨 위에 세션 칸, 그 아래 구분선
-        {
-            y = DrawSessions(g, y) + Content(SectionGap);
-            using (var pen = new Pen(Palette.Divider, DividerHeight)) g.DrawLine(pen, Content(PadX), y, Width - Content(PadX), y);
-            y += DividerHeight + Content(SectionGap);
-        }
-        for (var i = 0; i < order.Length; i++)  // 고른 순서대로(「칸 순서」 메뉴), 칸 사이에 구분선
+        var panes = ShownPanes;
+        for (var i = 0; i < panes.Count; i++)  // 고른 순서대로(「칸 순서」 메뉴, 세션 칸도 자리를 바꿀 수 있다), 켜 둔 칸만, 칸 사이에 구분선
         {
             if (i > 0)
             {
@@ -735,14 +769,18 @@ sealed class MainForm : Form
                 using (var pen = new Pen(Palette.Divider, DividerHeight)) g.DrawLine(pen, Content(PadX), y, Width - Content(PadX), y);
                 y += DividerHeight + Content(SectionGap);
             }
-            if (order[i] == Pane.Codex)
+            switch (panes[i])
             {
-                var detail = string.Join(" · ", new[] { "Codex", codexSnap.Plan }.Where(s => !string.IsNullOrEmpty(s)));
-                y = DrawSection(g, "ChatGPT", detail, Palette.ChatGPT, codexSnap, y);
-            }
-            else
-            {
-                y = DrawSection(g, "Claude", null, Palette.Claude, claudeSnap, y);
+                case Pane.Sessions:
+                    y = DrawSessions(g, y);
+                    break;
+                case Pane.Codex:
+                    var detail = string.Join(" · ", new[] { "Codex", codexSnap.Plan }.Where(s => !string.IsNullOrEmpty(s)));
+                    y = DrawSection(g, "ChatGPT", detail, Palette.ChatGPT, codexSnap, y);
+                    break;
+                default:
+                    y = DrawSection(g, "Claude", null, Palette.Claude, claudeSnap, y);
+                    break;
             }
         }
     }
@@ -947,7 +985,7 @@ sealed class MainForm : Form
     string? PushGauge() => gauge is { IsHandleCreated: true } g ? g.SetData(GaugeGroups(), taskbarSize, showSessions ? sessions.Count(s => s.State == SessionState.Waiting) : 0) : null;
 
     /// 「칸 순서」대로 회사마다 색 점 하나와 원들(5시간·주간·모델별)
-    List<TaskbarGauge.Group> GaugeGroups() => order.Select(pane =>
+    List<TaskbarGauge.Group> GaugeGroups() => Panes.Select(pane =>
     {
         var (name, snap, dot) = pane == Pane.Codex ? ("ChatGPT", codexSnap, Palette.ChatGPT) : ("Claude", claudeSnap, Palette.Claude);
         var rings = snap.VisibleWindows(showModels).Select(w => new TaskbarGauge.Ring(
@@ -1092,6 +1130,11 @@ sealed class MainForm : Form
         menu.Items.Add(T("지금 새로고침"), null, (_, _) => RefreshAll());
         menu.Items.Add(T("사용 추이…"), null, (_, _) => OpenTrend());
         menu.Items.Add(T("위치 초기화"), null, (_, _) => PlaceWindow(reset: true));
+        menu.Items.Add(new ToolStripSeparator());
+        // 혼자 켜져 있는 Claude·ChatGPT 는 끌 수 없다(흐리게) — 맥판과 같은 자리·순서
+        menu.Items.Add(new ToolStripMenuItem(T("Claude 보이기"), null, (_, _) => SetShown(!showClaude, showCodex)) { Checked = showClaude, Enabled = showCodex });
+        menu.Items.Add(new ToolStripMenuItem(T("ChatGPT 보이기"), null, (_, _) => SetShown(showClaude, !showCodex)) { Checked = showCodex, Enabled = showClaude });
+        menu.Items.Add(new ToolStripMenuItem(T("세션 보이기"), null, (_, _) => ToggleSessionDisplay()) { Checked = showSessions });
         var orderMenu = new ToolStripMenuItem(T("칸 순서"));
         foreach (var choice in Settings.Orders)
             orderMenu.DropDownItems.Add(new ToolStripMenuItem(string.Join(" → ", choice.Select(Settings.Title)), null, (_, _) => ChooseOrder(choice))
@@ -1100,9 +1143,9 @@ sealed class MainForm : Form
             });
         menu.Items.Add(orderMenu);
         menu.Items.Add(new ToolStripMenuItem(T("모델별 한도 보이기 (Fable 등)"), null, (_, _) => ToggleModelDisplay()) { Checked = showModels });
-        menu.Items.Add(new ToolStripMenuItem(T("세션 보이기"), null, (_, _) => ToggleSessionDisplay()) { Checked = showSessions });
         menu.Items.Add(AppearanceMenu());
         menu.Items.Add(LanguageMenu());
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem(T("한도 알림"), null, (_, _) => ToggleAlerts()) { Checked = Settings.LimitAlerts });
         menu.Items.Add(new ToolStripMenuItem(T("모델별 한도도 알림"), null, (_, _) => ToggleModelAlerts())
             { Enabled = Settings.LimitAlerts, Checked = Settings.LimitAlerts && modelAlerts });
@@ -1236,27 +1279,37 @@ sealed class MainForm : Form
     IEnumerable<string> DetailLines()
     {
         if (taskbarProblem != null) yield return T("작업 표시줄 대신 떠 있는 창 — {0}", taskbarProblem);
-        if (sessions.Count > 0)
-        {
-            yield return T("세션");
-            foreach (var s in sessions) yield return "    " + s.Describe(DateTimeOffset.Now);
-        }
-        foreach (var (title, snap) in order.Select(p => p == Pane.Codex
-                     ? (T("ChatGPT (Codex 한도)"), codexSnap)
-                     : ($"Claude ({claudeSnap.Source ?? T("Claude Code 상태 표시줄")})", claudeSnap)))
+        IEnumerable<string> Values(string title, ProviderSnapshot snap)
         {
             yield return T("{0} · 마지막 값 {1}", title, snap.ObservedAt is { } at ? Fmt.FullTime(at) : T("없음"));
             foreach (var w in snap.VisibleWindows(showModels))
                 yield return "    " + T("{0} {1}% 남음 · 초기화 {2}", w.Label, w.LeftPercent(now), w.ResetsAt is { } r ? Fmt.FullTime(r) : "-");
-            // Claude 값이 오래됐고 데스크톱 앱 기록도 멈췄으면 다시 받게 하는 법을 알린다
-            if (snap == claudeSnap && (snap.ObservedAt is not { } seen || now - seen >= ClaudeDesktopUsage.StaleAfter)
-                && ClaudeDesktopUsage.StaleHint(now) is { } hint)
-                yield return "    " + hint;
         }
-        var usageError = ClaudeUsageCommand.DisabledReason() ?? ClaudeUsageCommand.LastError;
-        yield return T("Claude /usage 확인 {0}", ClaudeUsageCommand.LastCheckedAt is { } u ? Fmt.Clock(u) : T("전"))
-                     + (usageError != null ? " — " + usageError : "");
-        yield return T("Codex 서버 확인 {0}", codex.ServerCheckedAt is { } c ? Fmt.Clock(c) : T("전")) + (codex.ServerError is { } error ? " — " + error : "");
+        foreach (var pane in order)  // 창과 같은 순서로, 켜 둔 칸만(맥판과 같다)
+        {
+            switch (pane)
+            {
+                case Pane.Sessions when showSessions && sessions.Count > 0:
+                    yield return T("세션");
+                    foreach (var s in sessions) yield return "    " + s.Describe(DateTimeOffset.Now);
+                    break;
+                case Pane.Claude when showClaude:
+                    foreach (var line in Values($"Claude ({claudeSnap.Source ?? T("Claude Code 상태 표시줄")})", claudeSnap)) yield return line;
+                    // Claude 값이 오래됐고 데스크톱 앱 기록도 멈췄으면 다시 받게 하는 법을 알린다
+                    if ((claudeSnap.ObservedAt is not { } seen || now - seen >= ClaudeDesktopUsage.StaleAfter)
+                        && ClaudeDesktopUsage.StaleHint(now) is { } hint)
+                        yield return "    " + hint;
+                    var usageError = ClaudeUsageCommand.DisabledReason() ?? ClaudeUsageCommand.LastError;
+                    yield return T("Claude /usage 확인 {0}", ClaudeUsageCommand.LastCheckedAt is { } u ? Fmt.Clock(u) : T("전"))
+                                 + (usageError != null ? " — " + usageError : "");
+                    break;
+                case Pane.Codex when showCodex:
+                    foreach (var line in Values(T("ChatGPT (Codex 한도)"), codexSnap)) yield return line;
+                    yield return T("Codex 서버 확인 {0}", codex.ServerCheckedAt is { } c ? Fmt.Clock(c) : T("전"))
+                                 + (codex.ServerError is { } error ? " — " + error : "");
+                    break;
+            }
+        }
     }
 }
 

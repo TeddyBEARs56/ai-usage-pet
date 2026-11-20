@@ -8,7 +8,7 @@
 set -euo pipefail
 
 root=${0:A:h}
-repo=TeddyBEARs56/ai-usage-pet
+repo=TeddyBEARs56/ai-usage-widget
 target=${1:-}
 notes=${2:-}
 cd "$root"

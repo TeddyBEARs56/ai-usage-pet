@@ -14,10 +14,10 @@ Claude 와 ChatGPT(Codex) 사용 한도를 화면 위에 계속 띄워 두는 �
 
 | | 버전 | 받기 | 설치 |
 |---|---|---|---|
-| 맥 (macOS 14 이상, 애플 칩·인텔) | 1.7 | [AIUsage-mac-1.7.zip](https://github.com/TeddyBEARs56/ai-usage-pet/releases/download/mac-v1.7/AIUsage-mac-1.7.zip) | 압축을 풀고 「읽어 주세요 (Read me).txt」대로: 터미널에 `zsh ` 를 치고 `설치.sh` 를 끌어다 놓은 뒤 Enter |
-| Windows 10·11 (64비트) | 1.4.1 | [AIUsage.exe](https://github.com/TeddyBEARs56/ai-usage-pet/releases/download/windows-v1.4.1/AIUsage.exe) | 실행 → 「Windows의 PC 보호」가 뜨면 **추가 정보 → 실행** → 「이 PC에 설치할까요?」 **예** |
+| 맥 (macOS 14 이상, 애플 칩·인텔) | 1.7 | [AIUsage-mac-1.7.zip](https://github.com/TeddyBEARs56/ai-usage-widget/releases/download/mac-v1.7/AIUsage-mac-1.7.zip) | 압축을 풀고 「읽어 주세요 (Read me).txt」대로: 터미널에 `zsh ` 를 치고 `설치.sh` 를 끌어다 놓은 뒤 Enter |
+| Windows 10·11 (64비트) | 1.4.1 | [AIUsage.exe](https://github.com/TeddyBEARs56/ai-usage-widget/releases/download/windows-v1.4.1/AIUsage.exe) | 실행 → 「Windows의 PC 보호」가 뜨면 **추가 정보 → 실행** → 「이 PC에 설치할까요?」 **예** |
 
-한 번 깔면 그 뒤로는 앱이 새 판을 알아서 받는다([자동 업데이트](#자동-업데이트)). 지난 판은 [Releases](https://github.com/TeddyBEARs56/ai-usage-pet/releases). 위 링크는 `release.sh` 가 새 판을 올릴 때 고친다.
+한 번 깔면 그 뒤로는 앱이 새 판을 알아서 받는다([자동 업데이트](#자동-업데이트)). 지난 판은 [Releases](https://github.com/TeddyBEARs56/ai-usage-widget/releases). 위 링크는 `release.sh` 가 새 판을 올릴 때 고친다.
 
 ## 보이는 것
 
@@ -26,27 +26,31 @@ Claude 와 ChatGPT(Codex) 사용 한도를 화면 위에 계속 띄워 두는 �
 | Claude 5시간·주간 | 남은 비율과 초기화 시각(↺). 초록 50% 이상, 노랑 20% 이상, 빨강 20% 미만 — Claude Code 상태 표시줄과 같은 기준 |
 | ChatGPT 주간 | ChatGPT 플랜의 Codex 한도. 플랜에 5시간 한도가 있으면(Plus 등) 5시간 줄이 생긴다 |
 | 오른쪽 위 「방금·n분 전」 | 그 값을 마지막으로 받은 때 |
-| 세션(맥 판, Windows 1.4.1 부터) | 이 컴퓨터에서 연 Claude Code·Codex 세션이 작업 중인지, 끝났는지, 내 입력을 기다리는지. 자세한 것은 [mac/README.md](mac/README.md#세션-목록)·[windows/README.md](windows/README.md#세션) |
+| 세션(맥 판, Windows 1.4.1 부터) | 이 컴퓨터에서 연 Claude Code·Codex 세션(터미널과 데스크톱 앱 모두)이 작업 중인지, 끝났는지, 내 입력을 기다리는지. 줄을 누르면 그 대화가 열린다. 열린 세션이 없으면 칸이 없어진다. 자세한 것은 [mac/README.md](mac/README.md#세션-목록)·[windows/README.md](windows/README.md#세션) |
 
 ChatGPT 대화(웹·앱) 자체의 한도는 밖에서 읽을 방법이 없어 Codex 한도만 보여 준다.
 
 창을 오른쪽 클릭해 「모양」에서 배경 투명도, 창 크기, 글자 크기를 각각 고른다. 선택은 다음 실행에도 유지된다(맥 1.7·Windows 1.4.0 부터).
 
-Windows 는 「모양 → 표시 방식」에서 「작업 표시줄 (간단 모드)」를 고르면 떠 있는 창 대신 작업 표시줄의 알림 영역(시계·트레이) 바로 왼쪽에 동그란 게이지만 한 줄로 보인다. 테두리 길이가 남은 비율, 가운데 숫자가 남은 %, 앞의 색 점이 회사(주황 Claude, 초록 ChatGPT)다. 마우스를 올리면 그 한도의 이름·남은 %·초기화 시각이 뜨고, 한 번 클릭하면 세션 패널이 열리고 닫히며, 오른쪽 클릭하면 같은 메뉴. 떠 있는 창과 작업 표시줄 사이는 오른쪽 두 번 클릭으로 오간다. 세션 줄을 누르면 그 대화(Claude·Codex 데스크톱 앱, 또는 터미널 창)가 열린다(Windows 1.4.1 부터). 자세한 것은 [Windows README](windows/README.md#작업-표시줄-간단-모드).
+같은 메뉴의 「Claude 보이기」·「ChatGPT 보이기」·「세션 보이기」로 칸을 숨기고, 「칸 순서」로 세션·Claude·ChatGPT 세 칸의 순서를 여섯 가지 중에서 고른다(처음엔 세션 → Claude → ChatGPT, Claude·ChatGPT 를 둘 다 끌 수는 없다). 숨긴 칸은 알리지 않고, ChatGPT 칸을 끄면 codex 를, Claude 칸을 끄면 `claude /usage` 를 띄우지 않는다. 칸 머리줄을 누르면 그 칸이 접힌다(세션은 개수만, Claude·ChatGPT 는 주간 막대와 % 한 줄). 모두 맥 1.8·Windows 1.4.2 부터 두 판이 같다.
+
+마우스: 끌면 옮기고, 오른쪽 한 번이면 메뉴(두 번째 클릭을 기다려 0.5초쯤 뒤에 열린다), 오른쪽 두 번이면 간단 모드로 바뀐다. 새로고침은 메뉴의 「지금 새로고침」(맥은 ⌘R 도).
+
+**간단 모드**: 「모양 → 표시 방식」에서 Windows 는 「작업 표시줄 (간단 모드)」(Windows 1.4.1 부터), 맥은 「메뉴 막대 (간단 모드)」(맥 1.8 부터)를 고르면 떠 있는 창 대신 작업 표시줄의 알림 영역(시계·트레이) 바로 왼쪽, 맥은 화면 위 메뉴 막대(시계 왼쪽)에 동그란 게이지만 한 줄로 보인다. 테두리 길이가 남은 비율, 가운데 숫자가 남은 %, 앞의 색 점이 회사(주황 Claude, 초록 ChatGPT)다. 마우스를 올리면 그 한도의 이름·남은 %·초기화 시각이 뜨고, 한 번 클릭하면 세션 패널이 열리고 닫히며, 오른쪽 클릭하면 같은 메뉴. 떠 있는 창과 간단 모드 사이는 오른쪽 두 번 클릭으로 오간다. 입력이 필요한 세션이 있으면 게이지 맨 앞에 주황 「!」. 세션 줄을 누르면 그 대화(Claude·Codex 데스크톱 앱, 또는 그 세션을 띄운 터미널)가 열린다. 크기는 「모양」의 「작업 표시줄 크기」·「메뉴 막대 크기」(크게·작게). 자세한 것은 [Windows README](windows/README.md#작업-표시줄-간단-모드)·[맥 README](mac/README.md#메뉴-막대-간단-모드).
 
 ## 값의 출처(두 판 공통)
 
-- **Claude**: 세 곳(맥 판은 아래 두 곳)에서 읽고, 가장 나중에 받은 값을 쓴다. Claude Code 로그인 토큰은 읽지 않는다.
-  - **`claude /usage`(Windows 1.3.2 부터)**: Codex 처럼 Claude Code 에게 직접 묻는다 — `claude -p "/usage" --output-format json --no-session-persistence` 를 창 없이 잠깐 띄운다(5초쯤). `/usage` 는 모델을 부르지 않는 Claude Code 안의 명령이라 한도를 쓰지 않고, 인증은 Claude Code 가 한다. 대화 기록도 남기지 않는다(`~/.cache/ai-usage/claude-usage` 폴더에서 띄우므로 `~/.claude.json` 에 그 폴더 항목 하나가 생긴다). 받은 값은 상태 표시줄 기록과 같은 모양으로 `~/.cache/ai-usage/claude/usage-command.json` 에 남겨 같은 규칙으로 합치고, 초기화 시각도 있다. 모델별 주간 한도(예: 「Current week (Fable)」)가 있으면 주간 아래에 그 모델 이름으로 한 줄 더 보인다(Windows 1.3.3 부터, 1시간 안에 받은 /usage 값일 때만).
+- **Claude**: 세 곳에서 읽고, 가장 나중에 받은 값을 쓴다. Claude Code 로그인 토큰은 읽지 않는다.
+  - **`claude /usage`(Windows 1.3.2·맥 1.8 부터)**: Codex 처럼 Claude Code 에게 직접 묻는다 — `claude -p "/usage" --output-format json --no-session-persistence` 를 창 없이 잠깐 띄운다(5초쯤). `/usage` 는 모델을 부르지 않는 Claude Code 안의 명령이라 한도를 쓰지 않고, 인증은 Claude Code 가 한다. 대화 기록도 남기지 않는다(`~/.cache/ai-usage/claude-usage` 폴더에서 띄우므로 `~/.claude.json` 에 그 폴더 항목 하나가 생긴다). 받은 값은 상태 표시줄 기록과 같은 모양으로 `~/.cache/ai-usage/claude/usage-command.json` 에 남겨 같은 규칙으로 합치고, 초기화 시각도 있다. 모델별 주간 한도(예: 「Current week (Fable)」)가 있으면 주간 아래에 그 모델 이름으로 한 줄 더 보인다(Windows 1.3.3·맥 1.8 부터, 1시간 안에 받은 /usage 값일 때만).
     - **언제 묻나**: 앱을 켤 때, 이 PC 에서 Claude Code 가 응답했을 때(CLI·데스크톱 앱 Code 탭 모두 — `~/.claude/projects` 의 대화 기록이 바뀌는 것을 지켜본다: 응답이 끝나고 5초 잠잠하면, 긴 작업이면 30초마다, 두 번 사이는 1분 이상), 그리고 5분마다(claude.ai 웹·모바일·데스크톱 앱 Chat 처럼 이 PC 에 흔적이 없는 사용 몫). 「지금 새로고침」 하면 바로.
-    - **어느 claude 를 쓰나**: `~\.local\bin\claude.exe`·npm 의 `claude.cmd`·PATH, 없으면 Claude 데스크톱 앱이 품은 것(`Claude-Data\claude_<id>\claude-code\<버전>\…\claude.exe`, 가장 높은 버전) — 그래서 데스크톱 앱만 써도 된다.
+    - **어느 claude 를 쓰나**: Windows 는 `~\.local\bin\claude.exe`·npm 의 `claude.cmd`·PATH, 맥은 `~/.local/bin/claude`·`/opt/homebrew/bin`·`/usr/local/bin`·PATH. 없으면 Claude 데스크톱 앱이 품은 것(Windows `Claude-Data\claude_<id>\claude-code\<버전>\…\claude.exe`, 맥 `~/Library/Application Support/Claude…/claude-code/<버전>/…/claude.app`, 가장 높은 버전) — 그래서 데스크톱 앱만 써도 된다.
     - **안전장치**: 답에 모델을 부른 흔적(`num_turns`·비용 > 0)이 있으면 값을 버리고 `~/.cache/ai-usage/claude-usage-disabled`를 남긴다. 이 파일을 지우면 다시 묻는다. 파일을 쓸 수 없으면 현재 프로세스에서 조회를 멈추고 진단에 저장 실패 이유를 표시한다.
     - **기록**: 값이 바뀌었거나 실패했을 때만 `~/.cache/ai-usage/claude-usage.log` 에 계기(시작·활동·5분·새로고침)와 함께 한 줄. 오른쪽 클릭 메뉴에 「Claude /usage 확인 <시각>」과 실패 이유, `AIUsageStatus.exe --print` 에 결과·걸린 시간·쓴 claude 경로가 나온다.
-    - **끄기**: 레지스트리 `HKCU\Software\AIUsage` 의 `ClaudeUsage`(DWORD)=0, 또는 환경 변수 `AIUSAGE_CLAUDE_USAGE=0`.
+    - **끄기**: Windows 는 레지스트리 `HKCU\Software\AIUsage` 의 `ClaudeUsage`(DWORD)=0, 맥은 `defaults write com.local.ai-usage-pet claudeUsage -bool false`. 두 판 모두 환경 변수 `AIUSAGE_CLAUDE_USAGE=0` 도 된다.
     - 결과는 사람이 읽는 영어 문장(`Current session: 8% used · resets Nov 20, 3:10pm (Asia/Seoul)`)이라 Claude Code 업데이트로 바뀔 수 있다. 못 읽으면 「/usage 결과 형식을 읽지 못했습니다」로 알리고 나머지 두 출처만 쓴다.
   - **Claude Code 상태 표시줄**: 상태 표시줄이 받는 `rate_limits` 를 세션마다 `~/.cache/ai-usage/claude/<세션>.json` 에 남기고(맥은 앱의 `--statusline` 또는 `statusline.sh` 에서 그 옵션을 호출하는 한 줄, Windows 는 `AIUsageStatus.exe`), 창은 가장 최근 창(초기화 시각이 가장 늦은 것)에서 가장 많이 쓴 값을 쓴다. 초기화 시각이 있다.
-  - **Claude 데스크톱 앱 기록**: 데스크톱 앱이 사용량을 서버에서 받을 때마다 남기는 `plan-usage-history.json`(맥 `~/Library/Application Support/Claude/`, Windows 는 요즘 판(Microsoft Store 판 포함) `%LOCALAPPDATA%\Claude-Data\claude_<id>\`, 옛 판 `%APPDATA%\Claude\`). 데스크톱 앱을 쓰는 동안에만 쌓이고(4.5분에 한 번까지), 초기화 시각이 없다. 데스크톱 앱은 트레이(메뉴 막대) 아이콘을 오른쪽 클릭한 뒤 24시간 동안만 사용량을 계속 받고, 그 밖에는 앱을 켤 때 한 번만 받아 기록이 멈춘다 — Windows 판은 그럴 때 오른쪽 클릭 메뉴에 그렇게 알린다. Claude Code 가 로그인한 조직(`~/.claude.json` 의 `oauthAccount.organizationUuid`)과 다른 계정의 기록은 쓰지 않는다. 상태 표시줄이 본 창이 그 기록 때도 열려 있었으면 그 초기화 시각을 이어 쓴다.
-  - Windows 판은 `/usage` 로 5분마다 묻기 때문에 claude.ai 웹·모바일에서 쓴 양도 5분 안에 반영된다. 맥 판(아직 `/usage` 없음)은 Claude Code 도 데스크톱 앱도 한동안 안 쓰면 값이 멈춰 있다(「n분 전」 확인).
+  - **Claude 데스크톱 앱 기록**: 데스크톱 앱이 사용량을 서버에서 받을 때마다 남기는 `plan-usage-history.json`(맥 `~/Library/Application Support/` 밑 `Claude-Data`·`Claude`·`Claude-3p` 와 그 하위 폴더, Windows 는 요즘 판(Microsoft Store 판 포함) `%LOCALAPPDATA%\Claude-Data\claude_<id>\`, 옛 판 `%APPDATA%\Claude\`). 데스크톱 앱을 쓰는 동안에만 쌓이고(4.5분에 한 번까지), 초기화 시각이 없다. 데스크톱 앱은 트레이(메뉴 막대) 아이콘을 오른쪽 클릭한 뒤 24시간 동안만 사용량을 계속 받고, 그 밖에는 앱을 켤 때 한 번만 받아 기록이 멈춘다 — 그럴 때 오른쪽 클릭 메뉴에 그렇게 알린다(맥은 1.8 부터). Claude Code 가 로그인한 조직(`~/.claude.json` 의 `oauthAccount.organizationUuid`)과 다른 계정의 기록은 쓰지 않는다. 상태 표시줄이 본 창이 그 기록 때도 열려 있었으면 그 초기화 시각을 이어 쓴다.
+  - `/usage` 로 5분마다 묻기 때문에 claude.ai 웹·모바일에서 쓴 양도 5분 안에 반영된다(맥 1.7 이하는 Claude Code 도 데스크톱 앱도 한동안 안 쓰면 값이 멈춰 있었다).
   - 값이 하나도 없으면 Claude 칸에 이유를 쓴다: Claude Code 없음 / 상태 표시줄 연결 안 됨 / 연결이 끊김(앱을 옮김 등) / 상태 표시줄은 도는데 한도 값이 안 옴(구독 로그인이 아님 등) / 아직 대화 전. 상태 표시줄은 돌 때마다 `~/.cache/ai-usage/claude-statusline.json` 에 그 시각과 한도 값이 왔는지 남긴다.
   - `/usage` 글과 두 파일 모두 공식 문서에 없는 형식이라 Claude Code·데스크톱 앱 업데이트로 바뀔 수 있다.
 - **계정을 바꿨을 때**: 한도는 계정마다 따로라 지금 로그인한 계정 값만 쓴다.
@@ -61,9 +65,9 @@ Windows 는 「모양 → 표시 방식」에서 「작업 표시줄 (간단 모
 
 맥 1.7·Windows 1.4.0 부터 창을 오른쪽 클릭해 「한도 알림」을 켜거나 끈다. 기본값은 켜짐이다. 5시간·주간 등 각 한도에서 처음 10% 이하로 남으면 한 번 알린다. 초기화 시각을 알면 그 시각부터 60분 이내에 확인한 초기화도 한 번 알린다. 초기화 시각을 모르면 첫 알림의 관측 시각에서 창 길이가 지난 뒤 새 관측부터 남은 한도를 다시 판단한다.
 
-Windows 1.4.0에서 「모델별 한도 보이기 (Fable 등)」는 처음에 켜져 있어 작은 창과 메뉴 상세에 모델별 주간 한도가 표시된다. 「모델별 한도도 알림」은 처음에 꺼져 있다. 「한도 알림」이 켜져 있으면 모델 줄을 숨긴 상태에서도 모델별 알림을 받을 수 있다. 사용 추이와 35일 기록에는 전체 주간 한도만 들어간다.
+Windows 1.4.0·맥 1.8 부터 「모델별 한도 보이기 (Fable 등)」는 처음에 켜져 있어 작은 창과 메뉴 상세에 모델별 주간 한도가 표시된다. 「모델별 한도도 알림」은 처음에 꺼져 있다. 「한도 알림」이 켜져 있으면 모델 줄을 숨긴 상태에서도 모델별 알림을 받을 수 있다. 사용 추이와 35일 기록에는 전체 주간 한도만 들어간다.
 
-「사용 추이…」를 열면 현재 계정의 주간 한도를 볼 수 있다. 「이번 주」는 지금까지의 사용률과 예상 소진 시각을, 「지난 4주」는 하루에 쓴 비율을 보여 준다. 흐린 막대는 대략적인 값이며 ↺는 초기화된 날이다. 주간 기록은 `~/.cache/ai-usage/history.jsonl`에 35일간 보관한다.
+「사용 추이…」를 열면 현재 계정의 주간 한도를 볼 수 있다. 「이번 주」는 지금까지의 사용률과 예상 소진 시각을, 「지난 4주」는 하루에 쓴 비율을 보여 준다. 흐린 막대는 대략적인 값이며 ↺는 초기화된 날이다. 주간 기록은 `~/.cache/ai-usage/history.jsonl`에 35일간 보관한다. 창 크기는 두 판 모두 고정이고, Windows 판(1.4.2 부터)은 맥 판처럼 어두운 제목 줄과 둥근 모서리로 그린다.
 
 ## 언어
 
