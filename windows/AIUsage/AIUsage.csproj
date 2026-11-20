@@ -14,7 +14,7 @@
     <Product>AI 사용량</Product>
     <AssemblyTitle>AI 사용량</AssemblyTitle>
     <Description>Claude·ChatGPT(Codex) 사용 한도를 화면 위에 띄워 둔다</Description>
-    <Version>1.3.0</Version>
+    <Version>1.3.1</Version>
     <InvariantGlobalization>false</InvariantGlobalization>
     <SatelliteResourceLanguages>ko</SatelliteResourceLanguages>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
@@ -36,7 +36,7 @@
 
   <!-- 상태 표시줄 프로그램 없이 만들어지지 않게 막는다 -->
   <Target Name="RequireStatusExe" BeforeTargets="BeforeBuild" Condition="!Exists('../AIUsageStatus/publish/AIUsageStatus.exe')">
-    <Error Text="상태 표시줄 프로그램이 없습니다. zsh windows/build.sh 로 만드세요." />
+    <Error Text="상태 표시줄 프로그램이 없습니다. zsh windows/build.sh(맥) 또는 windows/build.ps1(Windows) 로 만드세요." />
   </Target>
 
 </Project>

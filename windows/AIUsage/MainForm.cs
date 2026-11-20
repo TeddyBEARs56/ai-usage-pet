@@ -437,6 +437,10 @@ sealed class MainForm : Form
             yield return T("{0} · 마지막 값 {1}", title, snap.ObservedAt is { } at ? Fmt.FullTime(at) : T("없음"));
             foreach (var w in snap.Windows)
                 yield return "    " + T("{0} {1}% 남음 · 초기화 {2}", w.Label, w.LeftPercent(now), w.ResetsAt is { } r ? Fmt.FullTime(r) : "-");
+            // Claude 값이 오래됐고 데스크톱 앱 기록도 멈췄으면 다시 받게 하는 법을 알린다
+            if (snap == claudeSnap && (snap.ObservedAt is not { } seen || now - seen >= ClaudeDesktopUsage.StaleAfter)
+                && ClaudeDesktopUsage.StaleHint(now) is { } hint)
+                yield return "    " + hint;
         }
         yield return T("Codex 서버 확인 {0}", codex.ServerCheckedAt is { } c ? Fmt.Clock(c) : T("전")) + (codex.ServerError is { } error ? " — " + error : "");
     }

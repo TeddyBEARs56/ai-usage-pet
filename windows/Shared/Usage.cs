@@ -172,27 +172,49 @@ public static class Paths
     /// 상태 표시줄이 마지막으로 돈 때와 한도 값이 왔는지(값이 안 나올 때 이유를 말하려고)
     public static string StatusSeen => Path.Combine(Home, ".cache", "ai-usage", "claude-statusline.json");
 
-    /// Claude 데스크톱 앱의 사용량 기록 후보. 설치판은 %APPDATA%\Claude, Microsoft Store 판은 Packages\…Claude…\LocalCache\Roaming\Claude.
-    /// 맥에서 돌려 볼 때는 ~/Library/Application Support/Claude.
+    /// Claude 데스크톱 앱의 사용량 기록 후보(있는 파일만). 앱의 데이터 폴더 이름은 Claude-Data·Claude·Claude-3p 이고
+    /// %LOCALAPPDATA% 나 %APPDATA% 밑에 있다. 요즘 판(Microsoft Store 판 포함)은 %LOCALAPPDATA%\Claude-Data\claude_<id>\ 에 두고,
+    /// 옛 자리(%APPDATA%\Claude, Packages\…Claude…\LocalCache\Roaming\Claude)에는 옮겼다는 빈 표시 파일만 남긴다.
+    /// 맥에서 돌려 볼 때(AIUSAGE_HOME)는 Home 밑의 AppData\Local·AppData\Roaming·Library/Application Support 를 본다.
     public static List<string> ClaudeDesktopHistory()
     {
-        const string name = "plan-usage-history.json";
+        var bases = new List<string>();
         if (Environment.GetEnvironmentVariable("AIUSAGE_HOME") is { Length: > 0 } || OperatingSystem.IsMacOS())
-            return new()
-            {
-                Path.Combine(Home, "AppData", "Roaming", "Claude", name),
-                Path.Combine(Home, "Library", "Application Support", "Claude", name),
-            };
-        var result = new List<string> { Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Claude", name) };
-        try
         {
-            var packages = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Packages");
-            if (Directory.Exists(packages))
-                result.AddRange(Directory.EnumerateDirectories(packages, "*Claude_*")
-                                         .Select(dir => Path.Combine(dir, "LocalCache", "Roaming", "Claude", name)));
+            bases.Add(Path.Combine(Home, "AppData", "Local"));
+            bases.Add(Path.Combine(Home, "AppData", "Roaming"));
+            bases.Add(Path.Combine(Home, "Library", "Application Support"));
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
-        return result;
+        else
+        {
+            var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            bases.Add(local);
+            bases.Add(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData));
+            try
+            {
+                var packages = Path.Combine(local, "Packages");
+                if (Directory.Exists(packages))
+                    bases.AddRange(Directory.EnumerateDirectories(packages, "*Claude_*").Select(dir => Path.Combine(dir, "LocalCache", "Roaming")));
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        }
+
+        const string name = "plan-usage-history.json";
+        var result = new List<string>();
+        foreach (var root in bases.Where(b => b.Length > 0))
+            foreach (var folder in new[] { "Claude-Data", "Claude", "Claude-3p" })
+            {
+                var dir = Path.Combine(root, folder);
+                if (!Directory.Exists(dir)) continue;
+                result.Add(Path.Combine(dir, name));
+                try
+                {
+                    // Claude-Data 는 설치마다 하위 폴더(claude_<id>)를 둔다
+                    result.AddRange(Directory.EnumerateDirectories(dir).Select(sub => Path.Combine(sub, name)));
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+            }
+        return result.Where(File.Exists).ToList();
     }
 }
 
@@ -398,17 +420,17 @@ public sealed record DesktopUsageSample(DateTimeOffset At, Dictionary<string, do
 public static class ClaudeDesktopUsage
 {
     /// 가장 최근 기록. Claude Code 계정(조직)을 알면 그 조직 것만, 8일보다 오래된 것은 뺀다.
+    /// 후보가 여럿이면(옛 자리에 남은 파일, 여러 설치) 모두 보고 가장 새 기록을 쓴다
     public static DesktopUsageSample? Latest(string? org, DateTimeOffset now)
     {
+        DesktopUsageSample? best = null;
         foreach (var path in Paths.ClaudeDesktopHistory())
         {
-            if (!File.Exists(path)) continue;
             try
             {
                 using var doc = JsonDocument.Parse(File.ReadAllBytes(path));
                 if (doc.RootElement.ValueKind != JsonValueKind.Object
                     || !doc.RootElement.TryGetProperty("samples", out var samples) || samples.ValueKind != JsonValueKind.Array) continue;
-                DesktopUsageSample? best = null;
                 foreach (var sample in samples.EnumerateArray())
                 {
                     if (J.Number(sample, "t") is not { } t) continue;
@@ -421,12 +443,36 @@ public static class ClaudeDesktopUsage
                     if (J.Number(u, "sd") is { } sd) used["seven_day"] = sd;
                     if (used.Count > 0) best = new DesktopUsageSample(at, used);
                 }
-                if (best is not null) return best;
             }
             catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException) { }
         }
-        return null;
+        return best;
     }
+
+    /// 가장 최근에 쓰인 기록 파일과 그 시각(값이 왜 멈췄는지 알리려고). 없으면 null
+    public static (string Path, DateTimeOffset At)? LastWrite()
+    {
+        (string Path, DateTimeOffset At)? newest = null;
+        foreach (var path in Paths.ClaudeDesktopHistory())
+        {
+            try
+            {
+                var at = new DateTimeOffset(File.GetLastWriteTimeUtc(path), TimeSpan.Zero);
+                if (newest is null || at > newest.Value.At) newest = (path, at);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        }
+        return newest;
+    }
+
+    /// 데스크톱 앱은 트레이 아이콘의 사용량 메뉴를 한동안 열지 않으면 사용량을 받지 않아 기록이 멈춘다(앱 설정에 따라 다름).
+    /// 기록이 이보다 오래 안 바뀌었으면 그렇게 알린다.
+    public static readonly TimeSpan StaleAfter = TimeSpan.FromHours(1);
+
+    public static string? StaleHint(DateTimeOffset now) =>
+        LastWrite() is { } last && now - last.At >= StaleAfter
+            ? T("Claude 데스크톱 앱 기록이 {0} 뒤로 멈춤 — 작업 표시줄 알림 영역의 Claude 아이콘을 눌러 메뉴를 열면 다시 받습니다", Fmt.FullTime(last.At))
+            : null;
 }
 
 /// Claude Code 가 로그인한 조직(~/.claude.json 의 oauthAccount.organizationUuid, 비밀값 아님).
@@ -1036,6 +1082,10 @@ public static class Report
         };
         if (ClaudeSettings.LastSeen() is { } seen)
             lines.Add("  " + T("상태 표시줄 마지막 실행 {0} · 한도 값 {1} · Claude Code {2}", Fmt.FullTime(seen.At), seen.Limits ? T("옴") : T("안 옴"), seen.Version));
+        lines.Add("  " + (ClaudeDesktopUsage.LastWrite() is { } desktop
+            ? T("데스크톱 앱 기록 {0} · 마지막으로 바뀜 {1}", desktop.Path, Fmt.FullTime(desktop.At))
+            : T("데스크톱 앱 기록: 못 찾음")));
+        if (ClaudeDesktopUsage.StaleHint(now) is { } hint) lines.Add("  " + hint);
         return string.Join("\n", lines.Concat(new[]
         {
             Fmt.Describe(T("ChatGPT · 기록"), fromLog ?? new ProviderSnapshot { Message = T("최근 기록 없음") }, now),
