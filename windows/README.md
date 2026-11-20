@@ -29,7 +29,7 @@
 | 값 | 필요한 것 |
 |---|---|
 | ChatGPT | Codex CLI 로그인. `codex` 를 PATH, npm(`%APPDATA%\npm`), `~\.codex\packages\standalone` 에서 찾는다 |
-| Claude | Claude Code + 상태 표시줄 연결(메뉴). `~\.claude\settings.json` 의 `statusLine` 을 `AIUsageStatus.exe --statusline` 으로 바꾼다(원래 파일은 `settings.json.bak-날짜`). 연결이 가리키는 `AIUsageStatus.exe` 가 없으면 켤 때 묻지 않고 다시 건다. 또는 Claude 데스크톱 앱의 `plan-usage-history.json` — 요즘 판(Microsoft Store 판 포함)은 `%LOCALAPPDATA%\Claude-Data\claude_<id>\`, 옛 판은 `%APPDATA%\Claude\`(`Claude-Data`·`Claude`·`Claude-3p` 를 `%LOCALAPPDATA%`·`%APPDATA%` 밑에서 모두 찾아 가장 새 기록을 쓴다). 앱을 쓰는 동안 받은 값만, 초기화 시각 없이. 기록이 1시간 넘게 멈췄고 Claude 값도 오래됐으면 오른쪽 클릭 메뉴에 「작업 표시줄 알림 영역의 Claude 아이콘을 눌러 메뉴를 열면 다시 받습니다」가 뜬다. 어느 파일을 읽는지는 `AIUsageStatus.exe --print` 로 본다 |
+| Claude | `claude /usage`: Claude Code(또는 Claude 데스크톱 앱이 품은 claude.exe)에게 5분마다, 그리고 Claude Code 가 응답할 때마다 묻는다(모델을 부르지 않음, 자세한 것은 [값의 출처](../README.md#값의-출처두-판-공통)). 그 밖에 Claude Code + 상태 표시줄 연결(메뉴). `~\.claude\settings.json` 의 `statusLine` 을 `AIUsageStatus.exe --statusline` 으로 바꾼다(원래 파일은 `settings.json.bak-날짜`). 연결이 가리키는 `AIUsageStatus.exe` 가 없으면 켤 때 묻지 않고 다시 건다. 또는 Claude 데스크톱 앱의 `plan-usage-history.json` — 요즘 판(Microsoft Store 판 포함)은 `%LOCALAPPDATA%\Claude-Data\claude_<id>\`, 옛 판은 `%APPDATA%\Claude\`(`Claude-Data`·`Claude`·`Claude-3p` 를 `%LOCALAPPDATA%`·`%APPDATA%` 밑에서 모두 찾아 가장 새 기록을 쓴다). 앱을 쓰는 동안 받은 값만, 초기화 시각 없이. 기록이 1시간 넘게 멈췄고 Claude 값도 오래됐으면 오른쪽 클릭 메뉴에 「…Claude 아이콘을 오른쪽 클릭하면 그 뒤 하루 동안 다시 받습니다」가 뜬다(데스크톱 앱은 트레이 아이콘을 오른쪽 클릭한 뒤 24시간 동안만 사용량을 계속 받고, 그 밖에는 앱을 켤 때 한 번만 받는다. 왼쪽 클릭은 창만 연다). 어느 파일을 읽는지는 `AIUsageStatus.exe --print` 로 본다 |
 
 Windows 에는 jq 가 없어서 상태 표시줄은 같이 들어 있는 작은 콘솔 프로그램 `AIUsageStatus.exe` 가 맡는다(창 프로그램으로 하면 실행될 때마다 마우스 커서가 「로딩 중」으로 깜빡인다). 상태 표시줄 모양은 맥과 같은 3줄(저장소·모델·한도)이고 브랜치 표시는 없다.
 

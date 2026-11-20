@@ -32,12 +32,19 @@ ChatGPT 대화(웹·앱) 자체의 한도는 밖에서 읽을 방법이 없어 C
 
 ## 값의 출처(두 판 공통)
 
-- **Claude**: 두 곳에서 읽고, 둘 중 나중에 받은 값을 쓴다. Claude Code 로그인 토큰은 읽지 않는다.
+- **Claude**: 세 곳(맥 판은 아래 두 곳)에서 읽고, 가장 나중에 받은 값을 쓴다. Claude Code 로그인 토큰은 읽지 않는다.
+  - **`claude /usage`(Windows 1.3.2 부터)**: Codex 처럼 Claude Code 에게 직접 묻는다 — `claude -p "/usage" --output-format json --no-session-persistence` 를 창 없이 잠깐 띄운다(5초쯤). `/usage` 는 모델을 부르지 않는 Claude Code 안의 명령이라 한도를 쓰지 않고, 인증은 Claude Code 가 한다. 대화 기록도 남기지 않는다(`~/.cache/ai-usage/claude-usage` 폴더에서 띄우므로 `~/.claude.json` 에 그 폴더 항목 하나가 생긴다). 받은 값은 상태 표시줄 기록과 같은 모양으로 `~/.cache/ai-usage/claude/usage-command.json` 에 남겨 같은 규칙으로 합치고, 초기화 시각도 있다.
+    - **언제 묻나**: 앱을 켤 때, 이 PC 에서 Claude Code 가 응답했을 때(CLI·데스크톱 앱 Code 탭 모두 — `~/.claude/projects` 의 대화 기록이 바뀌는 것을 지켜본다: 응답이 끝나고 5초 잠잠하면, 긴 작업이면 30초마다, 두 번 사이는 1분 이상), 그리고 5분마다(claude.ai 웹·모바일·데스크톱 앱 Chat 처럼 이 PC 에 흔적이 없는 사용 몫). 창을 두 번 누르거나 「지금 새로고침」 하면 바로.
+    - **어느 claude 를 쓰나**: `~\.local\bin\claude.exe`·npm 의 `claude.cmd`·PATH, 없으면 Claude 데스크톱 앱이 품은 것(`Claude-Data\claude_<id>\claude-code\<버전>\…\claude.exe`, 가장 높은 버전) — 그래서 데스크톱 앱만 써도 된다.
+    - **안전장치**: 답에 모델을 부른 흔적(`num_turns`·비용 > 0)이 있으면 값을 쓰지 않고 다시는 묻지 않는다(`~/.cache/ai-usage/claude-usage-disabled` 를 남긴다 — 지우면 다시 묻는다).
+    - **기록**: 값이 바뀌었거나 실패했을 때만 `~/.cache/ai-usage/claude-usage.log` 에 계기(시작·활동·5분·새로고침)와 함께 한 줄. 오른쪽 클릭 메뉴에 「Claude /usage 확인 <시각>」과 실패 이유, `AIUsageStatus.exe --print` 에 결과·걸린 시간·쓴 claude 경로가 나온다.
+    - **끄기**: 레지스트리 `HKCU\Software\AIUsage` 의 `ClaudeUsage`(DWORD)=0, 또는 환경 변수 `AIUSAGE_CLAUDE_USAGE=0`.
+    - 결과는 사람이 읽는 영어 문장(`Current session: 8% used · resets Nov 20, 3:10pm (Asia/Seoul)`)이라 Claude Code 업데이트로 바뀔 수 있다. 못 읽으면 「/usage 결과 형식을 읽지 못했습니다」로 알리고 나머지 두 출처만 쓴다.
   - **Claude Code 상태 표시줄**: 상태 표시줄이 받는 `rate_limits` 를 세션마다 `~/.cache/ai-usage/claude/<세션>.json` 에 남기고(맥은 앱의 `--statusline` 또는 `statusline.sh` 에 넣는 7줄, Windows 는 `AIUsageStatus.exe`), 창은 가장 최근 창(초기화 시각이 가장 늦은 것)에서 가장 많이 쓴 값을 쓴다. 초기화 시각이 있다.
-  - **Claude 데스크톱 앱 기록**: 데스크톱 앱이 사용량을 서버에서 받을 때마다 남기는 `plan-usage-history.json`(맥 `~/Library/Application Support/Claude/`, Windows 는 요즘 판(Microsoft Store 판 포함) `%LOCALAPPDATA%\Claude-Data\claude_<id>\`, 옛 판 `%APPDATA%\Claude\`). 데스크톱 앱을 쓰는 동안에만 쌓이고(4.5분에 한 번까지), 초기화 시각이 없다. 데스크톱 앱은 트레이 아이콘 메뉴를 한동안 안 열면 사용량을 받지 않아 기록이 멈출 수 있다 — Windows 판은 그럴 때 오른쪽 클릭 메뉴에 그렇게 알린다. Claude Code 가 로그인한 조직(`~/.claude.json` 의 `oauthAccount.organizationUuid`)과 다른 계정의 기록은 쓰지 않는다. 상태 표시줄이 본 창이 그 기록 때도 열려 있었으면 그 초기화 시각을 이어 쓴다.
-  - 그래서 Claude Code 도 데스크톱 앱도 한동안 안 쓰면 값이 멈춰 있다(「n분 전」 확인). claude.ai 웹에서 쓴 양도 같은 한도에서 깎이고, 다음에 둘 중 하나가 값을 받을 때 반영된다.
+  - **Claude 데스크톱 앱 기록**: 데스크톱 앱이 사용량을 서버에서 받을 때마다 남기는 `plan-usage-history.json`(맥 `~/Library/Application Support/Claude/`, Windows 는 요즘 판(Microsoft Store 판 포함) `%LOCALAPPDATA%\Claude-Data\claude_<id>\`, 옛 판 `%APPDATA%\Claude\`). 데스크톱 앱을 쓰는 동안에만 쌓이고(4.5분에 한 번까지), 초기화 시각이 없다. 데스크톱 앱은 트레이(메뉴 막대) 아이콘을 오른쪽 클릭한 뒤 24시간 동안만 사용량을 계속 받고, 그 밖에는 앱을 켤 때 한 번만 받아 기록이 멈춘다 — Windows 판은 그럴 때 오른쪽 클릭 메뉴에 그렇게 알린다. Claude Code 가 로그인한 조직(`~/.claude.json` 의 `oauthAccount.organizationUuid`)과 다른 계정의 기록은 쓰지 않는다. 상태 표시줄이 본 창이 그 기록 때도 열려 있었으면 그 초기화 시각을 이어 쓴다.
+  - Windows 판은 `/usage` 로 5분마다 묻기 때문에 claude.ai 웹·모바일에서 쓴 양도 5분 안에 반영된다. 맥 판(아직 `/usage` 없음)은 Claude Code 도 데스크톱 앱도 한동안 안 쓰면 값이 멈춰 있다(「n분 전」 확인).
   - 값이 하나도 없으면 Claude 칸에 이유를 쓴다: Claude Code 없음 / 상태 표시줄 연결 안 됨 / 연결이 끊김(앱을 옮김 등) / 상태 표시줄은 도는데 한도 값이 안 옴(구독 로그인이 아님 등) / 아직 대화 전. 상태 표시줄은 돌 때마다 `~/.cache/ai-usage/claude-statusline.json` 에 그 시각과 한도 값이 왔는지 남긴다.
-  - 두 파일 모두 공식 문서에 없는 형식이라 Claude Code·데스크톱 앱 업데이트로 바뀔 수 있다.
+  - `/usage` 글과 두 파일 모두 공식 문서에 없는 형식이라 Claude Code·데스크톱 앱 업데이트로 바뀔 수 있다.
 - **계정을 바꿨을 때**: 한도는 계정마다 따로라 지금 로그인한 계정 값만 쓴다.
   - Claude: 상태 표시줄이 한도를 남길 때 그때 Claude Code 에 로그인한 계정(`~/.claude.json` 의 `oauthAccount` 사용자 id|조직 id)을 `account` 로 함께 적고, 창은 지금 계정과 같은 것만 쓴다. 계정이 안 적힌 옛 기록(1.5 이전, 또는 직접 만든 `statusline.sh` 의 jq 줄)은 지금 계정이 적힌 기록이 하나도 없을 때만, 그것도 계정을 바꾼 뒤 쓰인 것만 쓴다. 바뀐 때는 `~/.cache/ai-usage/accounts.json` 에 남는다.
   - ChatGPT: Codex 기록 첫 줄의 `creator_account_id` 가 지금 로그인(`~/.codex/auth.json` 의 `tokens.account_id` 만 읽는다)과 같은 기록만 쓴다. 15초마다 보다가 계정이 바뀌면 앞 계정 값을 버리고 5분을 기다리지 않고 바로 서버에 다시 묻는다.

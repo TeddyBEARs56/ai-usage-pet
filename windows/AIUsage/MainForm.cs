@@ -24,11 +24,15 @@ sealed class MainForm : Form
     readonly System.Windows.Forms.Timer localTimer = new() { Interval = 15_000 };
     readonly System.Windows.Forms.Timer serverTimer = new() { Interval = 300_000 };
     readonly System.Windows.Forms.Timer updateTimer = new() { Interval = (int)Updater.FirstDelay.TotalMilliseconds };
+    // Claude Code 가 응답하면(대화 기록이 바뀌면) 곧 `claude /usage` 를 묻고, 그 밖에는 5분마다 — 5초마다 때인지 본다
+    readonly System.Windows.Forms.Timer usageTimer = new() { Interval = 5_000 };
+    readonly ClaudeActivityWatcher activity = new();
     readonly ContextMenuStrip menu = new();
     ProviderSnapshot claudeSnap = new(), codexSnap = new();
     Pane[] order = Settings.Order;
     DateTimeOffset now = DateTimeOffset.Now;
-    bool fetching, updating, useRegion;
+    DateTimeOffset? usageAskedAt;
+    bool fetching, updating, useRegion, askingUsage;
     Font? fontName, fontSmall, fontRow, fontPercent;
 
     public MainForm(Mutex mutex, bool afterInstall)
@@ -51,6 +55,7 @@ sealed class MainForm : Form
         MouseDoubleClick += (_, e) => { if (e.Button == MouseButtons.Left) RefreshAll(); };
         localTimer.Tick += (_, _) => RefreshLocal();
         serverTimer.Tick += (_, _) => RefreshServer();
+        usageTimer.Tick += (_, _) => CheckClaudeUsage();
         updateTimer.Tick += (_, _) =>
         {
             updateTimer.Interval = (int)Updater.Interval.TotalMilliseconds;  // 처음은 켠 뒤 1분, 그 뒤 6시간마다
@@ -84,7 +89,9 @@ sealed class MainForm : Form
         localTimer.Start();
         serverTimer.Start();
         updateTimer.Start();
+        usageTimer.Start();
         RefreshServer();
+        CheckClaudeUsage();
         if (afterInstall) BeginInvoke(new Action(() => ClaudeLink.Ask(fromMenu: false)));
     }
 
@@ -94,6 +101,8 @@ sealed class MainForm : Form
         localTimer.Dispose();
         serverTimer.Dispose();
         updateTimer.Dispose();
+        usageTimer.Dispose();
+        activity.Dispose();
         base.OnFormClosed(e);
     }
 
@@ -178,6 +187,32 @@ sealed class MainForm : Form
     {
         RefreshLocal();
         RefreshServer();
+        AskClaudeUsage("새로고침");
+    }
+
+    /// 지금 `claude /usage` 를 물을 때인지 본다(처음·Claude Code 응답 직후·5분마다)
+    void CheckClaudeUsage()
+    {
+        if (!Settings.ClaudeUsage) return;
+        activity.Ensure();
+        if (ClaudeActivityWatcher.Due(DateTimeOffset.Now, usageAskedAt, activity.Pending()) is { } reason) AskClaudeUsage(reason);
+    }
+
+    async void AskClaudeUsage(string reason)
+    {
+        if (askingUsage || !Settings.ClaudeUsage) return;
+        askingUsage = true;
+        usageAskedAt = DateTimeOffset.Now;
+        activity.Take();
+        try
+        {
+            await Task.Run(() => ClaudeUsageCommand.FetchAsync(reason));
+        }
+        finally
+        {
+            askingUsage = false;
+        }
+        if (!IsDisposed) RefreshLocal();
     }
 
     void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
@@ -442,6 +477,9 @@ sealed class MainForm : Form
                 && ClaudeDesktopUsage.StaleHint(now) is { } hint)
                 yield return "    " + hint;
         }
+        if (Settings.ClaudeUsage)
+            yield return T("Claude /usage 확인 {0}", ClaudeUsageCommand.LastCheckedAt is { } u ? Fmt.Clock(u) : T("전"))
+                         + (ClaudeUsageCommand.LastError is { } usageError ? " — " + usageError : "");
         yield return T("Codex 서버 확인 {0}", codex.ServerCheckedAt is { } c ? Fmt.Clock(c) : T("전")) + (codex.ServerError is { } error ? " — " + error : "");
     }
 }

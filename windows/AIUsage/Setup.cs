@@ -175,6 +175,16 @@ static class Settings
         }
     }
 
+    /// `claude /usage` 로 Claude 한도를 묻기(값 ClaudeUsage). 값이 없으면 켬, 0 이면 끔.
+    public static bool ClaudeUsage
+    {
+        get
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(Key);
+            return key?.GetValue("ClaudeUsage") is not int v || v != 0;
+        }
+    }
+
     /// 「칸 순서」 메뉴에 나오는 순서 전부. 맨 앞이 기본(맥판의 세션 칸은 Windows 에 없다).
     public static readonly Pane[][] Orders = { new[] { Pane.Claude, Pane.Codex }, new[] { Pane.Codex, Pane.Claude } };
 
